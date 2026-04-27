@@ -51,11 +51,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # ── Build dependencies (curl static linking needs headers) ──
+      # ── Build dependencies ──
+      # static-curl + tls-rustls = no system dependencies needed!
       - name: Install build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libcurl4-openssl-dev pkg-config
+        run: echo "No system dependencies needed (static-curl + tls-rustls)"
 
       # ── Build release binary ──
       # Strip + LTO already configured in Cargo.toml [profile.release]
