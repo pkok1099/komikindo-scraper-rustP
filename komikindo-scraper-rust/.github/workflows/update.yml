@@ -1,0 +1,54 @@
+name: Update Komik Data
+
+on:
+  schedule:
+    # Setiap 6 jam (cron bisa delay 5-60 menit saat traffic GitHub tinggi)
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Manual trigger dari GitHub UI
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: komikindo-scraper
+
+      - name: Build release binary
+        run: cargo build --release --manifest-path komikindo-scraper-rust/Cargo.toml
+
+      - name: Run smart update
+        working-directory: komikindo-scraper-rust
+        run: |
+          ./target/release/komikindo-scraper update \
+            --max-pages 3 \
+            --max-age-minutes 360 \
+            --timeout 30
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add komikindo-scraper-rust/data/
+          # Hanya commit kalau ada perubahan
+          git diff --cached --quiet --exit-code && echo "NO_CHANGES" || git commit -m "update: komik data $(date -u +%Y-%m-%d_%H:%M) [skip ci]"
+
+      - name: Push changes
+        run: |
+          if [ "$(git log --oneline -1 | grep -c 'update:')" -eq 1 ]; then
+            git push
+          else
+            echo "Nothing to push"
+          fi

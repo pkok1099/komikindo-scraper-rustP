@@ -1,4 +1,4 @@
-/// KomikIndo Scraper - Rust Version (FULL SPEED)
+/// KomikIndo Scraper - Rust Version (FULL SPEED + SMART UPDATE)
 ///
 /// FULL SPEED DESIGN:
 ///   - Tidak ada semaphore / concurrency limit
@@ -7,8 +7,16 @@
 ///   - tokio blocking pool 8192 threads (1 thread per curl request)
 ///   - No batch barrier: semua 8671 komik detail + chapter paralel
 ///
+/// SMART UPDATE:
+///   - Fetch /komik-terbaru/ untuk cek komik yang baru update
+///   - Bandingkan chapter number dengan DB (HashMap, single lookup)
+///   - Komik baru → scrape detail (1 request)
+///   - Chapter update → construct URL saja (0 request!)
+///   - Pagination otomatis: fetch page 2+ kalau item terakhir < 6 jam
+///
 /// PERBAIKAN SLUG:
 ///   - Chapter URL diambil langsung dari href di halaman detail komik
+///   - Incremental: construct dari url_base (derived dari terbaru page)
 
 mod config;
 mod fetcher;
@@ -20,14 +28,14 @@ use anyhow::Result;
 use chrono::{DateTime, Local};
 use clap::Parser;
 use parsers::KomikDetail;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::config::env_config;
 use crate::fetcher::Fetcher;
-use crate::scraper::{scrape_chapter_images, scrape_full_komik_list, scrape_komik_detail};
+use crate::scraper::{scrape_chapter_images, scrape_full_komik_list, scrape_komik_detail, scrape_komik_terbaru};
 
 // ============================================================
 // CLI
@@ -35,7 +43,7 @@ use crate::scraper::{scrape_chapter_images, scrape_full_komik_list, scrape_komik
 
 #[derive(Parser, Debug)]
 #[command(name = "komikindo-scraper")]
-#[command(about = "KomikIndo Scraper - Rust Full Speed (No Bottleneck)")]
+#[command(about = "KomikIndo Scraper - Rust Full Speed + Smart Update")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -69,6 +77,29 @@ enum Commands {
         /// SOCKS5/HTTP proxy URL
         #[arg(long)]
         proxy: Option<String>,
+    },
+
+    /// Smart incremental update dari /komik-terbaru/
+    Update {
+        /// Max halaman /komik-terbaru/ yang di-fetch
+        #[arg(long, default_value_t = 3)]
+        max_pages: u32,
+
+        /// Batas usia entry dalam menit (default 6 jam = 360 menit)
+        #[arg(long, default_value_t = 360)]
+        max_age_minutes: u32,
+
+        /// Timeout per request dalam detik
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+
+        /// SOCKS5/HTTP proxy URL
+        #[arg(long)]
+        proxy: Option<String>,
+
+        /// Dry run - hanya tampilkan apa yang akan berubah
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Scrape homepage untuk cek update terbaru
@@ -115,6 +146,22 @@ fn main() -> Result<()> {
                 })
                 .await?;
             }
+            Commands::Update {
+                max_pages,
+                max_age_minutes,
+                timeout,
+                proxy,
+                dry_run,
+            } => {
+                run_update(UpdateOpts {
+                    max_pages,
+                    max_age_minutes,
+                    timeout,
+                    proxy,
+                    dry_run,
+                })
+                .await?;
+            }
             Commands::Homepage { proxy } => {
                 let fetcher = Fetcher::new(30, proxy.as_deref())?;
                 let updates = scraper::scrape_homepage_updates(&fetcher).await?;
@@ -133,15 +180,6 @@ fn main() -> Result<()> {
     })
 }
 
-struct FullFetchOpts {
-    skip_chapters: bool,
-    limit: usize,
-    start_from: Option<String>,
-    resume: bool,
-    timeout: u64,
-    proxy: Option<String>,
-}
-
 // ============================================================
 // FULL FETCH (STREAMING PIPELINE - NO BATCH BARRIER)
 // ============================================================
@@ -154,6 +192,15 @@ struct FullFetchOpts {
 //   5. Tidak ada batch barrier, tidak ada semaphore
 //   6. Bottleneck = internet saja
 
+struct FullFetchOpts {
+    skip_chapters: bool,
+    limit: usize,
+    start_from: Option<String>,
+    resume: bool,
+    timeout: u64,
+    proxy: Option<String>,
+}
+
 async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     let start_time = Instant::now();
     let dt_start = Local::now();
@@ -162,7 +209,7 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
 
     let proxy_url = opts.proxy.as_deref();
-    let cfg = env_config();
+    let cfg = config::env_config();
     let proxy_info = if let Some(p) = proxy_url {
         format!("\n  Proxy: {p}")
     } else if cfg.proxy_enabled && !cfg.proxy_url.is_empty() {
@@ -517,6 +564,206 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
         jsonl_path.display(),
         jsonl_size_mb
     );
+    println!("{}", "=".repeat(70));
+
+    Ok(())
+}
+
+// ============================================================
+// SMART UPDATE (incremental dari /komik-terbaru/)
+// ============================================================
+//
+// Design:
+//   1. Load DB ke HashMap<slug, KomikDetail> (single lookup O(1))
+//   2. Fetch /komik-terbaru/ dengan pagination otomatis
+//   3. Single pass: compare setiap item dengan DB
+//      - Slug baru → scrape detail (1 request per komik baru)
+//      - Chapter update → construct URL (0 request!)
+//      - Sama → skip
+//   4. Save DB (full rewrite)
+//
+// Efisiensi:
+//   - Update 6 jam: ~40-80 item dari terbaru
+//   - Dari itu: ~2-5 komik baru (scrape detail)
+//   - Sisanya: cuma increment chapter number (0 request)
+//   - Total requests per update: 2-5 (bukan 8701!)
+
+struct UpdateOpts {
+    max_pages: u32,
+    max_age_minutes: u32,
+    timeout: u64,
+    proxy: Option<String>,
+    dry_run: bool,
+}
+
+async fn run_update(opts: UpdateOpts) -> Result<()> {
+    let start_time = Instant::now();
+
+    let data_dir = PathBuf::from("data");
+    std::fs::create_dir_all(&data_dir)?;
+    let db_path = data_dir.join("komik_db.jsonl");
+
+    println!("{}", "=".repeat(70));
+    println!("  KOMIKINDO SMART UPDATE");
+    println!("  Max pages: {} | Max age: {}min", opts.max_pages, opts.max_age_minutes);
+    if opts.dry_run {
+        println!("  *** DRY RUN - no changes will be saved ***");
+    }
+    println!("{}", "=".repeat(70));
+
+    // === Step 1: Load existing DB ===
+    println!("\n--- Step 1: Loading DB ---");
+    let mut db = jsonl::load_db(&db_path);
+    let db_count_before = db.len();
+    if db_count_before > 0 {
+        println!("[DB] Loaded {} komik from {}", db_count_before, db_path.display());
+    } else {
+        println!("[DB] No existing DB found at {} — starting fresh", db_path.display());
+    }
+
+    let fetcher = Arc::new(Fetcher::new(opts.timeout, opts.proxy.as_deref())?);
+
+    // === Step 2: Fetch /komik-terbaru/ ===
+    println!("\n--- Step 2: Fetching /komik-terbaru/ ---");
+    let terbaru_items = scrape_komik_terbaru(&fetcher, opts.max_pages, opts.max_age_minutes).await?;
+    if terbaru_items.is_empty() {
+        println!("[TERBARU] No items found. Nothing to update.");
+        return Ok(());
+    }
+    println!("[TERBARU] {} items fetched", terbaru_items.len());
+
+    // === Step 3: Single-pass compare ===
+    println!("\n--- Step 3: Comparing with DB ---");
+    let mut new_komiks: Vec<parsers::TerbaruItem> = Vec::new();
+    let mut updated_chapters: Vec<(String, f64, f64, i64)> = Vec::new(); // (slug, old_ch, new_ch, gap)
+    let mut skipped = 0usize;
+
+    for item in &terbaru_items {
+        if let Some(existing) = db.get_mut(&item.slug) {
+            // Slug ADA di DB → bandingkan chapter
+            let stored_ch = existing.latest_chapter_number.unwrap_or(0.0);
+
+            if item.chapter_number <= stored_ch {
+                // Sama atau terbaru lebih kecil → skip
+                skipped += 1;
+            } else {
+                // BEDA → construct chapter URLs (0 request!)
+                let old_ch = stored_ch;
+                let new_ch = item.chapter_number;
+                let gap = new_ch as i64 - old_ch as i64;
+
+                // Construct URLs untuk chapter baru
+                for ch_num in (old_ch as i64 + 1)..=(new_ch as i64) {
+                    let ch_url = parsers::construct_chapter_url(&item.url_base, ch_num as f64);
+                    existing.chapters.push(parsers::ChapterInfo {
+                        number: ch_num as f64,
+                        url: ch_url,
+                        cdn_domain_id: None,
+                        cdn_path_prefix: None,
+                        image_filenames: None,
+                        image_ext_ids: None,
+                        total_images: None,
+                    });
+                }
+
+                // Re-sort chapters descending
+                existing.chapters.sort_by(|a, b| {
+                    b.number
+                        .partial_cmp(&a.number)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                existing.latest_chapter_number = Some(new_ch);
+
+                updated_chapters.push((item.slug.clone(), old_ch, new_ch, gap));
+            }
+        } else {
+            // Slug TIDAK ADA → komik baru!
+            new_komiks.push(item.clone());
+        }
+    }
+
+    println!("[COMPARE] New komiks: {}", new_komiks.len());
+    println!("[COMPARE] Updated chapters: {}", updated_chapters.len());
+    println!("[COMPARE] Skipped (unchanged): {}", skipped);
+
+    // Print chapter updates
+    for (slug, old_ch, new_ch, gap) in &updated_chapters {
+        println!("  + {}: ch.{:.0} → ch.{:.0} (+{} chapters, 0 requests)", slug, old_ch, new_ch, gap);
+    }
+
+    // Print new komiks
+    for item in &new_komiks {
+        println!("  * {} (ch.{:.0}) — will scrape detail", item.judul, item.chapter_number);
+    }
+
+    // === Step 4: Scrape detail untuk komik BARU ===
+    if !new_komiks.is_empty() {
+        println!("\n--- Step 4: Scraping {} new komik details ---", new_komiks.len());
+
+        let mut detail_handles = Vec::with_capacity(new_komiks.len());
+        for item in &new_komiks {
+            let fetcher = Arc::clone(&fetcher);
+            let slug = item.slug.clone();
+            detail_handles.push(tokio::spawn(async move {
+                let result = scrape_komik_detail(&slug, &fetcher).await;
+                (slug, result)
+            }));
+        }
+
+        let mut new_success = 0usize;
+        let mut new_failed = 0usize;
+
+        for handle in detail_handles {
+            match handle.await {
+                Ok((slug, Ok(detail))) => {
+                    println!("[NEW] + {} — {}", slug, detail.judul.as_deref().unwrap_or("?"));
+                    new_success += 1;
+                    db.insert(slug, detail);
+                }
+                Ok((slug, Err(e))) => {
+                    eprintln!("[NEW FAIL] {} — {}", slug, e);
+                    new_failed += 1;
+                }
+                Err(e) => {
+                    eprintln!("[NEW FAIL] task error: {}", e);
+                    new_failed += 1;
+                }
+            }
+        }
+
+        println!("[NEW] {} success, {} failed", new_success, new_failed);
+    }
+
+    // === Step 5: Save DB ===
+    if opts.dry_run {
+        println!("\n--- DRY RUN: skipping save ---");
+    } else {
+        println!("\n--- Step 5: Saving DB ---");
+        jsonl::save_db(&db_path, &db)?;
+
+        let db_size = std::fs::metadata(&db_path)
+            .map(|m| m.len() as f64 / 1024.0 / 1024.0)
+            .unwrap_or(0.0);
+
+        println!("[DB] Saved {} komik to {} ({:.1} MB)", db.len(), db_path.display(), db_size);
+    }
+
+    // === Summary ===
+    let elapsed = start_time.elapsed();
+    let stats = fetcher.stats();
+    let new_count = db.len() - db_count_before;
+
+    println!();
+    println!("{}", "=".repeat(70));
+    println!("  UPDATE COMPLETE");
+    println!("  DB before:     {} komik", db_count_before);
+    println!("  DB after:      {} komik (+{} new)", db.len(), new_count);
+    println!("  New komiks:    {} ({} detail fetches)", new_komiks.len(), new_komiks.len());
+    println!("  Updated ch:    {} (0 extra requests!)", updated_chapters.len());
+    println!("  Skipped:       {}", skipped);
+    println!("  Total requests:{}", stats.requests);
+    println!("  Time:          {:.1}s", elapsed.as_secs_f64());
+    println!("  Saved:         {}", if opts.dry_run { "NO (dry run)" } else { "YES" });
     println!("{}", "=".repeat(70));
 
     Ok(())

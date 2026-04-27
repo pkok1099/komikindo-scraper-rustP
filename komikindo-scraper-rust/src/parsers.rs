@@ -734,6 +734,165 @@ pub fn parse_homepage_updates(html: &str) -> Vec<HomepageUpdate> {
 }
 
 // ============================================================
+// KOMIK TERBARU PARSER (/komik-terbaru/)
+// ============================================================
+
+/// Item dari halaman /komik-terbaru/.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TerbaruItem {
+    /// Slug komik (e.g., "blue-lock", "675026-blue-lock")
+    pub slug: String,
+    /// Judul komik
+    pub judul: String,
+    /// Nomor chapter terbaru (e.g., 342.0)
+    pub chapter_number: f64,
+    /// Full URL chapter terbaru (e.g., "https://komikindo.ch/blue-lock-chapter-342/")
+    pub chapter_url: String,
+    /// URL base untuk construct chapter URL baru.
+    /// Diambil dari chapter_url, stripped "-chapter-{number}".
+    /// (e.g., "https://komikindo.ch/blue-lock")
+    pub url_base: String,
+    /// Time string asli (e.g., "3 menit lalu", "4 jam lalu")
+    pub time_str: String,
+    /// Time dalam menit untuk sorting/comparison
+    pub time_minutes: u32,
+}
+
+/// Parse halaman /komik-terbaru/ -> list of TerbaruItem.
+pub fn parse_komik_terbaru(html: &str) -> Vec<TerbaruItem> {
+    let document = Html::parse_document(html);
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+
+    let post_sel = Selector::parse("div.animepost").unwrap();
+    let komik_sel = Selector::parse("h3 a[href*='/komik/'], a.animposx[href*='/komik/']").unwrap();
+    let ch_sel = Selector::parse("div.lsch a[href*='-chapter-']").unwrap();
+    let time_sel = Selector::parse("span.datech").unwrap();
+    let slug_re = Regex::new(r"/komik/([^/]+)/?").unwrap();
+    let ch_num_re = Regex::new(r"(?i)chapter-([\d.]+)").unwrap();
+
+    for post in document.select(&post_sel) {
+        // --- Komik link & slug ---
+        let komik_link = match post.select(&komik_sel).next() {
+            Some(el) => el,
+            None => continue,
+        };
+        let komik_href = match komik_link.value().attr("href") {
+            Some(h) => h,
+            None => continue,
+        };
+        let slug = match slug_re.captures(komik_href) {
+            Some(caps) => caps[1].to_string(),
+            None => continue,
+        };
+        if slug.is_empty() || !seen.insert(slug.clone()) {
+            continue;
+        }
+
+        let judul = komik_link.text().collect::<String>().trim().to_string();
+
+        // --- Chapter link ---
+        let ch_link = match post.select(&ch_sel).next() {
+            Some(el) => el,
+            None => continue,
+        };
+        let ch_url_raw = match ch_link.value().attr("href") {
+            Some(u) => u,
+            None => continue,
+        };
+        let ch_url = normalize_url_full(ch_url_raw);
+        let chapter_number = match ch_num_re.captures(&ch_url) {
+            Some(caps) => caps[1].parse::<f64>().unwrap_or(0.0),
+            None => continue,
+        };
+
+        // --- Time ---
+        let time_str = post
+            .select(&time_sel)
+            .next()
+            .map(|el| el.text().collect::<String>().trim().to_string())
+            .unwrap_or_default();
+        let time_minutes = parse_time_to_minutes(&time_str);
+
+        // --- URL base (untuk construct chapter baru) ---
+        let url_base = extract_url_base(&ch_url);
+
+        items.push(TerbaruItem {
+            slug,
+            judul,
+            chapter_number,
+            chapter_url: ch_url,
+            url_base,
+            time_str,
+            time_minutes,
+        });
+    }
+
+    items
+}
+
+/// Parse time string "X menit lalu" / "X jam lalu" / "X hari lalu" -> menit.
+fn parse_time_to_minutes(time_str: &str) -> u32 {
+    let s = time_str.trim().to_lowercase();
+
+    if let Some(m) = Regex::new(r"(\d+)\s*menit").unwrap().captures(&s) {
+        return m[1].parse::<u32>().unwrap_or(0);
+    }
+    if let Some(m) = Regex::new(r"(\d+)\s*jam").unwrap().captures(&s) {
+        return m[1].parse::<u32>().unwrap_or(0) * 60;
+    }
+    if let Some(m) = Regex::new(r"(\d+)\s*hari").unwrap().captures(&s) {
+        return m[1].parse::<u32>().unwrap_or(0) * 60 * 24;
+    }
+
+    // Default: anggap sudah lama (>24 jam)
+    99999
+}
+
+/// Extract URL base dari chapter URL (strip "-chapter-{number}").
+///
+/// "https://komikindo.ch/blue-lock-chapter-342/"
+/// → "https://komikindo.ch/blue-lock"
+pub fn extract_url_base(chapter_url: &str) -> String {
+    let re = Regex::new(r"-chapter-[\d.]+/?$").unwrap();
+    let trimmed = chapter_url.trim_end_matches('/');
+    re.replace(trimmed, "").to_string()
+}
+
+/// Construct chapter URL dari base dan nomor chapter.
+///
+/// ("https://komikindo.ch/blue-lock", 341)
+/// → "https://komikindo.ch/blue-lock-chapter-341/"
+pub fn construct_chapter_url(url_base: &str, chapter_number: f64) -> String {
+    if chapter_number.fract() == 0.0 {
+        format!("{}-chapter-{}/", url_base, chapter_number as i64)
+    } else {
+        // Fractal chapter: 124.2 → "chapter-124-2"
+        let int_part = chapter_number.trunc() as i64;
+        let frac_part = chapter_number.fract();
+        // 0.2 → "2", 0.15 → "15", 0.10 → "10"
+        let frac_formatted = format!("{:.10}", frac_part);
+        let frac_str = frac_formatted
+            .split('.')
+            .nth(1)
+            .unwrap_or("0")
+            .trim_end_matches('0');
+        format!("{}-chapter-{}-{}/", url_base, int_part, frac_str)
+    }
+}
+
+/// Normalize URL: add BASE_URL prefix if relative.
+fn normalize_url_full(raw: &str) -> String {
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.to_string()
+    } else if raw.starts_with('/') {
+        format!("{BASE_URL}{raw}")
+    } else {
+        format!("{BASE_URL}/{raw}")
+    }
+}
+
+// ============================================================
 // HELPERS
 // ============================================================
 

@@ -2,8 +2,9 @@
 /// Format JSONL: 1 line per komik, crash-safe, resume-friendly.
 
 use crate::parsers::KomikDetail;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// Append satu komik ke JSONL file.
@@ -81,10 +82,10 @@ pub fn find_latest_jsonl(dir: &Path) -> Option<PathBuf> {
         .ok()?
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("full_fetch_")
-                && e.file_name().to_string_lossy().ends_with(".jsonl")
+            let name = e.file_name();
+            let name_str = name.to_string_lossy();
+            (name_str.starts_with("full_fetch_") || name_str.starts_with("komik_db"))
+                && name_str.ends_with(".jsonl")
         })
         .collect();
 
@@ -101,4 +102,76 @@ pub fn find_latest_jsonl(dir: &Path) -> Option<PathBuf> {
     entries.sort_by(|a, b| b.1.cmp(&a.1));
 
     entries.into_iter().next().map(|(p, _)| p)
+}
+
+// ============================================================
+// DB HELPERS (HashMap-based JSONL database)
+// ============================================================
+
+/// Load seluruh JSONL ke HashMap<slug, KomikDetail>.
+///
+/// Efisien untuk update: load sekali, compare, save sekali.
+/// Skip baris yang gagal parse (e.g., error entries).
+pub fn load_db(filepath: &Path) -> HashMap<String, KomikDetail> {
+    let mut map = HashMap::new();
+
+    if !filepath.exists() {
+        return map;
+    }
+
+    let file = match File::open(filepath) {
+        Ok(f) => f,
+        Err(_) => return map,
+    };
+
+    let reader = std::io::BufReader::new(file);
+    let mut count = 0usize;
+    let mut skipped = 0usize;
+
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<KomikDetail>(trimmed) {
+            Ok(detail) => {
+                let slug = detail.slug.clone();
+                map.insert(slug, detail);
+                count += 1;
+            }
+            Err(_) => {
+                skipped += 1;
+            }
+        }
+    }
+
+    if skipped > 0 {
+        eprintln!("[DB] Loaded {count} entries, skipped {skipped} invalid lines");
+    }
+
+    map
+}
+
+/// Save HashMap<slug, KomikDetail> ke JSONL file.
+///
+/// Full rewrite — aman untuk data kecil (~18MB dengan Method 2).
+pub fn save_db(filepath: &Path, data: &HashMap<String, KomikDetail>) -> std::io::Result<()> {
+    if let Some(parent) = filepath.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file = File::create(filepath)?;
+    let mut writer = BufWriter::with_capacity(1024 * 64, file);
+
+    for detail in data.values() {
+        let json = serde_json::to_string(detail).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })?;
+        writeln!(writer, "{}", json)?;
+    }
+
+    writer.flush()?;
+    Ok(())
 }
