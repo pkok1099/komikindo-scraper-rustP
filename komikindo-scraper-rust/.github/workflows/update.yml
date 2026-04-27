@@ -26,6 +26,7 @@ jobs:
     timeout-minutes: 15
     env:
       RUST_LOG: warn
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
     steps:
       # ── Checkout source code ──
       - uses: actions/checkout@v4
@@ -87,7 +88,8 @@ jobs:
           mkdir -p data
           ./target/release/komikindo-scraper update \
             --max-pages 3 \
-            --max-age-minutes 380
+            --max-age-minutes 380 \
+            --db
 
       # ── Push updated DB to data branch ──
       # Uses a separate worktree to avoid branch-switching issues.
