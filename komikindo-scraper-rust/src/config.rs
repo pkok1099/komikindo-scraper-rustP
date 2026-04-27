@@ -17,6 +17,7 @@ pub const BASE_URL: &str = "https://komikindo.ch";
 static ENV: LazyLock<EnvConfig> = LazyLock::new(|| {
     dotenvy::dotenv().ok();
     EnvConfig {
+        database_url: env::var("DATABASE_URL").unwrap_or_default(),
         proxy_url: env::var("PROXY_URL").unwrap_or_default(),
         proxy_enabled: matches!(
             env::var("PROXY_ENABLED").unwrap_or_default().to_lowercase().as_str(),
@@ -35,9 +36,13 @@ static ENV: LazyLock<EnvConfig> = LazyLock::new(|| {
 
 #[derive(Debug, Clone)]
 pub struct EnvConfig {
+    /// Supabase PostgreSQL connection string.
+    /// Kosong = DB mode disabled (fallback ke JSONL saja).
+    pub database_url: String,
     pub proxy_url: String,
     pub proxy_enabled: bool,
     pub scraper_retries: u32,
+    #[allow(dead_code)]
     pub scraper_timeout: u64,
 }
 
@@ -73,24 +78,24 @@ pub fn build_chapter_url(slug: &str, chapter_number: f64) -> String {
 // CDN DOMAINS
 // ============================================================
 
-/// domain name -> id
+/// domain name -> id (DB 1-based: komikindo=1, imageainewgeneration=2, ...)
 pub fn cdn_domain_to_id(domain: &str) -> Option<i16> {
     match domain {
-        "komikindo.ch" => Some(0),
-        "imageainewgeneration.lol" => Some(1),
-        "himmga.lat" => Some(2),
-        "gaimgame.pics" => Some(3),
+        "komikindo.ch" => Some(1),
+        "imageainewgeneration.lol" => Some(2),
+        "himmga.lat" => Some(3),
+        "gaimgame.pics" => Some(4),
         _ => None,
     }
 }
 
-/// id -> base URL
+/// id -> base URL (DB 1-based)
 pub fn cdn_id_to_base_url(id: i16) -> &'static str {
     match id {
-        0 => "https://komikindo.ch",
-        1 => "https://imageainewgeneration.lol",
-        2 => "https://himmga.lat",
-        3 => "https://gaimgame.pics",
+        1 => "https://komikindo.ch",
+        2 => "https://imageainewgeneration.lol",
+        3 => "https://himmga.lat",
+        4 => "https://gaimgame.pics",
         _ => "",
     }
 }
