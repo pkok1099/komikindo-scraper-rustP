@@ -1,19 +1,15 @@
 /// Async HTTP fetcher menggunakan libcurl (bypass Cloudflare).
 ///
-/// Menggunakan `curl` crate Rust yang memakai native libcurl.
-/// libcurl punya TLS fingerprint Chrome-compatible, jadi Cloudflare
-/// tidak mendeteksi sebagai bot (berbeda dengan reqwest/rustls).
+/// FULL SPEED MODE:
+///   - Tidak ada semaphore / concurrency limit
+///   - Bottleneck hanya di internet (bandwidth + latency)
+///   - spawn_blocking dengan max_blocking_threads besar
 ///
 /// Architecture:
-///   - Semaphore untuk kontrol concurrency
-///   - Cookie jar otomatis (handle CF __cf_bm, cf_clearance)
+///   - Setiap request = 1 thread di blocking pool (libcurl sync API)
+///   - Cookie jar per-handle (CF __cf_bm cookies)
 ///   - Auto-retry dengan exponential backoff
-///   - Connection reuse via curl multi handle
 ///   - SOCKS5/HTTP proxy support
-///
-/// Termux Compatible:
-///   - static-curl = semua symbol libcurl di-static link
-///   - Tidak perlu libcurl.so di system
 
 use anyhow::Result;
 use curl::easy::{Easy2, Handler, HttpVersion, List, WriteError};
@@ -21,7 +17,6 @@ use log::debug;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
 
 use crate::config::{env_config, BASE_URL};
 
@@ -66,7 +61,6 @@ struct AtomicFetcherStats {
 // COLLECTOR (curl response handler)
 // ============================================================
 
-/// Handler untuk mengumpulkan response body dari curl.
 #[derive(Default)]
 struct Collector {
     data: Vec<u8>,
@@ -80,11 +74,10 @@ impl Handler for Collector {
 }
 
 // ============================================================
-// FETCHER
+// FETCHER (NO SEMAPHORE - FULL SPEED)
 // ============================================================
 
 pub struct Fetcher {
-    semaphore: Arc<Semaphore>,
     max_retries: u32,
     timeout_secs: u64,
     proxy_url: String,
@@ -93,13 +86,7 @@ pub struct Fetcher {
 }
 
 impl Fetcher {
-    /// Buat Fetcher baru berbasis libcurl.
-    ///
-    /// # Arguments
-    /// * `concurrency` - Max concurrent requests
-    /// * `timeout_secs` - Request timeout (default 30)
-    /// * `proxy_url` - Optional SOCKS5/HTTP proxy
-    pub fn new(concurrency: usize, timeout_secs: u64, proxy_url: Option<&str>) -> Result<Self> {
+    pub fn new(timeout_secs: u64, proxy_url: Option<&str>) -> Result<Self> {
         let cfg = env_config();
 
         let effective_proxy = proxy_url
@@ -119,12 +106,11 @@ impl Fetcher {
         };
 
         println!(
-            "[FETCHER] Started (libcurl): concurrency={}, timeout={}s{}",
-            concurrency, timeout_secs, proxy_info
+            "[FETCHER] Started (libcurl, NO LIMIT): timeout={}s{}",
+            timeout_secs, proxy_info
         );
 
         Ok(Fetcher {
-            semaphore: Arc::new(Semaphore::new(concurrency)),
             max_retries: cfg.scraper_retries,
             timeout_secs,
             proxy_url: effective_proxy,
@@ -133,13 +119,8 @@ impl Fetcher {
         })
     }
 
-    /// Fetch satu halaman HTML.
-    ///
-        /// Uses `spawn_blocking` karena libcurl adalah sync API.
+    /// Fetch satu halaman. Tidak ada semaphore - langsung spawn_blocking.
     pub async fn fetch_page(&self, url: &str) -> Result<String> {
-        let _permit = self.semaphore.clone().acquire_owned().await
-            .expect("Semaphore closed");
-
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
 
         let url = url.to_string();
@@ -155,6 +136,8 @@ impl Fetcher {
                 match curl_fetch(&url, timeout_secs, &proxy_url) {
                     Ok(html) => {
                         stats.success.fetch_add(1, Ordering::Relaxed);
+                        stats.bytes_downloaded
+                            .fetch_add(html.len() as u64, Ordering::Relaxed);
                         return Ok(html);
                     }
                     Err(e) => {
@@ -183,7 +166,59 @@ impl Fetcher {
         .map_err(|e| anyhow::anyhow!("Task error: {e}"))?
     }
 
-    /// Ambil statistik fetcher.
+    /// Batch fetch - untuk banyak URL sekaligus tanpa limit.
+    pub async fn fetch_pages_batch(&self, urls: &[String]) -> Vec<(String, Result<String>)> {
+        let mut handles = Vec::with_capacity(urls.len());
+        for url in urls {
+            let url = url.clone();
+            let stats = Arc::clone(&self.stats);
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+
+            let timeout_secs = self.timeout_secs;
+            let proxy_url = self.proxy_url.clone();
+            let max_retries = self.max_retries;
+
+            handles.push(tokio::task::spawn_blocking(move || {
+                let mut last_err = String::new();
+                for attempt in 0..max_retries {
+                    match curl_fetch(&url, timeout_secs, &proxy_url) {
+                        Ok(html) => {
+                            stats.success.fetch_add(1, Ordering::Relaxed);
+                            stats.bytes_downloaded
+                                .fetch_add(html.len() as u64, Ordering::Relaxed);
+                            return (url, Ok(html));
+                        }
+                        Err(e) => {
+                            last_err = e.to_string();
+                            stats.retries.fetch_add(1, Ordering::Relaxed);
+                            if attempt < max_retries - 1 {
+                                std::thread::sleep(Duration::from_secs_f64(
+                                    0.5 * (attempt + 1) as f64,
+                                ));
+                            }
+                        }
+                    }
+                }
+                stats.failed.fetch_add(1, Ordering::Relaxed);
+                (url, Err(anyhow::anyhow!(
+                    "Gagal setelah {} retries: {}", max_retries, last_err
+                )))
+            }));
+        }
+
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.await {
+                Ok(r) => results.push(r),
+                Err(e) => results.push((
+                    "task-error".into(),
+                    Err(anyhow::anyhow!("Task join error: {e}")),
+                )),
+            }
+        }
+        results
+    }
+
     pub fn stats(&self) -> FetcherStats {
         FetcherStats {
             requests: self.stats.requests.load(Ordering::Relaxed),
@@ -193,44 +228,27 @@ impl Fetcher {
             bytes_downloaded: self.stats.bytes_downloaded.load(Ordering::Relaxed),
         }
     }
-
-    /// Elapsed time sejak Fetcher dibuat.
-    #[allow(dead_code)]
-    pub fn elapsed_secs(&self) -> f64 {
-        self.start_time.elapsed().as_secs_f64()
-    }
 }
 
 // ============================================================
-// CURL FETCH IMPLEMENTATION
+// CURL FETCH (per-request)
 // ============================================================
 
-/// Fetch URL menggunakan libcurl dengan Chrome-like settings.
 fn curl_fetch(url: &str, timeout_secs: u64, proxy_url: &str) -> Result<String> {
     let mut handle = Easy2::new(Collector::default());
 
-    // URL
     handle.url(url)?;
-
-    // Chrome User-Agent
     handle.useragent(
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
          AppleWebKit/537.36 (KHTML, like Gecko) \
          Chrome/120.0.0.0 Safari/537.36",
     )?;
-
-    // HTTP/2 preferred (Chrome uses HTTP/2)
     handle.http_version(HttpVersion::V2)?;
-
-    // Follow redirects
     handle.follow_location(true)?;
     handle.max_redirections(10)?;
-
-    // Timeout
     handle.timeout(Duration::from_secs(timeout_secs))?;
     handle.connect_timeout(Duration::from_secs(timeout_secs))?;
 
-    // Headers (Chrome-like)
     let mut headers = List::new();
     headers.append("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")?;
     headers.append("Accept-Language: id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7")?;
@@ -246,46 +264,35 @@ fn curl_fetch(url: &str, timeout_secs: u64, proxy_url: &str) -> Result<String> {
     headers.append("Upgrade-Insecure-Requests: 1")?;
     handle.http_headers(headers)?;
 
-    // Enable cookie jar (memory-only, automatic CF cookie handling)
     handle.cookie_file("")?;
     handle.cookie_list("session=1")?;
 
-    // TLS settings - gunakan default libcurl TLS yang Chrome-compatible
-
-    // Proxy
     if !proxy_url.is_empty() {
         handle.proxy(proxy_url)?;
     }
 
-    // DNS cache timeout
     handle.dns_cache_timeout(Duration::from_secs(300))?;
-
-    // TCP keepalive
     handle.tcp_keepalive(true)?;
     handle.tcp_keepidle(Duration::from_secs(30))?;
-
-    // Compressed transfer - only gzip/deflate (no brotli in static curl)
     handle.accept_encoding("gzip, deflate")?;
 
-    // Execute
+    // Connection reuse (keep-alive)
+
     handle.perform()?;
     let response_code = handle.response_code()?;
 
-    // Get collected data
     let collector = handle.get_ref();
-    let bytes = &collector.data;
-    let text = String::from_utf8_lossy(bytes).to_string();
+    let text = String::from_utf8_lossy(&collector.data).to_string();
 
-    // Check response code
     if response_code >= 400 {
         anyhow::bail!("HTTP {response_code}");
     }
-
-    // Cloudflare challenge detection
-    if text.contains("Just a moment...") || text.contains("cf-challenge") || text.contains("Checking your browser") {
+    if text.contains("Just a moment...")
+        || text.contains("cf-challenge")
+        || text.contains("Checking your browser")
+    {
         anyhow::bail!("Cloudflare challenge detected (status={response_code})");
     }
-
     if text.len() < 100 && (text.contains("error") || text.contains("Access denied")) {
         anyhow::bail!("Suspicious short response ({} bytes)", text.len());
     }

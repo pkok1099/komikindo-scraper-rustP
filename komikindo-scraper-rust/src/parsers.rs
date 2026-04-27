@@ -109,7 +109,7 @@ pub fn parse_komik_list(html: &str) -> Vec<String> {
 ///
 /// PERBAIKAN: chapter URL diambil langsung dari `<a href="...">` di detail page,
 /// sehingga tidak perlu construct manual dari slug.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct KomikDetail {
     pub slug: String,
     pub judul: Option<String>,
