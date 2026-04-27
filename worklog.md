@@ -48,3 +48,26 @@ Stage Summary:
 - GitHub Actions workflow siap: .github/workflows/update.yml
 - .gitignore siap
 - Semua pending task selesai: concurrent fetching ✓, smart update ✓, GitHub Actions ✓
+
+---
+Task ID: 3
+Agent: Main Agent
+Task: Build release binaries (amd64 + arm64)
+
+Work Log:
+- Install Rust 1.95.0 toolchain (tidak ada sebelumnya)
+- Build amd64 native: cargo build --release -> 4.7MB stripped ELF x86-64
+- Coba cross-compile arm64 dari environment non-root:
+  - Download ARM64 cross toolchain (gcc-14, binutils, libc-dev) dari Debian trixie packages
+  - Build OpenSSL 3.5.0 static untuk ARM64 (berhasil)
+  - Cross-compile curl static untuk ARM64 (gagal — complex dependency chain tanpa root)
+- Solusi: buat GitHub Actions workflow untuk build kedua target:
+  - amd64: native build di ubuntu-latest
+  - arm64: cross-compile dengan gcc-aarch64-linux-gnu + QEMU
+  - Matrix strategy, artifacts, dan auto GitHub Release saat push tag
+- Binary amd64 siap di /home/z/my-project/download/release/komikindo-scraper-amd64
+
+Stage Summary:
+- amd64 binary: /home/z/my-project/download/release/komikindo-scraper-amd64 (4.7MB)
+- arm64: build via GitHub Actions (workflow: .github/workflows/release.yml)
+- Trigger release: push tag `v*` atau manual workflow_dispatch
