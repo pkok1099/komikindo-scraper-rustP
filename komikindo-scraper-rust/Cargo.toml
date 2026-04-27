@@ -9,9 +9,14 @@ description = "KomikIndo scraper - Rust version for Termux"
 tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
 
 # HTTP client (rustls = no OpenSSL, Termux-friendly)
+# cookies + http2 untuk bypass Cloudflare fingerprint detection
 reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls", "socks", "gzip", "brotli", "deflate", "stream"
+    "rustls-tls", "socks", "gzip", "brotli", "deflate", "stream",
+    "cookies", "http2"
 ] }
+
+# curl-based HTTP client sebagai fallback untuk bypass Cloudflare
+curl = { version = "0.4", features = ["static-curl", "http2"] }
 
 # HTML parsing
 scraper = "0.22"
