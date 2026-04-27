@@ -17,8 +17,6 @@ pub const BASE_URL: &str = "https://komikindo.ch";
 static ENV: LazyLock<EnvConfig> = LazyLock::new(|| {
     dotenvy::dotenv().ok();
     EnvConfig {
-        supabase_url: env::var("SUPABASE_URL").unwrap_or_default(),
-        supabase_key: env::var("SUPABASE_KEY").unwrap_or_default(),
         proxy_url: env::var("PROXY_URL").unwrap_or_default(),
         proxy_enabled: matches!(
             env::var("PROXY_ENABLED").unwrap_or_default().to_lowercase().as_str(),
@@ -37,8 +35,6 @@ static ENV: LazyLock<EnvConfig> = LazyLock::new(|| {
 
 #[derive(Debug, Clone)]
 pub struct EnvConfig {
-    pub supabase_url: String,
-    pub supabase_key: String,
     pub proxy_url: String,
     pub proxy_enabled: bool,
     pub scraper_retries: u32,
@@ -47,36 +43,6 @@ pub struct EnvConfig {
 
 pub fn env_config() -> &'static EnvConfig {
     &ENV
-}
-
-// ============================================================
-// HTTP HEADERS
-// ============================================================
-pub fn default_headers() -> reqwest::header::HeaderMap {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_static(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-             AppleWebKit/537.36 (KHTML, like Gecko) \
-             Chrome/120.0.0.0 Safari/537.36",
-        ),
-    );
-    headers.insert(
-        reqwest::header::ACCEPT,
-        reqwest::header::HeaderValue::from_static(
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        ),
-    );
-    headers.insert(
-        reqwest::header::ACCEPT_LANGUAGE,
-        reqwest::header::HeaderValue::from_static("id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"),
-    );
-    headers.insert(
-        reqwest::header::REFERER,
-        reqwest::header::HeaderValue::from_static("https://komikindo.ch/"),
-    );
-    headers
 }
 
 // ============================================================
