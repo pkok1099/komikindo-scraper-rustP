@@ -1,159 +1,199 @@
-# KomikIndo Scraper - Rust Version (Termux Compatible)
+# KomikIndo Scraper (Rust)
 
-Scraper untuk [KomikIndo](https://komikindo.ch) yang ditulis ulang di Rust.
-Full async, memory-efficient, dan bisa di-build langsung di Termux.
+Scraper untuk [KomikIndo](https://komikindo.ch) yang ditulis di Rust. Dirancang untuk berjalan di **Termux (Android)** dan **GitHub Actions**.
 
-## ⚡ Perubahan dari Python Version
+> **Method 2: Tanpa image** — hanya menyimpan metadata komik, daftar chapter (nomor + URL), dan genre. Tidak ada image scraping.
 
-### FIX: Masalah Slug
-**Sebelumnya (Python):**
-```python
-# chapter_read.py - URL di-construct manual, BISA SALAH!
-chapter_url = build_chapter_url(slug, chapter_number)
-# Contoh: build_chapter_url("nano-machine", 309)
-#       -> "https://komikindo.ch/nano-machine-chapter-309/"
-# Masalah: slug di daftar-manga bisa beda format dengan slug di chapter URL
-```
+## Fitur
 
-**Sekarang (Rust):**
-```rust
-// parsers.rs - extract_chapters() -> URL LANGSUNG dari href di detail page
-ChapterInfo {
-    number: 309.0,
-    url: "https://komikindo.ch/nano-machine-chapter-309/",  // ASLI dari website!
-}
+- **Full Speed** — tidak ada concurrency limit, 8192 blocking threads, bottleneck hanya di internet
+- **Smart Update** — incremental update dari halaman `/komik-terbaru/`, deteksi komik baru & chapter baru
+- **Supabase DB** — upsert otomatis ke PostgreSQL (komik, chapters, genres, scrape log)
+- **JSONL Backup** — output crash-safe format JSONL sebagai fallback/backup
+- **Cloudflare Bypass** — menggunakan `curl` crate dengan TLS fingerprint Chrome
+- **Termux Ready** — build langsung di Android tanpa OpenSSL dependency
+- **GitHub Actions** — cron setiap 6 jam + manual trigger, build & deploy otomatis
 
-// scraper.rs - scrape_chapter_images() pakai URL langsung
-scrape_chapter_images(&chapter.url, &fetcher).await
-// Tidak ada lagi build_chapter_url() yang bisa salah!
-```
+## Database Schema (Supabase PostgreSQL)
 
-### Keuntungan Rust vs Python
-- **Single binary** - Tidak perlu install dependencies
-- **Memory efficient** - ~10-20MB RAM vs ~100-200MB Python
-- **Fast** - Native compiled, connection pooling via reqwest
-- **Termux friendly** - rustls-tls (no OpenSSL), bisa build langsung di Android
+| Tabel | Deskripsi |
+|-------|-----------|
+| `komik` | Metadata: judul, slug, thumbnail, rating, sinopsis, author, chapter count |
+| `chapters` | Daftar chapter per komik (chapter_number only, tanpa image) |
+| `komik_genres` | Relasi many-to-many komik ↔ genre |
+| `scrape_log` | Log hasil scraping (operation, status, totals) |
 
-## 📱 Install di Termux
+## Install
+
+### Termux (Android ARM64)
 
 ```bash
-# 1. Install Rust di Termux
-pkg install rust
-
-# 2. Clone repository
-git clone <repo-url>
+pkg install rust git
+git clone https://github.com/pkok1099/komikindo-scraper-rust.git
 cd komikindo-scraper-rust
-
-# 3. Build release
 cargo build --release
-
-# 4. Binary ada di:
-ls target/release/komikindo-scraper
+# Binary: target/release/komikindo-scraper
 ```
 
-Atau cross-compile dari PC:
+### Download Binary (Pre-built)
+
+Lihat [GitHub Releases](https://github.com/pkok1099/komikindo-scraper-rust/releases) untuk binary amd64 dan arm64.
+
+### Linux / Server
+
 ```bash
-# Target: aarch64-linux-android (Android ARM64)
-rustup target add aarch64-linux-android
-# Lihat README-cross-compile.md untuk detail lengkap
+git clone https://github.com/pkok1099/komikindo-scraper-rust.git
+cd komikindo-scraper-rust
+cargo build --release
 ```
 
-## 🚀 Usage
+## Usage
 
-### Full Fetch (Scrape Semua Komik)
+### Environment Variables
+
+Buat file `.env` di root project:
+
+```env
+DATABASE_URL=postgresql://postgres.xxx@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres
+```
+
+> `DATABASE_URL` opsional. Tanpa DB, hasil scrape disimpan ke file JSONL.
+
+### Commands
 
 ```bash
-# Full fetch semua komik (detail + chapter images)
+# Smart update (cek komik terbaru, upsert ke DB)
+./komikindo-scraper update
+
+# Smart update dengan database
+./komikindo-scraper update --db
+
+# Smart update - dry run (lihat apa yang akan berubah)
+./komikindo-scraper update --dry-run
+
+# Smart update - 5 halaman, filter 12 jam terakhir
+./komikindo-scraper update --max-pages 5 --max-age-minutes 720
+
+# Full fetch semua komik
 ./komikindo-scraper full-fetch
 
-# Skip chapter images (lebih cepat, hanya metadata)
-./komikindo-scraper full-fetch --skip-chapters
+# Full fetch - limit 50 komik
+./komikindo-scraper full-fetch --limit 50
 
-# Testing: limit 10 komik
-./komikindo-scraper full-fetch --limit 10
+# Full fetch ke database
+./komikindo-scraper full-fetch --db
 
-# Turbo mode: 500 concurrent requests
-./komikindo-scraper full-fetch --turbo
+# Full fetch - resume dari slug tertentu
+./komikindo-scraper full-fetch --start-from "nano-machine"
 
-# Resume dari terakhir
-./komikindo-scraper full-fetch --resume
-
-# Dengan proxy
-./komikindo-scraper full-fetch --proxy socks5://127.0.0.1:1080
-```
-
-### Homepage Check
-
-```bash
+# Homepage check
 ./komikindo-scraper homepage
 ```
 
-## 📂 Output
-
-Hasil scrape disimpan di `data/` dalam format JSONL:
-```
-data/
-└── full_fetch_20260427_090000.jsonl
-```
-
-Setiap baris = 1 komik (JSON), crash-safe, bisa resume.
-
-### Contoh Output JSONL
-```json
-{
-  "slug": "155895-nano-machine",
-  "judul": "Nano Machine",
-  "tipe": "Manhwa",
-  "thumb_domain_id": 0,
-  "thumb_path": "2022/09/50kg-Cinderella.jpg",
-  "status_id": 1,
-  "author": "한중월야",
-  "rating": 8.5,
-  "genre_list": ["Action", "Martial Arts"],
-  "genre_ids": [1, 36],
-  "chapters": [
-    {
-      "number": 309.0,
-      "url": "https://komikindo.ch/nano-machine-chapter-309/",
-      "cdn_domain_id": 1,
-      "cdn_path_prefix": "data/91164060/16/abc",
-      "image_filenames": ["SLePJKtMVn", "xyz789"],
-      "image_ext_ids": [1, 1],
-      "total_images": 20
-    }
-  ],
-  "latest_chapter_number": 309.0
-}
-```
-
-## 🔧 Environment Variables (.env)
+### Full CLI Reference
 
 ```
-PROXY_URL=socks5://127.0.0.1:1080
-PROXY_ENABLED=true
-SCRAPER_RETRIES=3
+komikindo-scraper [COMMAND]
+
+Commands:
+  full-fetch    Fetch semua komik + detail (FULL SPEED)
+  update        Smart incremental update dari /komik-terbaru/
+  homepage      Scrape homepage untuk cek update terbaru
+
+Options:
+  --db              Write ke database (requires DATABASE_URL)
+  --limit <N>       Batasi jumlah komik (0 = semua)
+  --start-from <slug>  Resume dari slug tertentu
+  --resume          Resume dari JSONL terakhir
+  --max-pages <N>   Max halaman /komik-terbaru/ (default: 3)
+  --max-age-minutes <N>  Filter entry terbaru dalam N menit (default: 360)
+  --dry-run         Hanya tampilkan perubahan, tanpa save
+  --proxy <URL>     SOCKS5/HTTP proxy
+  --timeout <SEC>   Timeout per request (default: 30)
 ```
 
-## 🏗️ Struktur Project
+## GitHub Actions
+
+### Smart Update (Cron)
+
+Workflow `update.yml` berjalan otomatis setiap **6 jam** (07:00, 13:00, 19:00, 01:00 WIB).
+
+**Setup:**
+1. Tambahkan secret `DATABASE_URL` di repo Settings > Secrets and variables > Actions
+2. Workflow akan otomatis build, run update, dan push hasil ke branch `data`
+
+**Manual trigger:** Actions tab > Smart Update > Run workflow
+
+### Build Release
+
+Workflow `release.yml` membuat binary untuk amd64 dan arm64. Trigger manual atau push tag `v*`.
+
+## Arsitektur
 
 ```
 komikindo-scraper-rust/
 ├── Cargo.toml              # Dependencies & build config
+├── .github/workflows/
+│   ├── update.yml          # Cron setiap 6 jam → Supabase DB
+│   └── release.yml         # Build release amd64 + arm64
 ├── src/
-│   ├── main.rs             # CLI entry point, full fetch runner
-│   ├── config.rs           # Constants, genre maps, URL builders
-│   ├── fetcher.rs          # Async HTTP client (reqwest + rustls)
+│   ├── main.rs             # CLI entry point, full fetch & update runner
+│   ├── config.rs           # Constants, genre maps, URL builders, env config
+│   ├── db.rs               # Supabase PostgreSQL: upsert, sync, log
+│   ├── fetcher.rs          # Async HTTP client (curl crate + Cloudflare bypass)
 │   ├── parsers.rs          # HTML parsing (scraper crate)
-│   ├── scraper.rs          # High-level scrape functions
-│   └── jsonl.rs            # JSONL I/O helpers
-└── data/                   # Output (JSONL files)
+│   ├── scraper.rs          # High-level scrape logic, smart update
+│   └── jsonl.rs            # JSONL read/write helpers
+├── data/                   # Output JSONL (gitignored)
+└── .env                    # DATABASE_URL (gitignored)
 ```
 
-## 📊 Performance
+## Dependencies
 
-| Metric | Python (aiohttp) | Rust (reqwest) |
-|--------|-----------------|----------------|
-| Binary Size | N/A (interpreter) | ~6.3 MB |
+| Crate | Fungsi |
+|-------|--------|
+| `curl` | HTTP client, TLS fingerprint Chrome, Cloudflare bypass |
+| `scraper` | HTML parsing (CSS selector) |
+| `sqlx` | PostgreSQL async client (Supabase) |
+| `tokio` | Async runtime, 8192 blocking threads |
+| `clap` | CLI argument parser |
+| `serde` / `serde_json` | Serialization / JSONL |
+| `chrono` | Date/time |
+| `anyhow` | Error handling |
+
+## Performance
+
+| Metric | Python (aiohttp) | Rust (curl) |
+|--------|-----------------|-------------|
+| Binary Size | N/A (interpreter) | ~6 MB (stripped) |
 | RAM Usage | ~100-200 MB | ~10-20 MB |
 | Startup Time | ~1-2s | ~0.01s |
+| Concurrent Requests | ~50-100 | 8192 |
 | Dependencies | pip install 10+ packages | Single binary |
+| Termux Compatible | Tidak stabil | Full support |
+
+## Fix dari Python Version
+
+### Masalah Slug (Fixed)
+
+Python membangun chapter URL secara manual dari slug, yang sering salah format:
+
+```python
+# Python — BISA SALAH!
+chapter_url = build_chapter_url("nano-machine", 309)
+# → "https://komikindo.ch/nano-machine-chapter-309/"  # Tidak selalu benar
+```
+
+Rust mengambil URL langsung dari `<a href>` di detail page:
+
+```rust
+// Rust — URL ASLI dari website!
+ChapterInfo {
+    number: 309.0,
+    url: "https://komikindo.ch/nano-machine-chapter-309/",  // dari href
+}
+```
+
+## License
+
+MIT
