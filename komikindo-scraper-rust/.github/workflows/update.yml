@@ -1,10 +1,21 @@
-name: Update Komik Data
+# KomikIndo Smart Update — runs every 6 hours
+#
+# Flow:
+#   1. Build Rust binary (release, statically linked curl)
+#   2. Restore DB from data branch
+#   3. Run `komikindo-scraper update`
+#   4. Push updated DB to data branch
+#
+# DB storage: dedicated `data` branch containing only data/komik_db.jsonl
+# This keeps the main branch clean and avoids bloating git history.
+
+name: Smart Update
 
 on:
   schedule:
-    # Setiap 6 jam (cron bisa delay 5-60 menit saat traffic GitHub tinggi)
-    - cron: '0 */6 * * *'
-  workflow_dispatch: # Manual trigger dari GitHub UI
+    # Every 6 hours (UTC) = 07:00, 13:00, 19:00, 01:00 WIB
+    - cron: '0 0,6,12,18 * * *'
+  workflow_dispatch: # Manual trigger from GitHub UI
 
 permissions:
   contents: write
@@ -12,43 +23,135 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    timeout-minutes: 15
+    env:
+      RUST_LOG: warn
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      # ── Checkout source code ──
+      - uses: actions/checkout@v4
 
+      # ── Rust toolchain ──
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+      # ── Generate Cargo.lock if missing ──
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile 2>/dev/null || true
+
+      # ── Cache cargo (build time ~2min without cache, ~30s with) ──
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
         with:
-          key: komikindo-scraper
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
-      - name: Build release binary
-        run: cargo build --release --manifest-path komikindo-scraper-rust/Cargo.toml
-
-      - name: Run smart update
-        working-directory: komikindo-scraper-rust
+      # ── Build dependencies (curl static linking needs headers) ──
+      - name: Install build dependencies
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libcurl4-openssl-dev pkg-config
+
+      # ── Build release binary ──
+      # Strip + LTO already configured in Cargo.toml [profile.release]
+      - name: Build
+        run: cargo build --release 2>&1
+
+      # ── Restore DB from data branch ──
+      # The `data` branch stores only data/komik_db.jsonl.
+      # If branch doesn't exist yet, start with empty DB.
+      - name: Restore DB from data branch
+        id: restore-db
+        run: |
+          mkdir -p data
+          if git ls-remote --heads origin data | grep -q "refs/heads/data"; then
+            git fetch origin data --depth=1
+            if git show origin/data:data/komik_db.jsonl > data/komik_db.jsonl 2>/dev/null; then
+              LINES=$(wc -l < data/komik_db.jsonl)
+              echo "[DB] Restored ${LINES} komik from data branch"
+            else
+              echo "[DB] data branch exists but no DB file found"
+            fi
+          else
+            echo "[DB] No data branch yet, starting fresh"
+          fi
+
+      # ── Run smart update ──
+      # max_age_minutes=380 (>360) gives 20min buffer for cron delay
+      - name: Run smart update
+        run: |
+          mkdir -p data
           ./target/release/komikindo-scraper update \
             --max-pages 3 \
-            --max-age-minutes 360 \
-            --timeout 30
+            --max-age-minutes 380
 
-      - name: Commit changes
+      # ── Push updated DB to data branch ──
+      # Uses a separate worktree to avoid branch-switching issues.
+      - name: Push DB to data branch
         run: |
+          if [ ! -f data/komik_db.jsonl ]; then
+            echo "[DB] No DB file produced — skipping push"
+            exit 0
+          fi
+
+          # Save updated DB to temp
+          cp data/komik_db.jsonl /tmp/komik_db.jsonl
+
+          DB_SIZE=$(du -h /tmp/komik_db.jsonl | cut -f1)
+          DB_LINES=$(wc -l < /tmp/komik_db.jsonl)
+          echo "[DB] Updated: ${DB_SIZE}, ${DB_LINES} komik"
+
+          # Configure git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add komikindo-scraper-rust/data/
-          # Hanya commit kalau ada perubahan
-          git diff --cached --quiet --exit-code && echo "NO_CHANGES" || git commit -m "update: komik data $(date -u +%Y-%m-%d_%H:%M) [skip ci]"
 
-      - name: Push changes
-        run: |
-          if [ "$(git log --oneline -1 | grep -c 'update:')" -eq 1 ]; then
-            git push
+          # Create or update data branch
+          if git ls-remote --heads origin data | grep -q "refs/heads/data"; then
+            git fetch origin data
+            git branch -f data origin/data
           else
-            echo "Nothing to push"
+            git checkout --orphan data
+            git rm -rf . 2>/dev/null || true
+            git branch -f data HEAD
           fi
+
+          # Use worktree to avoid switching branches
+          git worktree add /tmp/db-worktree data 2>/dev/null || \
+            (git worktree remove /tmp/db-worktree --force 2>/dev/null; git worktree add /tmp/db-worktree data)
+
+          # Copy DB into worktree
+          mkdir -p /tmp/db-worktree/data
+          cp /tmp/komik_db.jsonl /tmp/db-worktree/data/komik_db.jsonl
+
+          # Commit and push
+          cd /tmp/db-worktree
+          git add data/komik_db.jsonl
+          TIMESTAMP=$(date -u +%Y-%m-%d_%H:%M:%S)
+          git commit -m "DB update ${TIMESTAMP} (${DB_LINES} komik)" \
+            --allow-empty-message || echo "[DB] No changes to commit"
+          git push origin data
+
+          # Cleanup
+          cd "$GITHUB_WORKSPACE"
+          git worktree remove /tmp/db-worktree --force
+
+          echo "[DB] Pushed to data branch successfully"
+
+      # ── Summary ──
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== Smart Update Summary ==="
+          if [ -f data/komik_db.jsonl ]; then
+            SIZE=$(du -h data/komik_db.jsonl | cut -f1)
+            LINES=$(wc -l < data/komik_db.jsonl)
+            echo "DB size: ${SIZE}"
+            echo "Total komik: ${LINES}"
+          else
+            echo "No DB file produced"
+          fi
+          echo "Timestamp: $(date -u)"

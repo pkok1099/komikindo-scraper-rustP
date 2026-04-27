@@ -20,3 +20,31 @@ Stage Summary:
 - Fix slug: chapter URL diambil langsung dari href di detail page (bukan construct manual)
 - Commands: full-fetch, homepage (mirip Python version)
 - Support: --skip-chapters, --limit, --resume, --turbo, --proxy
+
+---
+Task ID: 2
+Agent: Main Agent
+Task: Full speed concurrent fetching + smart incremental update + GitHub Actions
+
+Work Log:
+- Implementasi full speed pipeline: spawn ALL detail fetches + chapter fetches tanpa semaphore/batch (8192 blocking threads)
+- Implementasi smart update: parse_komik_terbaru() parser, construct_chapter_url(), extract_url_base()
+- DB lookup O(1) via HashMap, hemat hit DB
+- Update command: --max-pages, --max-age-minutes, --dry-run
+- Audit slug inconsistency: chapter URL (blue-lock-chapter-342) vs detail URL (komik/675026-blue-lock)
+  - Full fetch: AMAN — chapter URL diambil langsung dari href detail page, tidak di-construct
+  - Update: AMAN — DB lookup pakai detail slug, chapter construct pakai url_base dari chapter URL
+  - Tidak perlu ubah apapun
+- Buat GitHub Actions workflow: .github/workflows/update.yml
+  - Cron setiap 6 jam (UTC 0,6,12,18)
+  - Build Rust binary di ubuntu-latest
+  - DB persist di dedicated `data` branch (git worktree, bukan main)
+  - Manual trigger via workflow_dispatch
+  - Cargo cache untuk build speed
+- Buat .gitignore untuk Rust project
+
+Stage Summary:
+- Slug inconsistency audit: KODE SUDAH BENAR, tidak perlu perubahan
+- GitHub Actions workflow siap: .github/workflows/update.yml
+- .gitignore siap
+- Semua pending task selesai: concurrent fetching ✓, smart update ✓, GitHub Actions ✓
