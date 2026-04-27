@@ -15,9 +15,29 @@ pub const BASE_URL: &str = "https://komikindo.ch";
 // ============================================================
 
 static ENV: LazyLock<EnvConfig> = LazyLock::new(|| {
-    dotenvy::dotenv().ok();
+    // Load .env — dotenvy hanya set env var yang BELUM ada.
+    // Fallback: coba beberapa lokasi .env
+    let env_loaded = dotenvy::dotenv().is_ok();
+    if !env_loaded {
+        // Coba dari direktori binary (project root)
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                let env_path = exe_dir.parent().unwrap_or(exe_dir).join(".env");
+                dotenvy::from_path(&env_path).ok();
+            }
+        }
+    }
+
+    // DEBUG: show which DATABASE_URL is loaded
+    let db_url = env::var("DATABASE_URL").unwrap_or_default();
+    if db_url.is_empty() {
+        eprintln!("[ENV] DATABASE_URL not set — DB mode disabled");
+    } else if db_url.starts_with("file:") {
+        eprintln!("[ENV] WARNING: DATABASE_URL looks like SQLite (file:), expected PostgreSQL!");
+    }
+
     EnvConfig {
-        database_url: env::var("DATABASE_URL").unwrap_or_default(),
+        database_url: db_url,
         proxy_url: env::var("PROXY_URL").unwrap_or_default(),
         proxy_enabled: matches!(
             env::var("PROXY_ENABLED").unwrap_or_default().to_lowercase().as_str(),

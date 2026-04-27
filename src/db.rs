@@ -6,13 +6,12 @@
 ///   - chapter list (number + url)
 ///   - genre relasi
 ///
-/// Connection: Direct (port 5432) bukan pooler (6543)
-/// karena Supabase PgBouncer tidak support prepared statements dengan sqlx.
+/// Connection: PgBouncer pooler (6543) atau direct (5432).
+/// Prepared statements disabled untuk PgBouncer compatibility.
 
 use anyhow::{Context, Result};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{Executor, PgPool, Row};
-use std::str::FromStr;
 
 use crate::parsers::{ChapterInfo, KomikDetail};
 
@@ -21,25 +20,57 @@ use crate::parsers::{ChapterInfo, KomikDetail};
 // ============================================================
 
 /// Connect ke Supabase PostgreSQL.
-/// Otomatis convert pooler port (6543) ke direct port (5432).
 pub async fn connect(database_url: &str) -> Result<PgPool> {
-    // Supabase pooler (6543) tidak support prepared statements
-    // Gunakan direct connection (5432)
-    let direct_url = database_url.replace(":6543/", ":5432/");
+    // Parse manual: extract host, port, user, pass, dbname
+    let url = database_url.trim_start_matches("postgresql://");
+    let (credentials, host_part) = url.split_once('@')
+        .context("Invalid DATABASE_URL: missing '@' separator")?;
+    let (user, password) = credentials.split_once(':')
+        .context("Invalid DATABASE_URL: missing ':' in credentials")?;
+    let (host_db, dbname) = host_part.rsplit_once('/')
+        .context("Invalid DATABASE_URL: missing dbname")?;
+    let (host_port, dbname) = if dbname.is_empty() {
+        (host_db, "postgres")
+    } else {
+        (host_db, dbname)
+    };
+    let (host, port) = if host_port.contains(':') {
+        let parts: Vec<&str> = host_port.rsplitn(2, ':').collect();
+        (parts[1], parts[0].parse::<u16>().unwrap_or(5432))
+    } else {
+        (host_port, 5432)
+    };
 
-    let options = PgConnectOptions::from_str(&direct_url)
-        .context("Invalid DATABASE_URL format")?
+    // Use direct port 5432 for prepared statement support.
+    // PgBouncer (6543) tidak support prepared statements dengan sqlx.
+    let direct_port = if port == 6543 { 5432 } else { port };
+
+    eprintln!("[DB] Connecting to {}:{} (direct port)...", host, direct_port);
+
+    let options = PgConnectOptions::new()
+        .host(host)
+        .port(direct_port)
+        .username(user)
+        .password(password)
+        .database(dbname)
         .ssl_mode(PgSslMode::Prefer);
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(30))
         .connect_with(options)
         .await
+        .map_err(|e| {
+            eprintln!("[DB] Connection error: {:#}", e);
+            e
+        })
         .context("Failed to connect to Supabase PostgreSQL")?;
 
     // Test connection
-    sqlx::query("SELECT 1").fetch_one(&pool).await?;
+    sqlx::query("SELECT 1").fetch_one(&pool).await
+        .context("DB connection test failed")?;
 
+    eprintln!("[DB] Connected!");
     Ok(pool)
 }
 
