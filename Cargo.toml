@@ -1,0 +1,46 @@
+[package]
+name = "komikindo-scraper"
+version = "1.0.0"
+edition = "2021"
+description = "KomikIndo scraper - Rust version for Termux"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
+
+# HTTP client - curl untuk bypass Cloudflare (static-curl = no system lib needed)
+curl = { version = "0.4", features = ["static-curl", "http2"] }
+
+# HTML parsing
+scraper = "0.22"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI arguments
+clap = { version = "4", features = ["derive"] }
+
+# Regex
+regex = "1"
+
+# Logging
+env_logger = "0.11"
+log = "0.4"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# dotenv for .env support
+dotenvy = "0.15"
+sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "tls-rustls", "chrono"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
