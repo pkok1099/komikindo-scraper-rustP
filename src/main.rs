@@ -40,6 +40,7 @@ use sqlx::PgPool;
 
 use crate::fetcher::Fetcher;
 use crate::scraper::{scrape_full_komik_list, scrape_komik_detail, scrape_komik_terbaru};
+use crate::config::BASE_URL;
 
 // ============================================================
 // CLI
@@ -50,6 +51,10 @@ use crate::scraper::{scrape_full_komik_list, scrape_komik_detail, scrape_komik_t
 #[command(about = "KomikIndo Scraper - Rust Full Speed + Smart Update + DB")]
 #[command(version)]
 struct Cli {
+    /// Enable verbose output (curl protocol details, timing, response info)
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -75,7 +80,7 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         timeout: u64,
 
-        /// SOCKS5/HTTP proxy URL
+        /// SOCKS5/HTTP proxy URL (e.g. socks5://127.0.0.1:1080)
         #[arg(long)]
         proxy: Option<String>,
 
@@ -98,7 +103,7 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         timeout: u64,
 
-        /// SOCKS5/HTTP proxy URL
+        /// SOCKS5/HTTP proxy URL (e.g. socks5://127.0.0.1:1080)
         #[arg(long)]
         proxy: Option<String>,
 
@@ -116,6 +121,18 @@ enum Commands {
         #[arg(long)]
         proxy: Option<String>,
     },
+
+    /// Test connectivity to komikindo.ch (with optional proxy)
+    /// Use --verbose to see full curl protocol details
+    Check {
+        /// SOCKS5/HTTP proxy URL (e.g. socks5://127.0.0.1:1080)
+        #[arg(long)]
+        proxy: Option<String>,
+
+        /// Timeout per request dalam detik
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
 }
 
 // ============================================================
@@ -123,16 +140,20 @@ enum Commands {
 // ============================================================
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        .init();
-
     let cli = Cli::parse();
+
+    // Set log level based on verbose flag
+    let log_level = if cli.verbose { "debug" } else { "warn" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
+        .init();
 
     // 8192 blocking threads = 8192 concurrent curl requests
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .max_blocking_threads(8192)
         .build()?;
+
+    let verbose = cli.verbose;
 
     runtime.block_on(async move {
         match cli.command {
@@ -151,6 +172,7 @@ fn main() -> Result<()> {
                     timeout,
                     proxy,
                     use_db: db,
+                    verbose,
                 })
                 .await?;
             }
@@ -169,11 +191,12 @@ fn main() -> Result<()> {
                     proxy,
                     dry_run,
                     use_db: db,
+                    verbose,
                 })
                 .await?;
             }
             Commands::Homepage { proxy } => {
-                let fetcher = Fetcher::new(30, proxy.as_deref())?;
+                let fetcher = Fetcher::new(30, proxy.as_deref(), verbose)?;
                 let updates = scraper::scrape_homepage_updates(&fetcher).await?;
                 println!("\n=== Homepage Updates ({}) ===", updates.len());
                 for u in &updates {
@@ -185,9 +208,91 @@ fn main() -> Result<()> {
                     );
                 }
             }
+            Commands::Check { proxy, timeout } => {
+                run_check(&proxy, timeout, verbose).await?;
+            }
         }
         Ok(())
     })
+}
+
+// ============================================================
+// CHECK (connectivity test)
+// ============================================================
+
+async fn run_check(proxy: &Option<String>, timeout: u64, verbose: bool) -> Result<()> {
+    println!("{}", "=".repeat(50));
+    println!("  KOMIKINDO CONNECTIVITY CHECK");
+    if let Some(ref p) = proxy {
+        println!("  Proxy: {p}");
+    } else {
+        println!("  Proxy: (none — direct connection)");
+    }
+    if verbose {
+        println!("  Verbose: ON (curl protocol details below)");
+    }
+    println!("{}", "=".repeat(50));
+
+    let fetcher = Fetcher::new(timeout, proxy.as_deref(), verbose)?;
+
+    // Test 1: Homepage
+    println!("\n--- Test 1: Fetch homepage ---");
+    let t0 = Instant::now();
+    match fetcher.fetch_page(BASE_URL).await {
+        Ok(html) => {
+            let elapsed = t0.elapsed();
+            let size_kb = html.len() as f64 / 1024.0;
+            println!("[OK] Homepage fetched: {:.1} KB in {:.3}s", size_kb, elapsed.as_secs_f64());
+            if html.contains("Just a moment...") || html.contains("cf-challenge") {
+                println!("[WARN] Cloudflare challenge page detected — scraping will fail!");
+            } else if html.len() < 500 {
+                println!("[WARN] Very small response ({} bytes) — might be blocked or error page", html.len());
+                println!("[WARN] Response preview: {}", &html[..html.len().min(200)]);
+            } else {
+                println!("[OK] Response looks normal ({} bytes)", html.len());
+            }
+        }
+        Err(e) => {
+            let elapsed = t0.elapsed();
+            println!("[FAIL] Homepage fetch failed after {:.3}s", elapsed.as_secs_f64());
+            println!("[FAIL] Error: {e}");
+            println!();
+            println!("Troubleshooting:");
+            if proxy.is_none() {
+                println!("  - Try with --proxy socks5://127.0.0.1:PORT");
+            } else {
+                println!("  - Check proxy is running and accessible");
+                println!("  - Try socks5h:// instead of socks5:// (remote DNS resolution)");
+            }
+            println!("  - Use --verbose for full curl protocol details");
+            println!("  - komikindo.ch may block datacenter/VPN IPs (Cloudflare)");
+        }
+    }
+
+    // Test 2: /komik-terbaru/
+    println!("\n--- Test 2: Fetch /komik-terbaru/ ---");
+    let t0 = Instant::now();
+    match fetcher.fetch_page(&format!("{BASE_URL}/komik-terbaru/")).await {
+        Ok(html) => {
+            let elapsed = t0.elapsed();
+            println!("[OK] /komik-terbaru/ fetched: {:.1} KB in {:.3}s",
+                html.len() as f64 / 1024.0, elapsed.as_secs_f64());
+        }
+        Err(e) => {
+            println!("[FAIL] /komik-terbaru/ fetch failed: {e}");
+        }
+    }
+
+    // Stats
+    let stats = fetcher.stats();
+    println!("\n--- Fetcher Stats ---");
+    println!("  Requests:  {}", stats.requests);
+    println!("  Success:   {}", stats.success);
+    println!("  Failed:    {}", stats.failed);
+    println!("  Retries:   {}", stats.retries);
+    println!("  Downloaded: {:.1} KB", stats.bytes_downloaded as f64 / 1024.0);
+
+    Ok(())
 }
 
 // ============================================================
@@ -230,12 +335,6 @@ async fn maybe_connect_db(use_db: bool) -> Option<(PgPool, bool)> {
 // ============================================================
 // FULL FETCH (Method 2: tanpa image, dengan optional DB)
 // ============================================================
-//
-// Design:
-//   1. Fetch detail untuk SEMUA komik sekaligus (8671 spawn_blocking)
-//   2. Setiap detail selesai → write ke DB (atau JSONL)
-//   3. Tidak ada image scraping (Method 2)
-//   4. Bottleneck = internet saja
 
 struct FullFetchOpts {
     limit: usize,
@@ -244,6 +343,7 @@ struct FullFetchOpts {
     timeout: u64,
     proxy: Option<String>,
     use_db: bool,
+    verbose: bool,
 }
 
 async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
@@ -284,7 +384,6 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     } else if !using_db {
         create_jsonl_path(&data_dir, &dt_start)
     } else {
-        // DB mode: tetap buat JSONL sebagai backup
         create_jsonl_path(&data_dir, &dt_start)
     };
 
@@ -316,7 +415,7 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     println!("{proxy_info}");
     println!("{}", "=".repeat(70));
 
-    let fetcher = Arc::new(Fetcher::new(opts.timeout, proxy_url)?);
+    let fetcher = Arc::new(Fetcher::new(opts.timeout, proxy_url, opts.verbose)?);
 
     // === Step 1: Fetch komik list ===
     println!("\n--- Step 1: Fetching komik list ---");
@@ -423,7 +522,6 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
                         }
                         Err(e) => {
                             write_failed.fetch_add(1, Ordering::Relaxed);
-                            // Write error to JSONL
                             let failed_json = serde_json::json!({
                                 "slug": slug,
                                 "_status": "detail_failed",
@@ -559,6 +657,7 @@ struct UpdateOpts {
     proxy: Option<String>,
     dry_run: bool,
     use_db: bool,
+    verbose: bool,
 }
 
 async fn run_update(opts: UpdateOpts) -> Result<()> {
@@ -617,7 +716,7 @@ async fn run_update(opts: UpdateOpts) -> Result<()> {
         println!("[DATA] No existing data — starting fresh");
     }
 
-    let fetcher = Arc::new(Fetcher::new(opts.timeout, opts.proxy.as_deref())?);
+    let fetcher = Arc::new(Fetcher::new(opts.timeout, opts.proxy.as_deref(), opts.verbose)?);
 
     // === Step 2: Fetch /komik-terbaru/ ===
     println!("\n--- Step 2: Fetching /komik-terbaru/ ---");
@@ -635,7 +734,6 @@ async fn run_update(opts: UpdateOpts) -> Result<()> {
     let mut skipped = 0usize;
 
     for item in &terbaru_items {
-        // Cek di DB dulu, lalu JSONL fallback
         let stored_ch = if let Some((_, latest)) = db_chapter_map.get(&item.slug) {
             *latest
         } else if let Some(existing) = jsonl_db.get(&item.slug) {
@@ -693,7 +791,6 @@ async fn run_update(opts: UpdateOpts) -> Result<()> {
                     println!("[NEW] + {} — {}", slug, detail.judul.as_deref().unwrap_or("?"));
                     new_success += 1;
 
-                    // Write to DB
                     if let Some((pool, _)) = &db_pool {
                         if !opts.dry_run {
                             match db::write_komik(pool, &detail).await {
@@ -711,7 +808,6 @@ async fn run_update(opts: UpdateOpts) -> Result<()> {
                         }
                     }
 
-                    // Also update JSONL
                     jsonl_db.insert(slug.clone(), detail);
                 }
                 Ok((slug, Err(e))) => {
@@ -734,7 +830,6 @@ async fn run_update(opts: UpdateOpts) -> Result<()> {
     } else {
         println!("\n--- Step 5: Saving ---");
 
-        // Save JSONL backup
         if !jsonl_db.is_empty() {
             let data_dir = PathBuf::from("data");
             std::fs::create_dir_all(&data_dir)?;
@@ -747,7 +842,6 @@ async fn run_update(opts: UpdateOpts) -> Result<()> {
             println!("[JSONL] Saved {} komik to {} ({:.1} MB)", jsonl_db.len(), db_path.display(), db_size);
         }
 
-        // Log ke scrape_log
         if let Some((pool, _)) = &db_pool {
             let _ = db::log_scrape(
                 pool, "smart_update", "completed",

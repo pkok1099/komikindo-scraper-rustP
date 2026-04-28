@@ -1,8 +1,12 @@
-# Build release binaries for amd64 and arm64 (Termux)
+# Build release binaries for amd64, arm64 (Linux), and Termux (Android)
 #
 # All TLS: pure Rust (rustls) = ZERO system dependencies needed.
-# curl → rustls-ffi, sqlx → tls-rustls.
-# Cross-compile arm64 with gcc-aarch64-linux-gnu.
+# curl → rustls-ffi (static-curl), sqlx → tls-rustls.
+#
+# Targets:
+#   - x86_64-unknown-linux-gnu    → Linux amd64 servers
+#   - aarch64-unknown-linux-gnu   → Linux ARM64 servers
+#   - aarch64-linux-android       → Termux (Android ARM64)
 
 name: Build Release
 
@@ -10,9 +14,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v1.0.0)'
+        description: 'Release tag (e.g. v1.0.1)'
         required: false
-        default: 'v1.0.0'
+        default: 'v1.0.1'
   push:
     tags:
       - 'v*'
@@ -34,6 +38,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             artifact: komikindo-scraper-arm64
             apt_extra: 'gcc-aarch64-linux-gnu'
+          - target: aarch64-linux-android
+            artifact: komikindo-scraper-termux
+            apt_extra: ''
 
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +50,25 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Install Android NDK for Termux build
+      - name: Setup Android NDK (Termux only)
+        if: matrix.target == 'aarch64-linux-android'
+        uses: android-actions/setup-android@v3
+        with:
+          ndk-version: '26.1.10909125'
+
+      - name: Set Android NDK env (Termux only)
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          echo "NDK_HOME=${ANDROID_NDK_HOME}" >> $GITHUB_ENV
+          echo "CC_aarch64_linux_android=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang" >> $GITHUB_ENV
+          echo "CXX_aarch64_linux_android=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang++" >> $GITHUB_ENV
+          echo "AR_aarch64_linux_android=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> $GITHUB_ENV
+          echo "RANLIB_aarch64_linux_android=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang" >> $GITHUB_ENV
+
       - name: Install system dependencies
+        if: matrix.apt_extra != ''
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ${{ matrix.apt_extra }}
@@ -55,9 +80,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.target }}-rustls-v2-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.target }}-rustls-v3-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.target }}-rustls-v2-
+            ${{ matrix.target }}-rustls-v3-
 
       # --locked: use committed Cargo.lock exactly (no implicit openssl-sys)
       - name: Build ${{ matrix.target }}
@@ -70,11 +95,24 @@ jobs:
 
       - name: Strip binary
         run: |
-          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
-            strip target/${{ matrix.target }}/release/komikindo-scraper
-          else
-            aarch64-linux-gnu-strip target/${{ matrix.target }}/release/komikindo-scraper
-          fi
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              strip target/${{ matrix.target }}/release/komikindo-scraper
+              ;;
+            aarch64-unknown-linux-gnu)
+              aarch64-linux-gnu-strip target/${{ matrix.target }}/release/komikindo-scraper
+              ;;
+            aarch64-linux-android)
+              ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip target/${{ matrix.target }}/release/komikindo-scraper
+              ;;
+          esac
+
+      - name: Show binary info
+        run: |
+          echo "=== ${{ matrix.target }} ==="
+          ls -lh target/${{ matrix.target }}/release/komikindo-scraper
+          file target/${{ matrix.target }}/release/komikindo-scraper
+          readelf -d target/${{ matrix.target }}/release/komikindo-scraper 2>/dev/null | head -5 || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -92,19 +130,21 @@ jobs:
         with:
           path: release/
 
-      - name: Rename binaries for release
+      - name: Flatten and rename binaries
         run: |
           mv release/komikindo-scraper-amd64/komikindo-scraper release/komikindo-scraper-amd64.bin
           mv release/komikindo-scraper-arm64/komikindo-scraper release/komikindo-scraper-arm64.bin
-          rmdir release/komikindo-scraper-amd64 release/komikindo-scraper-arm64
+          mv release/komikindo-scraper-termux/komikindo-scraper release/komikindo-scraper-termux.bin
+          rmdir release/komikindo-scraper-amd64 release/komikindo-scraper-arm64 release/komikindo-scraper-termux 2>/dev/null || true
           mv release/komikindo-scraper-amd64.bin release/komikindo-scraper-amd64
           mv release/komikindo-scraper-arm64.bin release/komikindo-scraper-arm64
+          mv release/komikindo-scraper-termux.bin release/komikindo-scraper-termux
 
       - name: List binaries
         run: |
           echo "=== Release Binaries ==="
-          ls -lh release/komikindo-scraper-amd64 release/komikindo-scraper-arm64
-          file release/komikindo-scraper-amd64 release/komikindo-scraper-arm64
+          ls -lh release/komikindo-scraper-*
+          file release/komikindo-scraper-*
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -114,22 +154,30 @@ jobs:
           body: |
             ## KomikIndo Scraper - Rust Release
 
-            | File | Arch | Target |
-            |------|------|--------|
-            | `komikindo-scraper-amd64` | x86_64 | Linux (server/GitHub Actions) |
-            | `komikindo-scraper-arm64` | aarch64 | Termux (Android ARM64) |
+            | File | Arch | Target Platform |
+            |------|------|----------------|
+            | `komikindo-scraper-amd64` | x86_64 | Linux (server/GitHub Actions/Codespace) |
+            | `komikindo-scraper-arm64` | aarch64 | Linux ARM64 (server/VPS) |
+            | `komikindo-scraper-termux` | aarch64 | **Termux (Android ARM64)** |
 
-            ### Usage
+            ### Quick Start
             ```bash
             chmod +x komikindo-scraper-*
-            # Full fetch
-            ./komikindo-scraper-amd64 full-fetch --db --limit 10
+            # Test connectivity
+            ./komikindo-scraper-amd64 check
+            # Test with proxy
+            ./komikindo-scraper-amd64 check --proxy socks5://127.0.0.1:1080
+            # Verbose debug
+            ./komikindo-scraper-amd64 -v check --proxy socks5://127.0.0.1:1080
             # Smart update
             ./komikindo-scraper-amd64 update --db --max-pages 3
+            # Full fetch
+            ./komikindo-scraper-amd64 full-fetch --db --limit 10
             ```
           files: |
             release/komikindo-scraper-amd64
             release/komikindo-scraper-arm64
+            release/komikindo-scraper-termux
           draft: false
           prerelease: false
         env:
