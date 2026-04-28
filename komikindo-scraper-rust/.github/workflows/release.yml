@@ -2,7 +2,7 @@
 #
 # All TLS: pure Rust (rustls) = ZERO system dependencies needed.
 # curl → rustls-ffi, sqlx → tls-rustls.
-# Cross-compile arm64 with gcc-aarch64-linux-gnu (no QEMU needed).
+# Cross-compile arm64 with gcc-aarch64-linux-gnu.
 
 name: Build Release
 
@@ -59,8 +59,7 @@ jobs:
           restore-keys: |
             ${{ matrix.target }}-rustls-v2-
 
-      # Use --locked to ensure committed Cargo.lock is used exactly.
-      # This prevents cargo from resolving different deps on the runner.
+      # --locked: use committed Cargo.lock exactly (no implicit openssl-sys)
       - name: Build ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
@@ -70,7 +69,12 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} --locked 2>&1
 
       - name: Strip binary
-        run: strip target/${{ matrix.target }}/release/komikindo-scraper
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            strip target/${{ matrix.target }}/release/komikindo-scraper
+          else
+            aarch64-linux-gnu-strip target/${{ matrix.target }}/release/komikindo-scraper
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
