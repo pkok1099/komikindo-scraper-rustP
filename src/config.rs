@@ -116,12 +116,11 @@ pub fn set_explicit_env_path(path: Option<String>) {
             has_database_url: false,
         });
     }
+    // Get length before consuming path
+    let len = path.as_ref().map(|p| p.len()).unwrap_or(0);
+    EXPLICIT_ENV_LEN.store(len, std::sync::atomic::Ordering::Relaxed);
     EXPLICIT_ENV_PATH.store(
         path.unwrap_or_default().leak().as_ptr() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    EXPLICIT_ENV_LEN.store(
-        path.as_ref().map(|p| p.len()).unwrap_or(0),
         std::sync::atomic::Ordering::Relaxed,
     );
 }
