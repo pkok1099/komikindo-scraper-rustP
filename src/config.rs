@@ -127,7 +127,7 @@ pub fn set_explicit_env_path(path: Option<String>) {
 }
 
 // Thread-safe storage for explicit env path (set before LazyLock init)
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 static EXPLICIT_ENV_PATH: AtomicU64 = AtomicU64::new(0);
 static EXPLICIT_ENV_LEN: AtomicUsize = AtomicUsize::new(0);
 
