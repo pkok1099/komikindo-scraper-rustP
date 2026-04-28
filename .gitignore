@@ -2,7 +2,7 @@
 /target/
 **/*.rs.bk
 
-# Data (stored in data branch, not main)
+# Data
 /data/
 
 # Environment
@@ -20,5 +20,16 @@
 .DS_Store
 Thumbs.db
 
-# Binary (built binary, not needed in repo)
+# Built binaries
 /komikindo-scraper
+download/komikindo-scraper
+download/release/
+
+# Duplicate project directory
+komikindo-scraper-rust/
+
+# Agent skills (not part of this project)
+skills/
+
+# Work log
+worklog.md

@@ -92,12 +92,19 @@ jobs:
         with:
           path: release/
 
+      - name: Rename binaries for release
+        run: |
+          mv release/komikindo-scraper-amd64/komikindo-scraper release/komikindo-scraper-amd64.bin
+          mv release/komikindo-scraper-arm64/komikindo-scraper release/komikindo-scraper-arm64.bin
+          rmdir release/komikindo-scraper-amd64 release/komikindo-scraper-arm64
+          mv release/komikindo-scraper-amd64.bin release/komikindo-scraper-amd64
+          mv release/komikindo-scraper-arm64.bin release/komikindo-scraper-arm64
+
       - name: List binaries
         run: |
           echo "=== Release Binaries ==="
-          ls -lh release/
-          file release/komikindo-scraper-amd64/komikindo-scraper
-          file release/komikindo-scraper-arm64/komikindo-scraper
+          ls -lh release/komikindo-scraper-amd64 release/komikindo-scraper-arm64
+          file release/komikindo-scraper-amd64 release/komikindo-scraper-arm64
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -121,8 +128,8 @@ jobs:
             ./komikindo-scraper-amd64 update --db --max-pages 3
             ```
           files: |
-            release/komikindo-scraper-amd64/komikindo-scraper
-            release/komikindo-scraper-arm64/komikindo-scraper
+            release/komikindo-scraper-amd64
+            release/komikindo-scraper-arm64
           draft: false
           prerelease: false
         env:
