@@ -10,9 +10,9 @@ tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
 
 # HTTP client - curl untuk bypass Cloudflare
 # static-curl = compile libcurl from source (no system lib needed)
-# static-ssl = vendored OpenSSL (no system headers needed, works for cross-compile)
+# rustls = use rustls for TLS (no OpenSSL needed, works for cross-compile)
 # default-features = false disables default 'ssl' feature (which needs system OpenSSL)
-curl = { version = "0.4", default-features = false, features = ["static-curl", "http2", "static-ssl"] }
+curl = { version = "0.4", default-features = false, features = ["static-curl", "http2", "rustls"] }
 
 # HTML parsing
 scraper = "0.22"
