@@ -35,11 +35,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # ── Generate Cargo.lock if missing ──
-      - name: Generate Cargo.lock
-        run: cargo generate-lockfile 2>/dev/null || true
-
       # ── Cache cargo (build time ~2min without cache, ~30s with) ──
+      # Cache key includes 'rustls-v2' to force cache invalidation after TLS switch
       - name: Cache cargo registry & build
         uses: actions/cache@v4
         with:
@@ -47,21 +44,22 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-rustls-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-rustls-v2-
 
       # ── Build dependencies ──
-      # static-curl + static-ssl + tls-rustls = no system dependencies needed!
-      # curl: vendored OpenSSL compiled from source (no libssl-dev needed)
-      # sqlx: rustls for TLS (no native-tls/OpenSSL needed)
+      # static-curl + rustls + tls-rustls = no system dependencies needed!
+      # curl: rustls-ffi for TLS (pure Rust, no OpenSSL)
+      # sqlx: tls-rustls for TLS (pure Rust, no native-tls)
       - name: Install build dependencies
-        run: echo "No system dependencies needed (vendored OpenSSL + rustls)"
+        run: echo "No system dependencies needed (all rustls)"
 
       # ── Build release binary ──
+      # --locked: use committed Cargo.lock exactly (no implicit openssl-sys)
       # Strip + LTO already configured in Cargo.toml [profile.release]
       - name: Build
-        run: cargo build --release 2>&1
+        run: cargo build --release --locked 2>&1
 
       # ── Restore DB from data branch ──
       # The `data` branch stores only data/komik_db.jsonl.

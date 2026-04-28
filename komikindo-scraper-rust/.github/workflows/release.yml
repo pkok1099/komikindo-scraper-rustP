@@ -1,10 +1,8 @@
 # Build release binaries for amd64 and arm64 (Termux)
 #
-# This workflow builds the komikindo-scraper binary for multiple targets.
-# arm64 uses QEMU emulation on GitHub Actions runners.
-#
-# Artifacts are uploaded as GitHub Release assets (manual trigger)
-# or saved as workflow artifacts.
+# All TLS: pure Rust (rustls) = ZERO system dependencies needed.
+# curl → rustls-ffi, sqlx → tls-rustls.
+# Cross-compile arm64 with gcc-aarch64-linux-gnu (no QEMU needed).
 
 name: Build Release
 
@@ -27,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -49,14 +48,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ${{ matrix.apt_extra }}
 
-      # QEMU for arm64 cross-compilation
-      - name: Setup QEMU (arm64 only)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: docker/setup-qemu-action@v3
-
-      - name: Generate Cargo.lock
-        run: cargo generate-lockfile 2>/dev/null || true
-
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -64,15 +55,19 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.target }}-rustls-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.target }}-cargo-
+            ${{ matrix.target }}-rustls-v2-
 
+      # Use --locked to ensure committed Cargo.lock is used exactly.
+      # This prevents cargo from resolving different deps on the runner.
       - name: Build ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }} 2>&1
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          RANLIB_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ranlib
+        run: cargo build --release --target ${{ matrix.target }} --locked 2>&1
 
       - name: Strip binary
         run: strip target/${{ matrix.target }}/release/komikindo-scraper
@@ -117,9 +112,9 @@ jobs:
             ```bash
             chmod +x komikindo-scraper-*
             # Full fetch
-            ./komikindo-scraper-amd64 full-fetch --skip-chapters --limit 10
+            ./komikindo-scraper-amd64 full-fetch --db --limit 10
             # Smart update
-            ./komikindo-scraper-amd64 update --max-pages 3
+            ./komikindo-scraper-amd64 update --db --max-pages 3
             ```
           files: |
             release/komikindo-scraper-amd64/komikindo-scraper
