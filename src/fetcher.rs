@@ -289,9 +289,9 @@ pub fn find_ca_bundle() -> Option<String> {
     // 3. Termux-specific paths ($PREFIX usually = /data/data/com.termux/files/usr)
     if let Ok(prefix) = std::env::var("PREFIX") {
         let termux_paths = [
-            format!("{}/etc/tls/cert.pem"),
-            format!("{}/etc/ssl/certs/ca-certificates.crt"),
-            format!("{}/etc/tls/ca-bundle.crt"),
+            format!("{prefix}/etc/tls/cert.pem"),
+            format!("{prefix}/etc/ssl/certs/ca-certificates.crt"),
+            format!("{prefix}/etc/tls/ca-bundle.crt"),
         ];
         for p in &termux_paths {
             if std::path::Path::new(p).exists() {
@@ -322,7 +322,7 @@ pub fn find_ca_bundle() -> Option<String> {
 fn configure_ca_bundle(handle: &mut Easy2<Collector>, verbose: bool) {
     match find_ca_bundle() {
         Some(path) => {
-            match handle.ssl_ca_info(&path) {
+            match handle.cainfo(&path) {
                 Ok(_) => {
                     if verbose {
                         eprintln!("[CURL] CA bundle: {}", path);
