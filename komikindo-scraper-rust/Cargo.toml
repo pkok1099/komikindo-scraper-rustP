@@ -8,8 +8,11 @@ description = "KomikIndo scraper - Rust version for Termux"
 # Async runtime
 tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
 
-# HTTP client - curl untuk bypass Cloudflare (static-curl = no system lib needed)
-curl = { version = "0.4", features = ["static-curl", "http2"] }
+# HTTP client - curl untuk bypass Cloudflare
+# static-curl = compile libcurl from source (no system lib needed)
+# static-ssl = vendored OpenSSL (no system headers needed, works for cross-compile)
+# default-features = false disables default 'ssl' feature (which needs system OpenSSL)
+curl = { version = "0.4", default-features = false, features = ["static-curl", "http2", "static-ssl"] }
 
 # HTML parsing
 scraper = "0.22"

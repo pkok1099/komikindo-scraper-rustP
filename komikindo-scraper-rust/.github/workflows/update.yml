@@ -52,9 +52,11 @@ jobs:
             ${{ runner.os }}-cargo-
 
       # ── Build dependencies ──
-      # static-curl + tls-rustls = no system dependencies needed!
+      # static-curl + static-ssl + tls-rustls = no system dependencies needed!
+      # curl: vendored OpenSSL compiled from source (no libssl-dev needed)
+      # sqlx: rustls for TLS (no native-tls/OpenSSL needed)
       - name: Install build dependencies
-        run: echo "No system dependencies needed (static-curl + tls-rustls)"
+        run: echo "No system dependencies needed (vendored OpenSSL + rustls)"
 
       # ── Build release binary ──
       # Strip + LTO already configured in Cargo.toml [profile.release]
