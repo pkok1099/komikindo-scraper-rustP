@@ -334,6 +334,21 @@ async fn run_debug(opts: DebugOpts) -> Result<()> {
             println!("  CWD:        {}", cwd.display());
         }
 
+        // CA certificate bundle (critical for SSL)
+        match fetcher::find_ca_bundle() {
+            Some(ref p) => println!("  CA bundle:  {}", p),
+            None => {
+                println!("  CA bundle:  NOT FOUND!");
+                if let Ok(prefix) = std::env::var("PREFIX") {
+                    println!("    → Try: pkg install ca-certificates");
+                    println!("    → Or:  export SSL_CERT_FILE={}/etc/tls/cert.pem", prefix);
+                } else {
+                    println!("    → Try: sudo apt install ca-certificates");
+                    println!("    → Or:  export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt");
+                }
+            }
+        }
+
         println!();
     }
 

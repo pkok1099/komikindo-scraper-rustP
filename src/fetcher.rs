@@ -111,11 +111,18 @@ impl Fetcher {
             String::new()
         };
 
+        // Log CA bundle status
+        let ca_info = match find_ca_bundle() {
+            Some(ref p) => format!("\n  CA bundle: {}", p),
+            None => "\n  CA bundle: NOT FOUND (SSL will fail!)".to_string(),
+        };
+
         println!(
-            "[FETCHER] Started (libcurl, NO LIMIT): timeout={}s{}{}",
+            "[FETCHER] Started (libcurl, NO LIMIT): timeout={}s{}{}{}",
             timeout_secs,
             proxy_info,
-            if verbose { " [VERBOSE]" } else { "" }
+            if verbose { " [VERBOSE]" } else { "" },
+            ca_info
         );
 
         Ok(Fetcher {
@@ -248,6 +255,95 @@ impl Fetcher {
 }
 
 // ============================================================
+// CA CERTIFICATE BUNDLE DETECTION
+// ============================================================
+
+/// Find the best CA certificate bundle path for the current platform.
+/// Required when curl is built with static-curl + rustls (no default CA path).
+pub fn find_ca_bundle() -> Option<String> {
+    // 1. Check environment variables (user can override)
+    for var in &["SSL_CERT_FILE", "CURL_CA_BUNDLE"] {
+        if let Ok(path) = std::env::var(var) {
+            if std::path::Path::new(&path).exists() {
+                return Some(path);
+            }
+        }
+    }
+
+    // 2. Common Linux paths
+    let common_paths = [
+        "/etc/ssl/certs/ca-certificates.crt",                     // Debian/Ubuntu
+        "/etc/pki/tls/certs/ca-bundle.crt",                       // RHEL/CentOS/Fedora
+        "/etc/ssl/ca-bundle.pem",                                  // OpenSUSE
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",      // Newer RHEL/Fedora
+        "/usr/local/share/certs/ca-root-nss.crt",                 // FreeBSD/Nix
+        "/usr/share/ca-certificates/mozilla/ca-certificates.crt", // some Linux
+    ];
+
+    for p in &common_paths {
+        if std::path::Path::new(p).exists() {
+            return Some(p.to_string());
+        }
+    }
+
+    // 3. Termux-specific paths ($PREFIX usually = /data/data/com.termux/files/usr)
+    if let Ok(prefix) = std::env::var("PREFIX") {
+        let termux_paths = [
+            format!("{}/etc/tls/cert.pem"),
+            format!("{}/etc/ssl/certs/ca-certificates.crt"),
+            format!("{}/etc/tls/ca-bundle.crt"),
+        ];
+        for p in &termux_paths {
+            if std::path::Path::new(p).exists() {
+                return Some(p.clone());
+            }
+        }
+    }
+
+    // 4. macOS (for completeness)
+    #[cfg(target_os = "macos")]
+    {
+        let macos_paths = [
+            "/usr/local/etc/openssl/cert.pem",
+            "/opt/homebrew/etc/openssl/cert.pem",
+            "/etc/ssl/cert.pem",
+        ];
+        for p in &macos_paths {
+            if std::path::Path::new(p).exists() {
+                return Some(p.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Initialize CA bundle for a curl handle. Logs result in verbose mode.
+fn configure_ca_bundle(handle: &mut Easy2<Collector>, verbose: bool) {
+    match find_ca_bundle() {
+        Some(path) => {
+            match handle.ssl_ca_info(&path) {
+                Ok(_) => {
+                    if verbose {
+                        eprintln!("[CURL] CA bundle: {}", path);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[CURL] WARNING: Failed to set CA bundle '{}': {}", path, e);
+                }
+            }
+        }
+        None => {
+            eprintln!("[CURL] WARNING: No CA certificate bundle found!");
+            eprintln!("[CURL] SSL connections WILL FAIL. Fix:");
+            eprintln!("[CURL]   1. Install ca-certificates: pkg install ca-certificates (Termux)");
+            eprintln!("[CURL]   2. Or set env: export SSL_CERT_FILE=/path/to/ca-bundle.crt");
+            eprintln!("[CURL]   3. Or set env: export CURL_CA_BUNDLE=/path/to/ca-bundle.crt");
+        }
+    }
+}
+
+// ============================================================
 // CURL FETCH (per-request)
 // ============================================================
 
@@ -292,6 +388,9 @@ fn curl_fetch(url: &str, timeout_secs: u64, proxy_url: &str, verbose: bool) -> R
     handle.tcp_keepalive(true)?;
     handle.tcp_keepidle(Duration::from_secs(30))?;
     handle.accept_encoding("gzip, deflate")?;
+
+    // Configure CA certificate bundle (required for static-curl + rustls)
+    configure_ca_bundle(&mut handle, verbose);
 
     // Enable curl verbose output (protocol details → stderr)
     if verbose {
