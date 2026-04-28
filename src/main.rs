@@ -19,6 +19,11 @@
 ///   - Upsert komik metadata + chapters + genres ke Supabase PostgreSQL
 ///   - Tanpa image scraping (chapters table: hanya number, tanpa filenames)
 ///   - Jika DATABASE_URL kosong, fallback ke JSONL file
+///
+/// DEBUG FEATURES:
+///   - `--verbose` / `-v` global flag: curl protocol details, timing, response info
+///   - `--env /path/to/.env` global flag: explicit .env file location
+///   - `debug` subcommand: env diagnostics, DB test, network test, binary info
 
 mod config;
 mod db;
@@ -50,10 +55,30 @@ use crate::config::BASE_URL;
 #[command(name = "komikindo-scraper")]
 #[command(about = "KomikIndo Scraper - Rust Full Speed + Smart Update + DB")]
 #[command(version)]
+#[command(after_help = r#"ENVIRONMENT:
+  DATABASE_URL    PostgreSQL connection string (Supabase)
+  PROXY_URL       Default proxy URL (socks5://host:port)
+  PROXY_ENABLED   Set to "1" to enable default proxy
+  SCRAPER_RETRIES Max retry attempts (default: 3)
+  SCRAPER_TIMEOUT Request timeout in seconds (default: 30)
+
+EXAMPLES:
+  komikindo-scraper check                              # Test connectivity
+  komikindo-scraper -v check --proxy socks5://...       # Verbose with proxy
+  komikindo-scraper update --dry-run                    # Preview changes
+  komikindo-scraper update --db                         # Update DB
+  komikindo-scraper full-fetch --db --limit 10          # Fetch 10 komik
+  komikindo-scraper --env /path/to/.env update --db     # Specify .env path
+  komikindo-scraper debug                               # Run diagnostics
+"#)]
 struct Cli {
     /// Enable verbose output (curl protocol details, timing, response info)
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// Specify .env file path (searches: ./, binary dir, parent dirs if not set)
+    #[arg(long, global = true)]
+    env: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -133,6 +158,37 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
+
+    /// Run diagnostics: env config, .env loading, DB connection, network test, binary info
+    Debug {
+        /// Run all tests (env + db + network + info)
+        #[arg(long, default_value_t = false)]
+        all: bool,
+
+        /// Test DB connection only
+        #[arg(long)]
+        db: bool,
+
+        /// Test network only (direct + env proxy)
+        #[arg(long)]
+        network: bool,
+
+        /// Show environment/config info only
+        #[arg(long)]
+        env: bool,
+
+        /// Show binary/platform info only
+        #[arg(long)]
+        info: bool,
+
+        /// SOCKS5/HTTP proxy URL for network test (overrides PROXY_URL)
+        #[arg(long)]
+        proxy: Option<String>,
+
+        /// Timeout per request dalam detik
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
 }
 
 // ============================================================
@@ -141,6 +197,9 @@ enum Commands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Set explicit .env path BEFORE any access to env_config()
+    config::set_explicit_env_path(cli.env.clone());
 
     // Set log level based on verbose flag
     let log_level = if cli.verbose { "debug" } else { "warn" };
@@ -211,9 +270,273 @@ fn main() -> Result<()> {
             Commands::Check { proxy, timeout } => {
                 run_check(&proxy, timeout, verbose).await?;
             }
+            Commands::Debug { all, db, network, env, info, proxy, timeout } => {
+                run_debug(DebugOpts { all, db, network, env, info, proxy, timeout, verbose }).await?;
+            }
         }
         Ok(())
     })
+}
+
+// ============================================================
+// DEBUG (diagnostics)
+// ============================================================
+
+struct DebugOpts {
+    all: bool,
+    db: bool,
+    network: bool,
+    env: bool,
+    info: bool,
+    proxy: Option<String>,
+    timeout: u64,
+    verbose: bool,
+}
+
+async fn run_debug(opts: DebugOpts) -> Result<()> {
+    let run_all = opts.all || (!opts.db && !opts.network && !opts.env && !opts.info);
+
+    // --- Binary Info ---
+    if run_all || opts.info {
+        println!("{}", "=".repeat(50));
+        println!("  BINARY / PLATFORM INFO");
+        println!("{}", "=".repeat(50));
+
+        // Binary path
+        if let Ok(exe) = std::env::current_exe() {
+            println!("  Binary:     {}", exe.display());
+            if let Ok(meta) = std::fs::metadata(&exe) {
+                let size_mb = meta.len() as f64 / 1024.0 / 1024.0;
+                println!("  Size:       {:.1} MB", size_mb);
+            }
+        }
+
+        // Platform info
+        println!("  OS:         {}", std::env::consts::OS);
+        println!("  Arch:       {}", std::env::consts::ARCH);
+        println!("  Family:     {}", std::env::consts::FAMILY);
+
+        // Target triple (compile-time)
+        #[cfg(target_os = "linux")]
+        println!("  Target:     {}-{}", std::env::consts::ARCH, std::env::consts::OS);
+        #[cfg(target_os = "android")]
+        println!("  Target:     {}-android (Termux-compatible)", std::env::consts::ARCH);
+
+        // Check for Termux
+        if let Ok(prefix) = std::env::var("PREFIX") {
+            println!("  Termux:     YES (PREFIX={})", prefix);
+        } else {
+            println!("  Termux:     NO");
+        }
+
+        // CWD
+        if let Ok(cwd) = std::env::current_dir() {
+            println!("  CWD:        {}", cwd.display());
+        }
+
+        println!();
+    }
+
+    // --- Environment Info ---
+    if run_all || opts.env {
+        println!("{}", "=".repeat(50));
+        println!("  ENVIRONMENT / CONFIG");
+        println!("{}", "=".repeat(50));
+
+        let cfg = config::env_config();
+        let load_info = config::env_load_info();
+
+        // .env file search results
+        println!("\n  .env file search ({} paths checked):", load_info.searched_paths.len());
+        for (i, p) in load_info.searched_paths.iter().enumerate() {
+            let marker = if load_info.loaded_path.as_deref() == Some(p.as_str()) {
+                " <<< FOUND"
+            } else {
+                ""
+            };
+            println!("    {}. {}{}", i + 1, p, marker);
+        }
+
+        match &load_info.loaded_path {
+            Some(p) => println!("\n  .env loaded: YES -> {}", p),
+            None => println!("\n  .env loaded: NO (use --env /path/to/.env)"),
+        }
+
+        // Show config values (masked)
+        println!("\n  Config:");
+        println!("    DATABASE_URL:      {}", config::mask_database_url(&cfg.database_url));
+        println!("    PROXY_URL:         {}", if cfg.proxy_url.is_empty() { "(not set)".to_string() } else { cfg.proxy_url.clone() });
+        println!("    PROXY_ENABLED:     {}", cfg.proxy_enabled);
+        println!("    SCRAPER_RETRIES:   {}", cfg.scraper_retries);
+        println!("    SCRAPER_TIMEOUT:   {}s", cfg.scraper_timeout);
+        println!("    DB mode:           {}", if !cfg.database_url.is_empty() { "ENABLED" } else { "DISABLED (no DATABASE_URL)" });
+
+        // Check if .env exists next to binary
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let env_at_binary = dir.join(".env");
+                println!("\n  .env next to binary: {}", if env_at_binary.exists() { "YES" } else { "NO" });
+            }
+        }
+
+        // Check PROXY_URL from .env vs CLI
+        if let Some(ref cli_proxy) = opts.proxy {
+            println!("\n  CLI proxy override: {}", cli_proxy);
+        }
+
+        println!();
+    }
+
+    // --- Network Test ---
+    if run_all || opts.network {
+        println!("{}", "=".repeat(50));
+        println!("  NETWORK TEST");
+        println!("{}", "=".repeat(50));
+
+        let cfg = config::env_config();
+        let effective_proxy = opts.proxy.clone()
+            .or_else(|| if cfg.proxy_enabled && !cfg.proxy_url.is_empty() { Some(cfg.proxy_url.clone()) } else { None });
+
+        // Test 1: Direct (no proxy)
+        if effective_proxy.is_none() || run_all {
+            println!("\n  --- Test 1: Direct connection ---");
+            let t0 = Instant::now();
+            let fetcher_direct = Fetcher::new(opts.timeout, None, opts.verbose)?;
+            match fetcher_direct.fetch_page(BASE_URL).await {
+                Ok(html) => {
+                    let elapsed = t0.elapsed();
+                    println!("  [OK] komikindo.ch: {:.1} KB in {:.3}s",
+                        html.len() as f64 / 1024.0, elapsed.as_secs_f64());
+                    if html.contains("Just a moment...") {
+                        println!("  [WARN] Cloudflare challenge detected!");
+                    }
+                }
+                Err(e) => {
+                    let elapsed = t0.elapsed();
+                    println!("  [FAIL] komikindo.ch: {} ({:.3}s)", e, elapsed.as_secs_f64());
+                    println!("  [HINT] Direct connection blocked. Use --proxy");
+                }
+            }
+        }
+
+        // Test 2: With proxy
+        let proxy_to_test = effective_proxy.as_deref();
+        if let Some(proxy) = proxy_to_test {
+            println!("\n  --- Test 2: Proxy connection ({}) ---", proxy);
+            let t0 = Instant::now();
+            let fetcher_proxy = Fetcher::new(opts.timeout, Some(proxy), opts.verbose)?;
+            match fetcher_proxy.fetch_page(BASE_URL).await {
+                Ok(html) => {
+                    let elapsed = t0.elapsed();
+                    println!("  [OK] komikindo.ch via proxy: {:.1} KB in {:.3}s",
+                        html.len() as f64 / 1024.0, elapsed.as_secs_f64());
+                    if html.contains("Just a moment...") {
+                        println!("  [WARN] Cloudflare challenge detected even with proxy!");
+                    }
+                }
+                Err(e) => {
+                    let elapsed = t0.elapsed();
+                    println!("  [FAIL] komikindo.ch via proxy: {} ({:.3}s)", e, elapsed.as_secs_f64());
+                    println!("  [HINT] Check proxy is running. Try socks5h:// for remote DNS.");
+                }
+            }
+        } else if !run_all {
+            println!("\n  [SKIP] No proxy configured. Use --proxy or set PROXY_URL in .env");
+        }
+
+        // Test 3: /komik-terbaru/ (quick content check)
+        println!("\n  --- Test 3: Content check (/komik-terbaru/) ---");
+        let fetcher = Fetcher::new(opts.timeout, proxy_to_test, opts.verbose)?;
+        let t0 = Instant::now();
+        match fetcher.fetch_page(&format!("{BASE_URL}/komik-terbaru/")).await {
+            Ok(html) => {
+                let elapsed = t0.elapsed();
+                println!("  [OK] /komik-terbaru/: {:.1} KB in {:.3}s",
+                    html.len() as f64 / 1024.0, elapsed.as_secs_f64());
+                // Quick check: count entries
+                let entry_count = html.matches("class=\"entry-item\"").count()
+                    + html.matches("<article").count();
+                if entry_count > 0 {
+                    println!("  [OK] Found ~{} entries", entry_count);
+                }
+            }
+            Err(e) => {
+                println!("  [FAIL] /komik-terbaru/: {}", e);
+            }
+        }
+
+        println!();
+    }
+
+    // --- DB Test ---
+    if run_all || opts.db {
+        println!("{}", "=".repeat(50));
+        println!("  DATABASE TEST");
+        println!("{}", "=".repeat(50));
+
+        let cfg = config::env_config();
+        if cfg.database_url.is_empty() {
+            println!("\n  [SKIP] DATABASE_URL not set");
+            println!("  [HINT] Set DATABASE_URL in .env or use --env /path/to/.env");
+        } else {
+            println!("\n  URL: {}", config::mask_database_url(&cfg.database_url));
+            println!("  Connecting...");
+            let t0 = Instant::now();
+            match db::connect(&cfg.database_url).await {
+                Ok(pool) => {
+                    let elapsed = t0.elapsed();
+                    println!("  [OK] Connected in {:.3}s", elapsed.as_secs_f64());
+
+                    // Test query: count komik
+                    match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM komik")
+                        .fetch_one(&pool).await
+                    {
+                        Ok(count) => println!("  [OK] Total komik in DB: {}", count),
+                        Err(e) => println!("  [WARN] COUNT query failed: {}", e),
+                    }
+
+                    // Test query: count chapters
+                    match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM chapters")
+                        .fetch_one(&pool).await
+                    {
+                        Ok(count) => println!("  [OK] Total chapters in DB: {}", count),
+                        Err(e) => println!("  [WARN] COUNT chapters failed: {}", e),
+                    }
+
+                    // Test query: latest scrape_log
+                    match sqlx::query_as::<_, (String, String, chrono::DateTime<chrono::Utc>)>(
+                        "SELECT operation, status, created_at FROM scrape_log ORDER BY id DESC LIMIT 1"
+                    )
+                    .fetch_optional(&pool).await
+                    {
+                        Ok(Some((op, status, ts))) => {
+                            println!("  [OK] Last scrape: {} ({}) at {}", op, status, ts);
+                        }
+                        Ok(None) => println!("  [OK] No scrape_log entries yet"),
+                        Err(e) => println!("  [WARN] scrape_log query failed: {}", e),
+                    }
+                }
+                Err(e) => {
+                    let elapsed = t0.elapsed();
+                    println!("  [FAIL] Connection failed after {:.3}s", elapsed.as_secs_f64());
+                    println!("  Error: {}", e);
+                    println!("\n  Troubleshooting:");
+                    println!("    - Check DATABASE_URL format: postgresql://user:pass@host:5432/db");
+                    println!("    - For Supabase: use port 5432 (not 6543 PgBouncer)");
+                    println!("    - Check network connectivity to the DB host");
+                    println!("    - Verify credentials are correct");
+                }
+            }
+        }
+
+        println!();
+    }
+
+    println!("{}", "=".repeat(50));
+    println!("  DEBUG COMPLETE");
+    println!("{}", "=".repeat(50));
+
+    Ok(())
 }
 
 // ============================================================

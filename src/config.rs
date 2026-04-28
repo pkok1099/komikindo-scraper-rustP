@@ -3,7 +3,9 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::path::PathBuf;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 
 // ============================================================
 // BASE URL
@@ -14,18 +16,155 @@ pub const BASE_URL: &str = "https://komikindo.ch";
 // ENVIRONMENT VARIABLES
 // ============================================================
 
-static ENV: LazyLock<EnvConfig> = LazyLock::new(|| {
-    // Load .env — dotenvy hanya set env var yang BELUM ada.
-    // Fallback: coba beberapa lokasi .env
-    let env_loaded = dotenvy::dotenv().is_ok();
-    if !env_loaded {
-        // Coba dari direktori binary (project root)
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
-                let env_path = exe_dir.parent().unwrap_or(exe_dir).join(".env");
-                dotenvy::from_path(&env_path).ok();
+/// Stores debug info about .env loading (paths searched, which one was found).
+/// Only populated after first access to env_config().
+static ENV_LOAD_INFO: Mutex<Option<EnvLoadInfo>> = Mutex::new(None);
+
+#[derive(Debug, Clone)]
+pub struct EnvLoadInfo {
+    /// All paths that were searched for .env
+    pub searched_paths: Vec<String>,
+    /// The path that was successfully loaded (None if no .env found)
+    pub loaded_path: Option<String>,
+    /// Whether DATABASE_URL was found after all loading attempts
+    pub has_database_url: bool,
+}
+
+/// Find and load .env from multiple locations.
+/// Returns (env file path if found, list of searched paths).
+fn find_and_load_env(explicit_path: Option<&str>) -> (Option<String>, Vec<String>) {
+    let mut searched = Vec::new();
+
+    // 1. Explicit path from --env flag
+    if let Some(p) = explicit_path {
+        let path = PathBuf::from(p);
+        searched.push(format!("(explicit) {}", path.display()));
+        if path.exists() {
+            match dotenvy::from_path(&path) {
+                Ok(_) => return (Some(path.display().to_string()), searched),
+                Err(e) => eprintln!("[ENV] Failed to load {}: {e}", path.display()),
             }
         }
+    }
+
+    // 2. Current working directory
+    if let Ok(cwd) = env::current_dir() {
+        let p = cwd.join(".env");
+        searched.push(p.display().to_string());
+        if dotenvy::from_path(&p).is_ok() {
+            return (Some(p.display().to_string()), searched);
+        }
+    }
+
+    // 3. Binary's directory
+    if let Ok(exe) = env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let p = exe_dir.join(".env");
+            searched.push(p.display().to_string());
+            if dotenvy::from_path(&p).is_ok() {
+                return (Some(p.display().to_string()), searched);
+            }
+        }
+    }
+
+    // 4. Walk up to 5 parent directories from binary
+    if let Ok(exe) = env::current_exe() {
+        if let Some(start) = exe.parent() {
+            let mut dir = start.to_path_buf();
+            for _ in 0..5 {
+                if let Some(parent) = dir.parent() {
+                    dir = parent.to_path_buf();
+                    let p = dir.join(".env");
+                    searched.push(p.display().to_string());
+                    if dotenvy::from_path(&p).is_ok() {
+                        return (Some(p.display().to_string()), searched);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 5. Walk up to 3 parent directories from cwd
+    if let Ok(cwd) = env::current_dir() {
+        let mut dir = cwd;
+        for _ in 0..3 {
+            if let Some(parent) = dir.parent() {
+                dir = parent.to_path_buf();
+                let p = dir.join(".env");
+                searched.push(p.display().to_string());
+                if dotenvy::from_path(&p).is_ok() {
+                    return (Some(p.display().to_string()), searched);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    (None, searched)
+}
+
+/// Set the explicit .env path (from --env CLI flag).
+/// Must be called BEFORE first access to env_config().
+pub fn set_explicit_env_path(path: Option<String>) {
+    if let Ok(mut info) = ENV_LOAD_INFO.lock() {
+        *info = Some(EnvLoadInfo {
+            searched_paths: vec![],
+            loaded_path: None,
+            has_database_url: false,
+        });
+    }
+    EXPLICIT_ENV_PATH.store(
+        path.unwrap_or_default().leak().as_ptr() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    EXPLICIT_ENV_LEN.store(
+        path.as_ref().map(|p| p.len()).unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+// Thread-safe storage for explicit env path (set before LazyLock init)
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+static EXPLICIT_ENV_PATH: AtomicU64 = AtomicU64::new(0);
+static EXPLICIT_ENV_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Get the explicit env path as a string (unsafe but only used during init).
+fn get_explicit_env_path() -> Option<String> {
+    let len = EXPLICIT_ENV_LEN.load(AtomicOrdering::Relaxed);
+    if len == 0 {
+        return None;
+    }
+    let ptr = EXPLICIT_ENV_PATH.load(AtomicOrdering::Relaxed) as *const u8;
+    // Safety: this is only called during LazyLock init, before any concurrent access.
+    // The string was leaked and won't be freed.
+    unsafe {
+        let slice = std::slice::from_raw_parts(ptr, len);
+        Some(String::from_utf8_lossy(slice).to_string())
+    }
+}
+
+static ENV: LazyLock<EnvConfig> = LazyLock::new(|| {
+    let explicit = get_explicit_env_path();
+    let (env_path, searched) = find_and_load_env(explicit.as_deref());
+    let has_db = env::var("DATABASE_URL").is_ok();
+
+    if let Ok(mut info) = ENV_LOAD_INFO.lock() {
+        *info = Some(EnvLoadInfo {
+            searched_paths: searched,
+            loaded_path: env_path.clone(),
+            has_database_url: has_db,
+        });
+    }
+
+    // Show .env status
+    if let Some(ref p) = env_path {
+        eprintln!("[ENV] Loaded .env from: {p}");
+    } else {
+        eprintln!("[ENV] No .env file found — using environment variables only");
+        eprintln!("[ENV] Tip: use --env /path/to/.env to specify .env location");
     }
 
     // DEBUG: show which DATABASE_URL is loaded
@@ -68,6 +207,39 @@ pub struct EnvConfig {
 
 pub fn env_config() -> &'static EnvConfig {
     &ENV
+}
+
+/// Get debug info about .env loading (paths searched, which was loaded).
+pub fn env_load_info() -> EnvLoadInfo {
+    ENV_LOAD_INFO.lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or(EnvLoadInfo {
+            searched_paths: vec!["(not initialized yet)".to_string()],
+            loaded_path: None,
+            has_database_url: false,
+        })
+}
+
+/// Mask DATABASE_URL for safe display (hide password).
+/// postgresql://user:***@host:port/db
+pub fn mask_database_url(url: &str) -> String {
+    if url.is_empty() {
+        return "(not set)".to_string();
+    }
+    if url.starts_with("file:") {
+        return format!("{}... (SQLite — WARNING)", &url[..url.len().min(30)]);
+    }
+    // postgresql://user:password@host:port/db
+    if let Some(at_pos) = url.find('@') {
+        let prefix = &url[..at_pos + 1]; // "postgresql://user:"
+        if let Some(colon_pos) = prefix.rfind(':') {
+            let user_part = &prefix[..colon_pos + 1]; // "postgresql://user:"
+            let masked = format!("{}***{}", user_part, &url[at_pos..]);
+            return masked;
+        }
+    }
+    url.to_string()
 }
 
 // ============================================================

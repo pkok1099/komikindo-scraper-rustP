@@ -6,7 +6,7 @@
 # Targets:
 #   - x86_64-unknown-linux-gnu    → Linux amd64 servers
 #   - aarch64-unknown-linux-gnu   → Linux ARM64 servers
-#   - aarch64-linux-android       → Termux (Android ARM64)
+#   - aarch64-linux-android       → Termux (Android ARM64) — STATIC binary
 
 name: Build Release
 
@@ -14,9 +14,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v1.0.1)'
+        description: 'Release tag (e.g. v1.1.0)'
         required: false
-        default: 'v1.0.1'
+        default: 'v1.1.0'
   push:
     tags:
       - 'v*'
@@ -35,12 +35,15 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             artifact: komikindo-scraper-amd64
             apt_extra: ''
+            rustflags: ''
           - target: aarch64-unknown-linux-gnu
             artifact: komikindo-scraper-arm64
             apt_extra: 'gcc-aarch64-linux-gnu'
+            rustflags: ''
           - target: aarch64-linux-android
             artifact: komikindo-scraper-termux
             apt_extra: ''
+            rustflags: '-C target-feature=+crt-static'
 
     steps:
       - uses: actions/checkout@v4
@@ -66,6 +69,7 @@ jobs:
           echo "AR_aarch64_linux_android=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> $GITHUB_ENV
           echo "RANLIB_aarch64_linux_android=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" >> $GITHUB_ENV
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=${{ matrix.rustflags }}" >> $GITHUB_ENV
 
       - name: Install system dependencies
         if: matrix.apt_extra != ''
@@ -80,9 +84,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.target }}-rustls-v3-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.target }}-rustls-v4-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.target }}-rustls-v3-
+            ${{ matrix.target }}-rustls-v4-
 
       # --locked: use committed Cargo.lock exactly (no implicit openssl-sys)
       - name: Build ${{ matrix.target }}
@@ -91,6 +95,7 @@ jobs:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
           RANLIB_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ranlib
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --target ${{ matrix.target }} --locked 2>&1
 
       - name: Strip binary
@@ -113,6 +118,13 @@ jobs:
           ls -lh target/${{ matrix.target }}/release/komikindo-scraper
           file target/${{ matrix.target }}/release/komikindo-scraper
           readelf -d target/${{ matrix.target }}/release/komikindo-scraper 2>/dev/null | head -5 || true
+          # Check if static or dynamic
+          echo "---"
+          if readelf -d target/${{ matrix.target }}/release/komikindo-scraper 2>/dev/null | grep -q "NEEDED"; then
+            echo "LINKING: DYNAMIC (needs system libs)"
+          else
+            echo "LINKING: STATIC (no system libs needed)"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -154,26 +166,67 @@ jobs:
           body: |
             ## KomikIndo Scraper - Rust Release
 
-            | File | Arch | Target Platform |
-            |------|------|----------------|
-            | `komikindo-scraper-amd64` | x86_64 | Linux (server/GitHub Actions/Codespace) |
-            | `komikindo-scraper-arm64` | aarch64 | Linux ARM64 (server/VPS) |
-            | `komikindo-scraper-termux` | aarch64 | **Termux (Android ARM64)** |
+            | File | Arch | Platform | Notes |
+            |------|------|----------|-------|
+            | `komikindo-scraper-amd64` | x86_64 | Linux (server/Codespace/GitHub Actions) | glibc |
+            | `komikindo-scraper-arm64` | aarch64 | Linux ARM64 (server/VPS) | glibc |
+            | `komikindo-scraper-termux` | aarch64 | **Termux (Android)** | **STATIC — no dependencies** |
+
+            ### Which binary do I need?
+
+            - **Linux PC/Server (Intel/AMD)**: `komikindo-scraper-amd64`
+            - **Linux ARM Server (Raspberry Pi, etc)**: `komikindo-scraper-arm64`
+            - **Termux on Android**: `komikindo-scraper-termux` ← **download this one!**
 
             ### Quick Start
+
             ```bash
             chmod +x komikindo-scraper-*
+
+            # Run diagnostics (recommended first!)
+            ./komikindo-scraper debug
+
             # Test connectivity
-            ./komikindo-scraper-amd64 check
-            # Test with proxy
-            ./komikindo-scraper-amd64 check --proxy socks5://127.0.0.1:1080
+            ./komikindo-scraper check
+
+            # Test with proxy (Termux)
+            ./komikindo-scraper-termux check --proxy socks5://127.0.0.1:1080
+
             # Verbose debug
-            ./komikindo-scraper-amd64 -v check --proxy socks5://127.0.0.1:1080
-            # Smart update
-            ./komikindo-scraper-amd64 update --db --max-pages 3
+            ./komikindo-scraper -v check --proxy socks5://127.0.0.1:1080
+
+            # Smart update (dry run first)
+            ./komikindo-scraper update --dry-run
+
+            # Smart update (write to DB)
+            ./komikindo-scraper update --db --max-pages 3
+
             # Full fetch
-            ./komikindo-scraper-amd64 full-fetch --db --limit 10
+            ./komikindo-scraper full-fetch --db --limit 10
+
+            # Specify .env location
+            ./komikindo-scraper --env /path/to/.env update --db
             ```
+
+            ### .env file
+
+            Create `.env` in the same directory as the binary (or use `--env`):
+
+            ```
+            DATABASE_URL=postgresql://user:pass@host:5432/postgres
+            PROXY_URL=socks5://127.0.0.1:1080
+            PROXY_ENABLED=1
+            ```
+
+            ### Debug Features
+
+            - `debug` — Run all diagnostics (info + env + network + DB)
+            - `debug --info` — Show binary/platform info
+            - `debug --env` — Show .env loading details + config (password masked)
+            - `debug --network` — Test connectivity (direct + proxy)
+            - `debug --db` — Test DB connection + count tables
+            - `-v` / `--verbose` — Enable curl protocol details
+            - `--env /path/to/.env` — Explicit .env file location
           files: |
             release/komikindo-scraper-amd64
             release/komikindo-scraper-arm64
