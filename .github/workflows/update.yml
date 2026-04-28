@@ -47,6 +47,7 @@ jobs:
         run: cargo build --release --locked 2>&1
 
       - name: Run smart update
+        continue-on-error: true
         run: |
           ./target/release/komikindo-scraper update \
             --max-pages 3 \
@@ -58,3 +59,4 @@ jobs:
         run: |
           echo "=== Smart Update Summary ==="
           echo "Timestamp: $(date -u)"
+          echo "Note: Update may fail if komikindo.ch blocks datacenter IPs (Cloudflare)."

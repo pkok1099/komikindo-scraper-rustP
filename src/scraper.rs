@@ -24,7 +24,7 @@ pub async fn scrape_full_komik_list(fetcher: &Fetcher) -> Result<Vec<String>> {
 pub async fn scrape_komik_detail(slug: &str, fetcher: &Fetcher) -> Result<parsers::KomikDetail> {
     let komik_url = build_komik_url(slug);
     let html = fetcher.fetch_page(&komik_url).await
-        .map_err(|_| anyhow::anyhow!("Gagal fetch detail {}", komik_url))?;
+        .map_err(|e| anyhow::anyhow!("Gagal fetch detail {}: {e}", komik_url))?;
 
     parsers::parse_komik_detail(slug, &html)
         .ok_or_else(|| anyhow::anyhow!("Gagal parse detail untuk slug: {}", slug))
@@ -39,7 +39,7 @@ pub async fn scrape_chapter_images(
     fetcher: &Fetcher,
 ) -> Result<parsers::ChapterImageData> {
     let html = fetcher.fetch_page(chapter_url).await
-        .map_err(|_| anyhow::anyhow!("Gagal fetch chapter: {}", chapter_url))?;
+        .map_err(|e| anyhow::anyhow!("Gagal fetch chapter {}: {e}", chapter_url))?;
 
     Ok(parsers::parse_chapter_images(&html))
 }
@@ -49,7 +49,7 @@ pub async fn scrape_homepage_updates(fetcher: &Fetcher) -> Result<Vec<parsers::H
     println!("[HOME] Fetching homepage for incremental update check...");
 
     let html = fetcher.fetch_page(BASE_URL).await
-        .map_err(|_| anyhow::anyhow!("Gagal fetch homepage"))?;
+        .map_err(|e| anyhow::anyhow!("Gagal fetch homepage: {e}"))?;
 
     let updates = parsers::parse_homepage_updates(&html);
     println!("[HOME] Found {} recently updated komik", updates.len());
@@ -77,8 +77,19 @@ pub async fn scrape_komik_terbaru(
         };
 
         println!("[TERBARU] Fetching page {page}: {url}");
-        let html = fetcher.fetch_page(&url).await
-            .map_err(|_| anyhow::anyhow!("Gagal fetch /komik-terbaru/ page {page}"))?;
+        let html = match fetcher.fetch_page(&url).await {
+            Ok(html) => html,
+            Err(e) => {
+                eprintln!("[TERBARU] Failed page {page}: {e}");
+                if page == 1 {
+                    return Err(e.context(format!(
+                        "Website unreachable from this IP (page 1 failed). \
+                         Common on datacenter IPs (GitHub Actions)."
+                    )));
+                }
+                break;
+            }
+        };
 
         let items = parsers::parse_komik_terbaru(&html);
         println!("[TERBARU] Page {page}: {} items", items.len());
