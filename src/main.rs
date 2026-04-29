@@ -32,10 +32,11 @@ mod jsonl;
 mod parsers;
 mod scraper;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use clap::Parser;
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -46,6 +47,7 @@ use sqlx::Row;
 use crate::fetcher::Fetcher;
 use crate::scraper::{scrape_full_komik_list, scrape_komik_detail, scrape_komik_terbaru};
 use crate::config::BASE_URL;
+use crate::parsers::KomikDetail;
 
 // ============================================================
 // CLI
@@ -1073,6 +1075,19 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     let db_pool = maybe_connect_db(opts.use_db).await;
     let using_db = db_pool.is_some();
 
+    // Ensure DB schema is up-to-date BEFORE starting the pipeline.
+    // This avoids slow DDL (ALTER TABLE) calls inside high-concurrency writes.
+    if let Some((ref pool, _)) = db_pool {
+        println!("[DB] Ensuring schema...");
+        if let Err(e) = db::setup_schema(pool).await {
+            eprintln!("[DB] Schema setup warning: {:#}", e);
+        }
+        if let Err(e) = db::ensure_schema(pool).await {
+            eprintln!("[DB] Ensure schema warning: {:#}", e);
+        }
+        println!("[DB] Schema OK!");
+    }
+
     let data_dir = PathBuf::from("data");
     std::fs::create_dir_all(&data_dir)?;
 
@@ -1177,100 +1192,84 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     }
     println!("Komik to process: {total}");
 
-    // === Step 2: FULL SPEED PIPELINE ===
-    println!("\n--- Step 2: FULL SPEED PIPELINE ---");
-    println!("[INFO] Spawning {} detail fetches (no chapter scraping)", total);
+    // === PHASE 1: FETCH ALL → JSONL (no DB write, pure speed) ===
+    println!("\n--- Phase 1: FETCH ALL (to JSONL) ---");
+    println!("[INFO] Fetching {} komik details (DB write in Phase 2)", total);
 
     let success = Arc::new(AtomicUsize::new(0));
     let failed = Arc::new(AtomicUsize::new(0));
     let total_chapters = Arc::new(AtomicUsize::new(0));
     let jsonl_path = Arc::new(jsonl_path);
-    let db_new = Arc::new(AtomicUsize::new(0));
-    let db_updated = Arc::new(AtomicUsize::new(0));
+    let writer_fetcher = Arc::clone(&fetcher);
 
-    // Spawn ALL detail fetches at once
-    let mut detail_handles = Vec::with_capacity(total);
-    for slug in &komik_list {
-        let fetcher = Arc::clone(&fetcher);
-        let slug = slug.clone();
-        detail_handles.push(tokio::spawn(async move {
-            let result = scrape_komik_detail(&slug, &fetcher).await;
-            (slug, result)
-        }));
-    }
+    // Spawn in chunks to keep memory bounded
+    const FETCH_CHUNK: usize = 50;
+    let total_chunks = (total + FETCH_CHUNK - 1) / FETCH_CHUNK;
+    println!("[INFO] {} chunks of max {} komik", total_chunks, FETCH_CHUNK);
 
-    // Process results as they arrive
     let write_success = Arc::clone(&success);
     let write_failed = Arc::clone(&failed);
     let write_ch = Arc::clone(&total_chapters);
     let write_jsonl = Arc::clone(&jsonl_path);
-    let db_pool_ref = db_pool.as_ref().map(|(p, _)| p.clone());
-    let write_db_new = Arc::clone(&db_new);
-    let write_db_updated = Arc::clone(&db_updated);
 
-    let writer_task = tokio::spawn(async move {
-        for handle in detail_handles {
-            match handle.await {
-                Ok((slug, result)) => {
-                    match result {
-                        Ok(detail) => {
-                            let ch_count = detail.chapters.len();
-                            write_ch.fetch_add(ch_count, Ordering::Relaxed);
+    let fetch_task = tokio::spawn(async move {
+        for (chunk_idx, chunk) in komik_list.chunks(FETCH_CHUNK).enumerate() {
+            if chunk_idx > 0 {
+                eprintln!("  [FETCH] Chunk {}/{} ({} komik)...",
+                    chunk_idx + 1, total_chunks, chunk.len());
+            }
 
-                            // Write to DB if connected
-                            if let Some(ref pool) = db_pool_ref {
-                                match db::write_komik(pool, &detail).await {
-                                    Ok(wr) => {
-                                        if wr.is_new {
-                                            write_db_new.fetch_add(1, Ordering::Relaxed);
-                                        } else {
-                                            write_db_updated.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        if let Some(db_err) = e.downcast_ref::<sqlx::Error>() {
-                                            eprintln!("  [DB ERR] {}: {} | {:?}", slug, e, db_err);
-                                        } else {
-                                            eprintln!("  [DB ERR] {}: {:#}", slug, e);
-                                        }
-                                    }
+            let mut handles = Vec::with_capacity(chunk.len());
+            for slug in chunk {
+                let fetcher = Arc::clone(&writer_fetcher);
+                let slug = slug.clone();
+                handles.push(tokio::spawn(async move {
+                    let result = scrape_komik_detail(&slug, &fetcher).await;
+                    (slug, result)
+                }));
+            }
+
+            for handle in handles {
+                match handle.await {
+                    Ok((slug, result)) => {
+                        match result {
+                            Ok(detail) => {
+                                let ch_count = detail.chapters.len();
+                                write_ch.fetch_add(ch_count, Ordering::Relaxed);
+
+                                // Write to JSONL only (fast, local disk)
+                                if let Err(e) = jsonl::append_jsonl(&write_jsonl, &detail) {
+                                    eprintln!("  [WARN] JSONL write error: {e}");
                                 }
-                            }
 
-                            // Always write JSONL as backup
-                            if let Err(e) = jsonl::append_jsonl(&write_jsonl, &detail) {
-                                eprintln!("  [WARN] JSONL write error: {e}");
+                                write_success.fetch_add(1, Ordering::Relaxed);
                             }
-
-                            write_success.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            write_failed.fetch_add(1, Ordering::Relaxed);
-                            let failed_json = serde_json::json!({
-                                "slug": slug,
-                                "_status": "detail_failed",
-                                "_error": e.to_string(),
-                            });
-                            let _ = jsonl::append_jsonl_raw(&write_jsonl, &failed_json.to_string());
+                            Err(e) => {
+                                write_failed.fetch_add(1, Ordering::Relaxed);
+                                let failed_json = serde_json::json!({
+                                    "slug": slug,
+                                    "_status": "detail_failed",
+                                    "_error": e.to_string(),
+                                });
+                                let _ = jsonl::append_jsonl_raw(&write_jsonl, &failed_json.to_string());
+                            }
                         }
                     }
-                }
-                Err(_) => {
-                    write_failed.fetch_add(1, Ordering::Relaxed);
+                    Err(_) => {
+                        write_failed.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
     });
 
-    // Progress reporter
+    // Progress reporter (Phase 1 only)
     let progress_total = total;
     let progress_start = start_time;
     let progress_fetcher = Arc::clone(&fetcher);
     let progress_success = Arc::clone(&success);
     let progress_failed = Arc::clone(&failed);
     let progress_ch = Arc::clone(&total_chapters);
-    let progress_db_new = Arc::clone(&db_new);
-    let progress_db_updated = Arc::clone(&db_updated);
 
     let progress_handle = tokio::spawn(async move {
         loop {
@@ -1278,9 +1277,7 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
             let s = progress_success.load(Ordering::Relaxed);
             let f = progress_failed.load(Ordering::Relaxed);
             let c = s + f;
-            if c == 0 {
-                continue;
-            }
+            if c == 0 { continue; }
             let elapsed = progress_start.elapsed().as_secs_f64();
             let rate = c as f64 / elapsed * 60.0;
             let eta = if rate > 0.0 {
@@ -1289,47 +1286,128 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
                 0.0
             };
             let stats = progress_fetcher.stats();
-
-            if using_db {
-                eprint!(
-                    "  [{}/{} {:.1}%] {:.0} komik/min | ETA: {:.0}min | \
-                     OK: {} FAIL: {} | DB new: {} upd: {} | Ch: {} | DL: {:.1}MB | req: {}\r",
-                    c, progress_total, c as f64 / progress_total as f64 * 100.0,
-                    rate, eta, s, f,
-                    progress_db_new.load(Ordering::Relaxed),
-                    progress_db_updated.load(Ordering::Relaxed),
-                    progress_ch.load(Ordering::Relaxed),
-                    stats.mb_downloaded(), stats.requests,
-                );
-            } else {
-                eprint!(
-                    "  [{}/{} {:.1}%] {:.0} komik/min | ETA: {:.0}min | \
-                     OK: {} FAIL: {} | Ch: {} | DL: {:.1}MB | req: {}\r",
-                    c, progress_total, c as f64 / progress_total as f64 * 100.0,
-                    rate, eta, s, f,
-                    progress_ch.load(Ordering::Relaxed),
-                    stats.mb_downloaded(), stats.requests,
-                );
-            }
+            eprint!(
+                "  [FETCH {}/{} {:.1}%] {:.0} komik/min | ETA: {:.0}min | \
+                 OK: {} FAIL: {} | Ch: {} | DL: {:.1}MB | req: {}\r",
+                c, progress_total, c as f64 / progress_total as f64 * 100.0,
+                rate, eta, s, f,
+                progress_ch.load(Ordering::Relaxed),
+                stats.mb_downloaded(), stats.requests,
+            );
         }
     });
 
-    // Wait for writer
-    let _ = writer_task.await;
+    // Wait for fetch to complete
+    let _ = fetch_task.await;
     progress_handle.abort();
 
-    // === Summary ===
-    let elapsed = start_time.elapsed().as_secs_f64();
+    let fetch_elapsed = start_time.elapsed().as_secs_f64();
     let stats = fetcher.stats();
     let s = success.load(Ordering::Relaxed);
     let f = failed.load(Ordering::Relaxed);
     let ch = total_chapters.load(Ordering::Relaxed);
-    let db_n = db_new.load(Ordering::Relaxed);
-    let db_u = db_updated.load(Ordering::Relaxed);
+
+    println!();
+    println!("  [FETCH DONE] {s} komik, {f} failed, {ch} chapters in {:.1}s ({:.1} min)",
+        fetch_elapsed, fetch_elapsed / 60.0);
+    println!("  [FETCH RATE] {:.1} komik/min", s as f64 / fetch_elapsed * 60.0);
 
     let jsonl_size_mb = std::fs::metadata(jsonl_path.as_ref())
         .map(|m| m.len() as f64 / 1024.0 / 1024.0)
         .unwrap_or(0.0);
+    println!("  [JSONL] {} ({:.1} MB)", jsonl_path.display(), jsonl_size_mb);
+
+    // === PHASE 2: BATCH UPLOAD TO DB ===
+    let mut db_n: usize = 0;
+    let mut db_u: usize = 0;
+
+    if using_db && s > 0 {
+        println!("\n--- Phase 2: DB UPLOAD (batch from JSONL) ---");
+
+        let jsonl_file = std::fs::File::open(jsonl_path.as_ref())
+            .with_context(|| format!("Failed to open JSONL: {}", jsonl_path.display()))?;
+        let reader = std::io::BufReader::new(jsonl_file);
+
+        let db_upload_start = Instant::now();
+        let mut komik_batch: Vec<KomikDetail> = Vec::with_capacity(200);
+        let mut parse_skip = 0usize;
+
+        for line in reader.lines() {
+            let Ok(line) = line else { continue };
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+
+            match serde_json::from_str::<KomikDetail>(trimmed) {
+                Ok(detail) => komik_batch.push(detail),
+                Err(_) => parse_skip += 1,
+            }
+
+            // Flush batch every 500 komik
+            if komik_batch.len() >= 500 {
+                let pool = db_pool.as_ref().unwrap().0.clone();
+                match db::batch_write_komik(&pool, &komik_batch).await {
+                    Ok(result) => {
+                        db_n += result.new_count;
+                        db_u += result.updated_count;
+                    }
+                    Err(e) => {
+                        eprintln!("  [DB ERR] batch write: {:#}", e);
+                        // Fallback: write one by one
+                        for detail in &komik_batch {
+                            let pool = db_pool.as_ref().unwrap().0.clone();
+                            if let Ok(wr) = db::write_komik(&pool, detail).await {
+                                if wr.is_new { db_n += 1; } else { db_u += 1; }
+                            }
+                        }
+                    }
+                }
+                eprintln!("  [DB] Uploaded {} komik (total: {} new, {} updated)",
+                    db_n + db_u, db_n, db_u);
+                komik_batch.clear();
+            }
+        }
+
+        // Flush remaining
+        if !komik_batch.is_empty() {
+            let pool = db_pool.as_ref().unwrap().0.clone();
+            match db::batch_write_komik(&pool, &komik_batch).await {
+                Ok(result) => {
+                    db_n += result.new_count;
+                    db_u += result.updated_count;
+                }
+                Err(e) => {
+                    eprintln!("  [DB ERR] final batch: {:#}", e);
+                    for detail in &komik_batch {
+                        let pool = db_pool.as_ref().unwrap().0.clone();
+                        if let Ok(wr) = db::write_komik(&pool, detail).await {
+                            if wr.is_new { db_n += 1; } else { db_u += 1; }
+                        }
+                    }
+                }
+            }
+        }
+
+        let db_elapsed = db_upload_start.elapsed().as_secs_f64();
+        println!("  [DB DONE] {} new, {} updated in {:.1}s ({:.0} komik/min)",
+            db_n, db_u, db_elapsed,
+            (db_n + db_u) as f64 / db_elapsed.max(0.01) * 60.0);
+        if parse_skip > 0 {
+            println!("  [DB] Skipped {} invalid JSONL entries", parse_skip);
+        }
+
+        // Log ke scrape_log
+        if let Some((pool, _)) = &db_pool {
+            let _ = db::log_scrape(
+                pool, "full_fetch", "completed",
+                total as i32, db_n as i32, db_u as i32, f as i32,
+                Some(&format!("fetch={:.1}s db={:.1}s, {} reqs",
+                    fetch_elapsed, db_elapsed, stats.requests)),
+            ).await;
+        }
+    }
+
+    // === Summary ===
+    let total_elapsed = start_time.elapsed().as_secs_f64();
 
     println!();
     println!("{}", "=".repeat(70));
@@ -1342,29 +1420,16 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
         println!("  DB new:         {db_n}");
         println!("  DB updated:     {db_u}");
     }
-    println!("  Time:           {:.1}s ({:.1}min)", elapsed, elapsed / 60.0);
-    println!(
-        "  Rate:           {:.1} komik/min",
-        (s + f) as f64 / elapsed * 60.0
-    );
+    println!("  Fetch time:     {:.1}s ({:.1}min) | {:.1} komik/min",
+        fetch_elapsed, fetch_elapsed / 60.0,
+        s as f64 / fetch_elapsed * 60.0);
+    println!("  Total time:     {:.1}s ({:.1}min)",
+        total_elapsed, total_elapsed / 60.0);
     println!("  Requests:       {}", stats.requests);
     println!("  Retries:        {}", stats.retries);
     println!("  Downloaded:     {:.1} MB", stats.mb_downloaded());
-    println!(
-        "  JSONL:          {} ({:.1} MB)",
-        jsonl_path.display(),
-        jsonl_size_mb
-    );
-
-    // Log ke scrape_log
-    if let Some((pool, _)) = &db_pool {
-        let _ = db::log_scrape(
-            pool, "full_fetch", "completed",
-            total as i32, db_n as i32, db_u as i32, f as i32,
-            Some(&format!("{:.1}s, {} requests", elapsed, stats.requests)),
-        ).await;
-    }
-
+    println!("  JSONL:          {} ({:.1} MB)",
+        jsonl_path.display(), jsonl_size_mb);
     println!("{}", "=".repeat(70));
 
     Ok(())

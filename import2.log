@@ -1,0 +1,24 @@
+Connecting to aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres...
+Ensuring schema...
+Schema OK
+Reading data/full_fetch_20260429_072555.jsonl...
+Loaded 6050 komik entries
+  [200/6050] batch 1: +200 komik | 1e+03 k/min | ETA:0.1m | new=0 upd=200 fail=0
+  [400/6050] batch 2: +200 komik | 1e+03 k/min | ETA:0.1m | new=0 upd=400 fail=0
+  [600/6050] batch 3: +200 komik | 1e+03 k/min | ETA:0.1m | new=0 upd=600 fail=0
+  [800/6050] batch 4: +200 komik | 1e+03 k/min | ETA:0.1m | new=0 upd=800 fail=0
+  [1000/6050] batch 5: +200 komik | 1e+03 k/min | ETA:0.1m | new=0 upd=1000 fail=0
+  [1200/6050] batch 6: +200 komik | 1e+03 k/min | ETA:0.1m | new=0 upd=1200 fail=0
+  [1400/6050] batch 7: +200 komik | 1e+03 k/min | ETA:0.1m | new=0 upd=1400 fail=0
+  [1600/6050] batch 8: +200 komik | 1e+03 k/min | ETA:0.1m | new=0 upd=1600 fail=0
+  [1800/6050] batch 9: +200 komik | 1e+03 k/min | ETA:0.1m | new=0 upd=1800 fail=0
+  [2000/6050] batch 10: +200 komik | 1e+03 k/min | ETA:0.1m | new=0 upd=2000 fail=0
+  [2200/6050] batch 11: +200 komik | 1e+03 k/min | ETA:0.0m | new=0 upd=2200 fail=0
+  [2400/6050] batch 12: +200 komik | 1e+03 k/min | ETA:0.0m | new=0 upd=2400 fail=0
+  [2600/6050] batch 13: +200 komik | 1e+03 k/min | ETA:0.0m | new=91 upd=2509 fail=0
+  [2800/6050] batch 14: +200 komik | 1e+03 k/min | ETA:0.0m | new=291 upd=2509 fail=0
+  [3000/6050] batch 15: +200 komik | 1e+03 k/min | ETA:0.0m | new=491 upd=2509 fail=0
+  [3200/6050] batch 16: +200 komik | 1e+03 k/min | ETA:0.0m | new=691 upd=2509 fail=0
+  [3400/6050] batch 17: +200 komik | 1e+03 k/min | ETA:0.0m | new=891 upd=2509 fail=0
+  [3600/6050] batch 18: +200 komik | 1e+03 k/min | ETA:0.0m | new=1091 upd=2509 fail=0
+  [3800/6050] batch 19: +200 komik | 1e+03 k/min | ETA:0.0m | new=1291 upd=2509 fail=0

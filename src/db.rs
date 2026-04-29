@@ -364,19 +364,13 @@ pub async fn upsert_komik(pool: &PgPool, detail: &KomikDetail) -> Result<(i32, b
 /// Method 2: hanya menyimpan chapter_number dan url.
 /// image-related fields = NULL.
 ///
-/// FIX: Removed try-with-fallback pattern inside transaction.
-/// Previously, if the first INSERT failed, the transaction was aborted (25P02)
-/// and the fallback INSERT also failed, hiding the real error.
-/// Now: ensure_schema is called before the transaction to guarantee chapter_url
-/// column exists, then only one INSERT form is used.
+/// IMPORTANT: Caller MUST call db::setup_schema() + db::ensure_schema() once
+/// before starting the pipeline. This function does NOT call ensure_schema
+/// anymore to avoid slow DDL (ALTER TABLE) inside high-concurrency scenarios.
 pub async fn upsert_chapters(pool: &PgPool, komik_id: i32, chapters: &[ChapterInfo]) -> Result<usize> {
     if chapters.is_empty() {
         return Ok(0);
     }
-
-    // Ensure schema supports URL storage BEFORE starting transaction.
-    // This avoids DDL inside a transaction (which can cause deadlocks).
-    ensure_schema(pool).await?;
 
     // Use transaction for atomicity
     let mut tx = pool.begin().await.context("Failed to begin transaction")?;
@@ -471,6 +465,117 @@ pub struct WriteResult {
     pub is_new: bool,
     pub chapters_inserted: usize,
     pub genres_synced: usize,
+}
+
+// ============================================================
+// BATCH WRITE (Phase 2: from JSONL → DB)
+// ============================================================
+
+/// Result dari batch write: jumlah new + updated.
+#[derive(Debug, Default)]
+pub struct BatchWriteResult {
+    pub new_count: usize,
+    pub updated_count: usize,
+}
+
+/// Batch write multiple komik details ke DB.
+/// Optimized: batch upsert komik, then all chapters in one transaction, then genres.
+pub async fn batch_write_komik(pool: &PgPool, details: &[KomikDetail]) -> Result<BatchWriteResult> {
+    if details.is_empty() {
+        return Ok(BatchWriteResult::default());
+    }
+
+    let mut result = BatchWriteResult::default();
+
+    // Phase 1: Upsert all komik (one query each - unavoidable for ON CONFLICT RETURNING)
+    let mut komik_ids: Vec<(String, i32, bool)> = Vec::with_capacity(details.len());
+    for detail in details {
+        let (komik_id, is_new) = upsert_komik(pool, detail).await?;
+        if is_new {
+            result.new_count += 1;
+        } else {
+            result.updated_count += 1;
+        }
+        komik_ids.push((detail.slug.clone(), komik_id, is_new));
+    }
+
+    // Phase 2: Batch all chapters into single transaction
+    // Collect ALL (komik_id, chapter_number, chapter_url) triples
+    let mut all_chapters: Vec<(i32, f64, String)> = Vec::new();
+    for detail in details {
+        if let Some((_, komik_id, _)) = komik_ids.iter().find(|(s, _, _)| s == &detail.slug) {
+            for ch in &detail.chapters {
+                all_chapters.push((*komik_id, ch.number, ch.url.clone()));
+            }
+        }
+    }
+
+    if !all_chapters.is_empty() {
+        let mut tx = pool.begin().await.context("Failed to begin chapter batch transaction")?;
+
+        for (komik_id, number, url) in &all_chapters {
+            sqlx::query(
+                r#"
+                INSERT INTO chapters (komik_id, chapter_number, chapter_url)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (komik_id, chapter_number) DO UPDATE SET
+                    chapter_url = EXCLUDED.chapter_url,
+                    updated_at = now()
+                "#,
+            )
+            .bind(*komik_id)
+            .bind(*number)
+            .bind(url)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("Failed to batch upsert chapter {} for komik_id={}", number, komik_id))?;
+        }
+
+        tx.commit().await.context("Failed to commit chapter batch")?;
+    }
+
+    // Phase 3: Batch all genres
+    // Collect all (komik_id, genre_id) pairs
+    let mut all_genres: Vec<(i32, i16)> = Vec::new();
+    for detail in details {
+        if let Some((_, komik_id, _)) = komik_ids.iter().find(|(s, _, _)| s == &detail.slug) {
+            for &gid in &detail.genre_ids {
+                all_genres.push((*komik_id, gid));
+            }
+        }
+    }
+
+    if !all_genres.is_empty() {
+        // Delete existing genres for these komik, then insert all
+        let komik_id_list: Vec<i32> = komik_ids.iter().map(|(_, id, _)| *id).collect();
+        let id_placeholders: Vec<String> = (1..=komik_id_list.len()).map(|i| format!("${i}")).collect();
+        let delete_sql = format!(
+            "DELETE FROM komik_genres WHERE komik_id IN ({})",
+            id_placeholders.join(", ")
+        );
+
+        let mut delete_query = sqlx::query(&delete_sql);
+        for id in &komik_id_list {
+            delete_query = delete_query.bind(*id);
+        }
+        delete_query.execute(pool).await.context("Failed to batch delete genres")?;
+
+        // Insert all genres
+        let mut tx = pool.begin().await.context("Failed to begin genre batch transaction")?;
+        for (komik_id, genre_id) in &all_genres {
+            sqlx::query(
+                "INSERT INTO komik_genres (komik_id, genre_id) VALUES ($1, $2) ON CONFLICT DO NOTHING"
+            )
+            .bind(*komik_id)
+            .bind(*genre_id)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("Failed to insert genre {} for komik_id={}", genre_id, komik_id))?;
+        }
+        tx.commit().await.context("Failed to commit genre batch")?;
+    }
+
+    Ok(result)
 }
 
 // ============================================================
