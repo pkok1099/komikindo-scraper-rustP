@@ -18,7 +18,11 @@
 ///   - Set DATABASE_URL di .env untuk aktifkan
 ///   - Upsert komik metadata + chapters + genres ke Supabase PostgreSQL
 ///   - Tanpa image scraping (chapters table: hanya number, tanpa filenames)
-///   - Jika DATABASE_URL kosong, fallback ke JSONL file
+///
+/// WORKFLOW:
+///   1. full-fetch  → Fetch semua komik ke JSONL (TANPA DB write, ringan)
+///   2. upload-db   → Upload JSONL ke DB (manual, batch insert)
+///   3. update      → Smart update otomatis (write ke DB langsung)
 ///
 /// DEBUG FEATURES:
 ///   - `--verbose` / `-v` global flag: curl protocol details, timing, response info
@@ -69,7 +73,9 @@ EXAMPLES:
   komikindo-scraper -v check --proxy socks5://...       # Verbose with proxy
   komikindo-scraper update --dry-run                    # Preview changes
   komikindo-scraper update --db                         # Update DB
-  komikindo-scraper full-fetch --db --limit 10          # Fetch 10 komik
+  komikindo-scraper full-fetch --limit 10              # Fetch 10 komik ke JSONL
+  komikindo-scraper upload-db                            # Upload JSONL terbaru ke DB
+  komikindo-scraper upload-db --file data/full_fetch_xxx.jsonl  # Upload file tertentu
   komikindo-scraper --env /path/to/.env update --db     # Specify .env path
   komikindo-scraper debug                               # Run diagnostics
 "#)]
@@ -102,6 +108,8 @@ struct Cli {
 enum Commands {
     /// Full fetch semua komik + detail (FULL SPEED)
     /// Method 2: tanpa image scraping.
+    /// Fetch semua data ke JSONL file, TANPA auto upload ke DB.
+    /// Gunakan command 'upload-db' untuk upload ke database.
     FullFetch {
         /// Limit jumlah komik (0 = semua)
         #[arg(long, default_value_t = 0)]
@@ -122,10 +130,6 @@ enum Commands {
         /// SOCKS5/HTTP proxy URL (e.g. socks5://127.0.0.1:1080)
         #[arg(long)]
         proxy: Option<String>,
-
-        /// Force write ke database (requires DATABASE_URL)
-        #[arg(long)]
-        db: bool,
     },
 
     /// Smart incremental update dari /komik-terbaru/
@@ -269,6 +273,18 @@ enum Commands {
     /// Setup DB schema (create tables/columns/indexes if missing)
     DbSetup,
 
+    /// Upload JSONL data ke database (manual batch insert)
+    /// Gunakan setelah full-fetch selesai.
+    UploadDb {
+        /// Path ke file JSONL (default: terbaru di data/)
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Batch size untuk DB insert (default: 500)
+        #[arg(long, default_value_t = 500)]
+        batch_size: usize,
+    },
+
     /// Drop all scraper tables (DANGEROUS): removes tables completely
     DbDropAll,
 }
@@ -307,7 +323,6 @@ fn main() -> Result<()> {
                 resume,
                 timeout,
                 proxy,
-                db,
             } => {
                 run_full_fetch(FullFetchOpts {
                     limit,
@@ -315,7 +330,6 @@ fn main() -> Result<()> {
                     resume,
                     timeout,
                     proxy,
-                    use_db: db,
                     verbose,
                     max_in_flight,
                 })
@@ -391,6 +405,9 @@ fn main() -> Result<()> {
             }
             Commands::DbDropAll => {
                 run_db_drop_all().await?;
+            }
+            Commands::UploadDb { file, batch_size } => {
+                run_upload_db(file, batch_size).await?;
             }
         }
         Ok(())
@@ -1062,7 +1079,6 @@ struct FullFetchOpts {
     resume: bool,
     timeout: u64,
     proxy: Option<String>,
-    use_db: bool,
     verbose: bool,
     max_in_flight: usize,
 }
@@ -1071,30 +1087,13 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     let start_time = Instant::now();
     let dt_start = Local::now();
 
-    // DB connection (optional)
-    let db_pool = maybe_connect_db(opts.use_db).await;
-    let using_db = db_pool.is_some();
-
-    // Ensure DB schema is up-to-date BEFORE starting the pipeline.
-    // This avoids slow DDL (ALTER TABLE) calls inside high-concurrency writes.
-    if let Some((ref pool, _)) = db_pool {
-        println!("[DB] Ensuring schema...");
-        if let Err(e) = db::setup_schema(pool).await {
-            eprintln!("[DB] Schema setup warning: {:#}", e);
-        }
-        if let Err(e) = db::ensure_schema(pool).await {
-            eprintln!("[DB] Ensure schema warning: {:#}", e);
-        }
-        println!("[DB] Schema OK!");
-    }
-
     let data_dir = PathBuf::from("data");
     std::fs::create_dir_all(&data_dir)?;
 
-    // JSONL path (selalu dibuat sebagai backup)
+    // JSONL path
     let mut resume_slug = opts.start_from.unwrap_or_default();
 
-    let jsonl_path = if opts.resume && !using_db {
+    let jsonl_path = if opts.resume {
         if let Some(latest) = jsonl::find_latest_jsonl(&data_dir) {
             let already_done = jsonl::count_jsonl(&latest);
             match jsonl::last_slug_from_jsonl(&latest) {
@@ -1115,8 +1114,6 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
             println!("[RESUME] No existing JSONL found, starting fresh");
             create_jsonl_path(&data_dir, &dt_start)
         }
-    } else if !using_db {
-        create_jsonl_path(&data_dir, &dt_start)
     } else {
         create_jsonl_path(&data_dir, &dt_start)
     };
@@ -1132,20 +1129,13 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     };
 
     println!("{}", "=".repeat(70));
-    if using_db {
-        println!("  KOMIKINDO FULL FETCH → Supabase DB");
-    } else {
-        println!("  KOMIKINDO FULL FETCH → JSONL");
-    }
+    println!("  KOMIKINDO FULL FETCH → JSONL (no DB)");
     println!("  Started at {}", dt_start.format("%Y-%m-%d %H:%M:%S"));
     println!("  Timeout: {}s", opts.timeout);
     println!("  Mode: Method 2 (tanpa image)");
-    if using_db {
-        println!("  Storage: Supabase PostgreSQL + JSONL backup");
-    } else {
-        println!("  Storage: JSONL file");
-    }
+    println!("  Storage: JSONL file");
     println!("  In-flight requests: {}", opts.max_in_flight);
+    println!("  NOTE: Gunakan 'upload-db' untuk upload ke database setelah selesai");
     println!("{proxy_info}");
     println!("{}", "=".repeat(70));
 
@@ -1192,9 +1182,9 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     }
     println!("Komik to process: {total}");
 
-    // === PHASE 1: FETCH ALL → JSONL (no DB write, pure speed) ===
-    println!("\n--- Phase 1: FETCH ALL (to JSONL) ---");
-    println!("[INFO] Fetching {} komik details (DB write in Phase 2)", total);
+    // === FETCH ALL → JSONL (pure speed, no DB write) ===
+    println!("\n--- FETCH ALL → JSONL ---");
+    println!("[INFO] Fetching {} komik details", total);
 
     let success = Arc::new(AtomicUsize::new(0));
     let failed = Arc::new(AtomicUsize::new(0));
@@ -1317,95 +1307,6 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
         .unwrap_or(0.0);
     println!("  [JSONL] {} ({:.1} MB)", jsonl_path.display(), jsonl_size_mb);
 
-    // === PHASE 2: BATCH UPLOAD TO DB ===
-    let mut db_n: usize = 0;
-    let mut db_u: usize = 0;
-
-    if using_db && s > 0 {
-        println!("\n--- Phase 2: DB UPLOAD (batch from JSONL) ---");
-
-        let jsonl_file = std::fs::File::open(jsonl_path.as_ref())
-            .with_context(|| format!("Failed to open JSONL: {}", jsonl_path.display()))?;
-        let reader = std::io::BufReader::new(jsonl_file);
-
-        let db_upload_start = Instant::now();
-        let mut komik_batch: Vec<KomikDetail> = Vec::with_capacity(200);
-        let mut parse_skip = 0usize;
-
-        for line in reader.lines() {
-            let Ok(line) = line else { continue };
-            let trimmed = line.trim();
-            if trimmed.is_empty() { continue; }
-
-            match serde_json::from_str::<KomikDetail>(trimmed) {
-                Ok(detail) => komik_batch.push(detail),
-                Err(_) => parse_skip += 1,
-            }
-
-            // Flush batch every 500 komik
-            if komik_batch.len() >= 500 {
-                let pool = db_pool.as_ref().unwrap().0.clone();
-                match db::batch_write_komik(&pool, &komik_batch).await {
-                    Ok(result) => {
-                        db_n += result.new_count;
-                        db_u += result.updated_count;
-                    }
-                    Err(e) => {
-                        eprintln!("  [DB ERR] batch write: {:#}", e);
-                        // Fallback: write one by one
-                        for detail in &komik_batch {
-                            let pool = db_pool.as_ref().unwrap().0.clone();
-                            if let Ok(wr) = db::write_komik(&pool, detail).await {
-                                if wr.is_new { db_n += 1; } else { db_u += 1; }
-                            }
-                        }
-                    }
-                }
-                eprintln!("  [DB] Uploaded {} komik (total: {} new, {} updated)",
-                    db_n + db_u, db_n, db_u);
-                komik_batch.clear();
-            }
-        }
-
-        // Flush remaining
-        if !komik_batch.is_empty() {
-            let pool = db_pool.as_ref().unwrap().0.clone();
-            match db::batch_write_komik(&pool, &komik_batch).await {
-                Ok(result) => {
-                    db_n += result.new_count;
-                    db_u += result.updated_count;
-                }
-                Err(e) => {
-                    eprintln!("  [DB ERR] final batch: {:#}", e);
-                    for detail in &komik_batch {
-                        let pool = db_pool.as_ref().unwrap().0.clone();
-                        if let Ok(wr) = db::write_komik(&pool, detail).await {
-                            if wr.is_new { db_n += 1; } else { db_u += 1; }
-                        }
-                    }
-                }
-            }
-        }
-
-        let db_elapsed = db_upload_start.elapsed().as_secs_f64();
-        println!("  [DB DONE] {} new, {} updated in {:.1}s ({:.0} komik/min)",
-            db_n, db_u, db_elapsed,
-            (db_n + db_u) as f64 / db_elapsed.max(0.01) * 60.0);
-        if parse_skip > 0 {
-            println!("  [DB] Skipped {} invalid JSONL entries", parse_skip);
-        }
-
-        // Log ke scrape_log
-        if let Some((pool, _)) = &db_pool {
-            let _ = db::log_scrape(
-                pool, "full_fetch", "completed",
-                total as i32, db_n as i32, db_u as i32, f as i32,
-                Some(&format!("fetch={:.1}s db={:.1}s, {} reqs",
-                    fetch_elapsed, db_elapsed, stats.requests)),
-            ).await;
-        }
-    }
-
     // === Summary ===
     let total_elapsed = start_time.elapsed().as_secs_f64();
 
@@ -1416,10 +1317,6 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     println!("  Success:        {s}");
     println!("  Failed:         {f}");
     println!("  Chapters:       {ch}");
-    if using_db {
-        println!("  DB new:         {db_n}");
-        println!("  DB updated:     {db_u}");
-    }
     println!("  Fetch time:     {:.1}s ({:.1}min) | {:.1} komik/min",
         fetch_elapsed, fetch_elapsed / 60.0,
         s as f64 / fetch_elapsed * 60.0);
@@ -1430,6 +1327,10 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     println!("  Downloaded:     {:.1} MB", stats.mb_downloaded());
     println!("  JSONL:          {} ({:.1} MB)",
         jsonl_path.display(), jsonl_size_mb);
+    if s > 0 {
+        println!();
+        println!("  >>> Untuk upload ke DB: komikindo-scraper upload-db <<<");
+    }
     println!("{}", "=".repeat(70));
 
     Ok(())
@@ -1694,6 +1595,153 @@ async fn run_update(opts: UpdateOpts) -> Result<()> {
     println!("  Time:           {:.1}s", elapsed.as_secs_f64());
     println!("  Saved:          {}", if opts.dry_run { "NO (dry run)" } else { "YES" });
     println!("{}", "=".repeat(70));
+
+    Ok(())
+}
+
+// ============================================================
+// UPLOAD DB (manual batch from JSONL → DB)
+// ============================================================
+
+async fn run_upload_db(file: Option<String>, batch_size: usize) -> Result<()> {
+    let start_time = Instant::now();
+
+    // Find JSONL file
+    let jsonl_path = if let Some(ref path) = file {
+        let p = std::path::PathBuf::from(path);
+        if !p.exists() {
+            anyhow::bail!("File tidak ditemukan: {}", p.display());
+        }
+        p
+    } else {
+        let data_dir = PathBuf::from("data");
+        if !data_dir.exists() {
+            anyhow::bail!("Directory 'data' tidak ditemukan. Jalankan 'full-fetch' dulu.");
+        }
+        match jsonl::find_latest_jsonl(&data_dir) {
+            Some(p) => {
+                println!("[AUTO] Menggunakan file terbaru: {}", p.display());
+                p
+            }
+            None => {
+                anyhow::bail!("Tidak ada file JSONL di data/. Jalankan 'full-fetch' dulu.");
+            }
+        }
+    };
+
+    // Count lines
+    let total_lines = jsonl::count_jsonl(&jsonl_path);
+    println!("[JSONL] {} ({} entries)", jsonl_path.display(), total_lines);
+    if total_lines == 0 {
+        println!("[JSONL] File kosong, tidak ada yang diupload.");
+        return Ok(());
+    }
+
+    // Connect DB
+    let pool = db_connect_from_env().await?;
+
+    // Setup schema
+    println!("[DB] Ensuring schema...");
+    db::setup_schema(&pool).await?;
+    db::ensure_schema(&pool).await?;
+    println!("[DB] Schema OK!");
+
+    // Read and batch upload
+    println!("{}", "=".repeat(70));
+    println!("  UPLOAD DB: {} → Supabase", jsonl_path.display());
+    println!("  Batch size: {}", batch_size);
+    println!("  Total entries: {}", total_lines);
+    println!("{}", "=".repeat(70));
+
+    let jsonl_file = std::fs::File::open(&jsonl_path)
+        .with_context(|| format!("Failed to open JSONL: {}", jsonl_path.display()))?;
+    let reader = std::io::BufReader::new(jsonl_file);
+
+    let mut db_n: usize = 0;
+    let mut db_u: usize = 0;
+    let mut parse_skip = 0usize;
+    let mut komik_batch: Vec<KomikDetail> = Vec::with_capacity(batch_size);
+    let mut processed = 0usize;
+
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+
+        match serde_json::from_str::<KomikDetail>(trimmed) {
+            Ok(detail) => komik_batch.push(detail),
+            Err(_) => parse_skip += 1,
+        }
+
+        processed += 1;
+
+        // Flush batch
+        if komik_batch.len() >= batch_size {
+            match db::batch_write_komik(&pool, &komik_batch).await {
+                Ok(result) => {
+                    db_n += result.new_count;
+                    db_u += result.updated_count;
+                }
+                Err(e) => {
+                    eprintln!("  [DB ERR] batch write: {:#}", e);
+                    // Fallback: write one by one
+                    for detail in &komik_batch {
+                        if let Ok(wr) = db::write_komik(&pool, detail).await {
+                            if wr.is_new { db_n += 1; } else { db_u += 1; }
+                        }
+                    }
+                }
+            }
+
+            let total_done = db_n + db_u;
+            eprintln!("  [DB] Uploaded {} komik ({} new, {} updated) | batch progress: {}/{}",
+                total_done, db_n, db_u, processed, total_lines);
+
+            komik_batch.clear();
+        }
+    }
+
+    // Flush remaining
+    if !komik_batch.is_empty() {
+        match db::batch_write_komik(&pool, &komik_batch).await {
+            Ok(result) => {
+                db_n += result.new_count;
+                db_u += result.updated_count;
+            }
+            Err(e) => {
+                eprintln!("  [DB ERR] final batch: {:#}", e);
+                for detail in &komik_batch {
+                    if let Ok(wr) = db::write_komik(&pool, detail).await {
+                        if wr.is_new { db_n += 1; } else { db_u += 1; }
+                    }
+                }
+            }
+        }
+        komik_batch.clear();
+    }
+
+    let elapsed = start_time.elapsed().as_secs_f64();
+
+    println!();
+    println!("{}", "=".repeat(70));
+    println!("  UPLOAD DB COMPLETE");
+    println!("  Total new:      {}", db_n);
+    println!("  Total updated:  {}", db_u);
+    println!("  Parse skipped:  {}", parse_skip);
+    println!("  Time:           {:.1}s ({:.1} min)", elapsed, elapsed / 60.0);
+    if db_n + db_u > 0 {
+        println!("  Rate:           {:.0} komik/min",
+            (db_n + db_u) as f64 / elapsed.max(0.01) * 60.0);
+    }
+    println!("{}", "=".repeat(70));
+
+    // Log ke scrape_log
+    let _ = db::log_scrape(
+        &pool, "upload_db", "completed",
+        (db_n + db_u) as i32, db_n as i32, db_u as i32, parse_skip as i32,
+        Some(&format!("source={}, batch_size={}, time={:.1}s",
+            jsonl_path.display(), batch_size, elapsed)),
+    ).await;
 
     Ok(())
 }
