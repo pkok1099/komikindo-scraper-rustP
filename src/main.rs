@@ -187,7 +187,7 @@ enum Commands {
 
         /// Show environment/config info only
         #[arg(long)]
-        env: bool,
+        show_env: bool,
 
         /// Show binary/platform info only
         #[arg(long)]
@@ -355,12 +355,12 @@ fn main() -> Result<()> {
             Commands::Check { proxy, timeout } => {
                 run_check(&proxy, timeout, verbose, max_in_flight).await?;
             }
-            Commands::Debug { all, db, network, env, info, proxy, timeout } => {
+            Commands::Debug { all, db, network, show_env, info, proxy, timeout } => {
                 run_debug(DebugOpts {
                     all,
                     db,
                     network,
-                    env,
+                    show_env,
                     info,
                     proxy,
                     timeout,
@@ -660,7 +660,7 @@ struct DebugOpts {
     all: bool,
     db: bool,
     network: bool,
-    env: bool,
+    show_env: bool,
     info: bool,
     proxy: Option<String>,
     timeout: u64,
@@ -669,7 +669,7 @@ struct DebugOpts {
 }
 
 async fn run_debug(opts: DebugOpts) -> Result<()> {
-    let run_all = opts.all || (!opts.db && !opts.network && !opts.env && !opts.info);
+    let run_all = opts.all || (!opts.db && !opts.network && !opts.show_env && !opts.info);
 
     // --- Binary Info ---
     if run_all || opts.info {
@@ -728,7 +728,7 @@ async fn run_debug(opts: DebugOpts) -> Result<()> {
     }
 
     // --- Environment Info ---
-    if run_all || opts.env {
+    if run_all || opts.show_env {
         println!("{}", "=".repeat(50));
         println!("  ENVIRONMENT / CONFIG");
         println!("{}", "=".repeat(50));
@@ -1554,11 +1554,37 @@ async fn run_update(opts: UpdateOpts) -> Result<()> {
         println!("[NEW] {} success, {} failed", new_success, new_failed);
     }
 
-    // === Step 5: Save ===
+    // === Step 5: Update latest_chapter_number in DB for chapter-only updates ===
+    if !opts.dry_run {
+        if let Some((pool, _)) = &db_pool {
+            if !updated_chapters.is_empty() {
+                println!("\n--- Step 5: Updating latest_chapter_number in DB ---");
+                let mut db_ch_updated = 0usize;
+                for (slug, _old_ch, new_ch, _gap) in &updated_chapters {
+                    if let Some(&(komik_id, _)) = db_chapter_map.get(slug) {
+                        match db::update_latest_chapter(pool, komik_id, *new_ch).await {
+                            Ok(true) => {
+                                db_ch_updated += 1;
+                            }
+                            Ok(false) => {
+                                // Already up to date (concurrent update)
+                            }
+                            Err(e) => {
+                                eprintln!("  [DB WARN] Failed to update {slug}: {e}");
+                            }
+                        }
+                    }
+                }
+                println!("[DB] Updated latest_chapter_number for {db_ch_updated} komik");
+            }
+        }
+    }
+
+    // === Step 6: Save ===
     if opts.dry_run {
         println!("\n--- DRY RUN: skipping save ---");
     } else {
-        println!("\n--- Step 5: Saving ---");
+        println!("\n--- Step 6: Saving ---");
 
         if !jsonl_db.is_empty() {
             let data_dir = PathBuf::from("data");

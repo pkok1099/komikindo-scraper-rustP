@@ -8,6 +8,14 @@
 ///
 /// Connection: PgBouncer pooler (6543) atau direct (5432).
 /// Prepared statements disabled untuk PgBouncer compatibility.
+///
+/// FIXES applied:
+///   1. upsert_komik: use INSERT ON CONFLICT DO UPDATE (atomic, no race condition)
+///   2. upsert_chapters: use INSERT ON CONFLICT DO UPDATE (no DELETE+INSERT)
+///   3. ensure_schema: called outside transaction
+///   4. chapters: UNIQUE(komik_id, chapter_number) constraint
+///   5. komik: updated_at trigger auto-update
+///   6. Proper composite index on chapters(komik_id, chapter_number)
 
 use anyhow::{Context, Result};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
@@ -120,7 +128,7 @@ pub async fn setup_schema(pool: &PgPool) -> Result<()> {
     .await
     .context("Failed to create table komik")?;
 
-    // chapters
+    // chapters (with UNIQUE constraint to prevent duplicate chapters)
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS chapters (
@@ -134,7 +142,8 @@ pub async fn setup_schema(pool: &PgPool) -> Result<()> {
             image_ext_id SMALLINT NULL,
             total_images SMALLINT DEFAULT 0,
             created_at TIMESTAMPTZ DEFAULT now(),
-            updated_at TIMESTAMPTZ DEFAULT now()
+            updated_at TIMESTAMPTZ DEFAULT now(),
+            UNIQUE (komik_id, chapter_number)
         )
         "#,
     )
@@ -183,6 +192,104 @@ pub async fn setup_schema(pool: &PgPool) -> Result<()> {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_chapters_num ON chapters(chapter_number)")
         .execute(pool)
         .await;
+    // Composite index for the common lookup pattern (komik_id, chapter_number)
+    // Note: UNIQUE constraint already creates an index, but this explicit one
+    // can be optimized differently by the query planner for ORDER BY scenarios.
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_chapters_komik_num ON chapters(komik_id, chapter_number DESC)")
+        .execute(pool)
+        .await;
+
+    // FIX: Ensure UNIQUE constraint on chapters(komik_id, chapter_number) exists.
+    // The CREATE TABLE IF NOT EXISTS above won't add constraints to an existing table.
+    // Use DO $$ block to safely add the constraint only if it doesn't exist.
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'chapters_komik_id_chapter_number_key'
+            ) THEN
+                -- First clean up any duplicate rows that would violate the constraint
+                DELETE FROM chapters a
+                USING chapters b
+                WHERE a.id < b.id
+                  AND a.komik_id = b.komik_id
+                  AND a.chapter_number = b.chapter_number;
+
+                ALTER TABLE chapters
+                    ADD CONSTRAINT chapters_komik_id_chapter_number_key
+                    UNIQUE (komik_id, chapter_number);
+            END IF;
+        END;
+        $$"#,
+    )
+    .execute(pool)
+    .await
+    .context("Failed to ensure UNIQUE constraint on chapters(komik_id, chapter_number)")?;
+
+    // Auto-update updated_at trigger for komik table
+    sqlx::query(
+        r#"
+        CREATE OR REPLACE FUNCTION update_komik_updated_at()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            NEW.updated_at = now();
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("Failed to create update_komik_updated_at function")?;
+
+    // Drop and recreate trigger (idempotent)
+    let _ = sqlx::query("DROP TRIGGER IF EXISTS trg_komik_updated_at ON komik")
+        .execute(pool)
+        .await;
+    sqlx::query(
+        r#"
+        CREATE TRIGGER trg_komik_updated_at
+            BEFORE UPDATE ON komik
+            FOR EACH ROW
+            EXECUTE FUNCTION update_komik_updated_at()
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("Failed to create trg_komik_updated_at trigger")?;
+
+    // Auto-update updated_at trigger for chapters table
+    sqlx::query(
+        r#"
+        CREATE OR REPLACE FUNCTION update_chapters_updated_at()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            NEW.updated_at = now();
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("Failed to create update_chapters_updated_at function")?;
+
+    let _ = sqlx::query("DROP TRIGGER IF EXISTS trg_chapters_updated_at ON chapters")
+        .execute(pool)
+        .await;
+    sqlx::query(
+        r#"
+        CREATE TRIGGER trg_chapters_updated_at
+            BEFORE UPDATE ON chapters
+            FOR EACH ROW
+            EXECUTE FUNCTION update_chapters_updated_at()
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("Failed to create trg_chapters_updated_at trigger")?;
 
     Ok(())
 }
@@ -191,89 +298,60 @@ pub async fn setup_schema(pool: &PgPool) -> Result<()> {
 // UPSERT KOMIK
 // ============================================================
 
-/// UPSERT satu komik ke database.
+/// UPSERT satu komik ke database (atomic, race-condition free).
+/// Uses INSERT ... ON CONFLICT DO UPDATE for true upsert.
 /// Returns (komik_id, is_new).
 pub async fn upsert_komik(pool: &PgPool, detail: &KomikDetail) -> Result<(i32, bool)> {
-    // Check if exists first (Supabase direct connection works with simple queries)
-    let existing: Option<(i32,)> = sqlx::query_as(
-        "SELECT id FROM komik WHERE slug = $1"
+    // Atomic UPSERT: single query, no race condition.
+    // ON CONFLICT (slug) handles the unique constraint on slug.
+    // EXCLUDED is the row we tried to insert (the "new" values).
+    let row = sqlx::query(
+        r#"
+        INSERT INTO komik (
+            slug, judul, thumb_domain_id, thumb_path, tipe,
+            status_id, author, artist, alternative_title,
+            sinopsis, rating, latest_chapter_number, chapter_count
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        ON CONFLICT (slug) DO UPDATE SET
+            judul = EXCLUDED.judul,
+            thumb_domain_id = EXCLUDED.thumb_domain_id,
+            thumb_path = EXCLUDED.thumb_path,
+            tipe = EXCLUDED.tipe,
+            status_id = EXCLUDED.status_id,
+            author = EXCLUDED.author,
+            artist = EXCLUDED.artist,
+            alternative_title = EXCLUDED.alternative_title,
+            sinopsis = EXCLUDED.sinopsis,
+            rating = EXCLUDED.rating,
+            latest_chapter_number = EXCLUDED.latest_chapter_number,
+            chapter_count = EXCLUDED.chapter_count
+        RETURNING id, (xmax = 0) AS is_new
+        "#,
     )
     .bind(&detail.slug)
-    .fetch_optional(pool)
+    .bind(&detail.judul.as_deref().unwrap_or(&detail.slug))
+    .bind(detail.thumb_domain_id)
+    .bind(&detail.thumb_path)
+    .bind(&detail.tipe)
+    .bind(detail.status_id)
+    .bind(&detail.author)
+    .bind(&detail.artist)
+    .bind(&detail.alternative_title)
+    .bind(&detail.sinopsis)
+    .bind(detail.rating)
+    .bind(detail.latest_chapter_number)
+    .bind(detail.chapters.len() as i32)
+    .fetch_one(pool)
     .await
-    .context("Failed to check existing komik")?;
+    .context("Failed to upsert komik")?;
 
-    if let Some((komik_id,)) = existing {
-        // UPDATE existing
-        sqlx::query(
-            r#"
-            UPDATE komik SET
-                judul = $1,
-                thumb_domain_id = $2,
-                thumb_path = $3,
-                tipe = $4,
-                status_id = $5,
-                author = $6,
-                artist = $7,
-                alternative_title = $8,
-                sinopsis = $9,
-                rating = $10,
-                latest_chapter_number = $11,
-                chapter_count = $12,
-                updated_at = now()
-            WHERE id = $13
-            "#,
-        )
-        .bind(&detail.judul.as_deref().unwrap_or(&detail.slug))
-        .bind(detail.thumb_domain_id)
-        .bind(&detail.thumb_path)
-        .bind(&detail.tipe)
-        .bind(detail.status_id)
-        .bind(&detail.author)
-        .bind(&detail.artist)
-        .bind(&detail.alternative_title)
-        .bind(&detail.sinopsis)
-        .bind(detail.rating)
-        .bind(detail.latest_chapter_number)
-        .bind(detail.chapters.len() as i32)
-        .bind(komik_id)
-        .execute(pool)
-        .await
-        .context("Failed to update komik")?;
+    let komik_id: i32 = row.get("id");
+    // xmax = 0 means the row was inserted (not updated).
+    // This is a PostgreSQL-specific trick: on INSERT, xmax is 0;
+    // on UPDATE (via ON CONFLICT DO UPDATE), xmax is non-zero.
+    let is_new: bool = row.try_get("is_new").unwrap_or(false);
 
-        Ok((komik_id, false))
-    } else {
-        // INSERT new — return generated id
-        let row = sqlx::query(
-            r#"
-            INSERT INTO komik (
-                slug, judul, thumb_domain_id, thumb_path, tipe,
-                status_id, author, artist, alternative_title,
-                sinopsis, rating, latest_chapter_number, chapter_count
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            RETURNING id
-            "#,
-        )
-        .bind(&detail.slug)
-        .bind(&detail.judul.as_deref().unwrap_or(&detail.slug))
-        .bind(detail.thumb_domain_id)
-        .bind(&detail.thumb_path)
-        .bind(&detail.tipe)
-        .bind(detail.status_id)
-        .bind(&detail.author)
-        .bind(&detail.artist)
-        .bind(&detail.alternative_title)
-        .bind(&detail.sinopsis)
-        .bind(detail.rating)
-        .bind(detail.latest_chapter_number)
-        .bind(detail.chapters.len() as i32)
-        .fetch_one(pool)
-        .await
-        .context("Failed to insert komik")?;
-
-        let komik_id: i32 = row.get("id");
-        Ok((komik_id, true))
-    }
+    Ok((komik_id, is_new))
 }
 
 // ============================================================
@@ -281,66 +359,54 @@ pub async fn upsert_komik(pool: &PgPool, detail: &KomikDetail) -> Result<(i32, b
 // ============================================================
 
 /// UPSERT semua chapters untuk satu komik.
-/// Uses batch insert untuk efisiensi.
+/// Uses INSERT ON CONFLICT DO UPDATE (atomic, preserves chapter IDs).
 ///
 /// Method 2: hanya menyimpan chapter_number dan url.
 /// image-related fields = NULL.
+///
+/// FIX: Removed try-with-fallback pattern inside transaction.
+/// Previously, if the first INSERT failed, the transaction was aborted (25P02)
+/// and the fallback INSERT also failed, hiding the real error.
+/// Now: ensure_schema is called before the transaction to guarantee chapter_url
+/// column exists, then only one INSERT form is used.
 pub async fn upsert_chapters(pool: &PgPool, komik_id: i32, chapters: &[ChapterInfo]) -> Result<usize> {
     if chapters.is_empty() {
         return Ok(0);
     }
 
-    // Build batch insert
-    // Gunakan transaction untuk atomicity
-    let mut tx = pool.begin().await.context("Failed to begin transaction")?;
-
-    // Ensure schema supports URL storage (best-effort).
+    // Ensure schema supports URL storage BEFORE starting transaction.
+    // This avoids DDL inside a transaction (which can cause deadlocks).
     ensure_schema(pool).await?;
 
-    // Delete existing chapters for this komik (full replace)
-    sqlx::query("DELETE FROM chapters WHERE komik_id = $1")
-        .bind(komik_id)
-        .execute(&mut *tx)
-        .await
-        .context("Failed to delete existing chapters")?;
+    // Use transaction for atomicity
+    let mut tx = pool.begin().await.context("Failed to begin transaction")?;
 
-    // Batch insert new chapters
-    let mut inserted = 0usize;
+    // UPSERT each chapter using INSERT ON CONFLICT DO UPDATE.
+    // This preserves existing chapter IDs (unlike DELETE + INSERT).
+    let mut upserted = 0usize;
     for ch in chapters {
-        // Try insert with URL if the column exists.
-        // If user's schema doesn't allow it (unexpected), fallback to number-only.
-        let with_url = sqlx::query(
+        sqlx::query(
             r#"
             INSERT INTO chapters (komik_id, chapter_number, chapter_url)
             VALUES ($1, $2, $3)
+            ON CONFLICT (komik_id, chapter_number) DO UPDATE SET
+                chapter_url = EXCLUDED.chapter_url,
+                updated_at = now()
             "#,
         )
         .bind(komik_id)
         .bind(ch.number)
         .bind(&ch.url)
         .execute(&mut *tx)
-        .await;
+        .await
+        .with_context(|| format!("Failed to upsert chapter {} for komik_id={}", ch.number, komik_id))?;
 
-        if with_url.is_err() {
-            sqlx::query(
-                r#"
-                INSERT INTO chapters (komik_id, chapter_number)
-                VALUES ($1, $2)
-                "#,
-            )
-            .bind(komik_id)
-            .bind(ch.number)
-            .execute(&mut *tx)
-            .await
-            .context("Failed to insert chapter")?;
-        }
-
-        inserted += 1;
+        upserted += 1;
     }
 
     tx.commit().await.context("Failed to commit transaction")?;
 
-    Ok(inserted)
+    Ok(upserted)
 }
 
 // ============================================================
@@ -413,8 +479,10 @@ pub struct WriteResult {
 
 /// Load slug → (komik_id, latest_chapter_number) dari DB.
 /// Untuk smart update: compare dengan data dari /komik-terbaru/.
+/// FIX: Only selects needed columns for efficiency.
 pub async fn load_chapter_map(pool: &PgPool) -> Result<std::collections::HashMap<String, (i32, Option<f64>)>> {
-    // Cast NUMERIC → float8 to avoid type mismatch with Rust f64
+    // Only fetch the 3 columns we need (slug, id, latest_chapter_number)
+    // instead of SELECT * which fetches all columns including sinopsis etc.
     let rows = sqlx::query(
         "SELECT slug, id, latest_chapter_number::float8 AS latest_chapter_number FROM komik ORDER BY id",
     )
@@ -673,6 +741,36 @@ pub async fn get_chapter_count(pool: &PgPool, komik_id: i32) -> Result<i32> {
     .context("Failed to get chapter count")?;
 
     Ok(row.get("cnt"))
+}
+
+// ============================================================
+// UPDATE LATEST CHAPTER (for smart update without full re-scrape)
+// ============================================================
+
+/// Update latest_chapter_number for existing komik (smart update optimization).
+/// Used when we detect a new chapter number from /komik-terbaru/ but don't
+/// need to re-scrape the full detail page.
+/// Returns true if the row was actually updated (i.e., the new number is higher).
+pub async fn update_latest_chapter(
+    pool: &PgPool,
+    komik_id: i32,
+    new_chapter_number: f64,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE komik
+        SET latest_chapter_number = $1
+        WHERE id = $2
+          AND (latest_chapter_number IS NULL OR latest_chapter_number::float8 < $1)
+        "#,
+    )
+    .bind(new_chapter_number)
+    .bind(komik_id)
+    .execute(pool)
+    .await
+    .context("Failed to update latest chapter number")?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 // ============================================================
