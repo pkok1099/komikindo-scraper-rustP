@@ -181,7 +181,7 @@ impl Fetcher {
                                 debug!("{msg}");
                             }
                             std::thread::sleep(Duration::from_secs_f64(
-                                0.5 * (attempt + 1) as f64,
+                                0.3 * (attempt + 1) as f64,
                             ));
                         }
                     }
@@ -234,7 +234,7 @@ impl Fetcher {
                                 stats.retries.fetch_add(1, Ordering::Relaxed);
                                 if attempt < max_retries - 1 {
                                     std::thread::sleep(Duration::from_secs_f64(
-                                        0.5 * (attempt + 1) as f64,
+                                        0.3 * (attempt + 1) as f64,
                                     ));
                                 }
                             }
@@ -422,9 +422,9 @@ fn curl_fetch(url: &str, timeout_secs: u64, proxy_url: &str, verbose: bool) -> R
         handle.proxy(proxy_url)?;
     }
 
-    handle.dns_cache_timeout(Duration::from_secs(300))?;
+    handle.dns_cache_timeout(Duration::from_secs(600))?;
     handle.tcp_keepalive(true)?;
-    handle.tcp_keepidle(Duration::from_secs(30))?;
+    handle.tcp_keepidle(Duration::from_secs(15))?;
     handle.accept_encoding("gzip, deflate")?;
 
     // Configure CA certificate bundle (required for static-curl + rustls)

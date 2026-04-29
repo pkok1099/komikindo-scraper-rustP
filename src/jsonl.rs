@@ -6,8 +6,71 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+// ============================================================
+// BUFFERED JSONL WRITER (persistent, avoids open/close per line)
+// ============================================================
+
+/// Thread-safe buffered JSONL writer.
+/// Keeps the file open and uses a BufWriter for amortized I/O.
+/// Much faster than append_jsonl() which opens/closes per line.
+pub struct BufferedJsonlWriter {
+    writer: Mutex<BufWriter<File>>,
+}
+
+impl BufferedJsonlWriter {
+    /// Create a new buffered writer (opens file in append mode).
+    pub fn new(filepath: &Path) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(filepath)?;
+        let writer = BufWriter::with_capacity(1024 * 256, file); // 256KB buffer
+        Ok(Self {
+            writer: Mutex::new(writer),
+        })
+    }
+
+    /// Append a KomikDetail to the JSONL file (thread-safe).
+    pub fn append(&self, komik: &KomikDetail) -> std::io::Result<()> {
+        let json = serde_json::to_string(komik).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })?;
+        let mut writer = self.writer.lock().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })?;
+        writeln!(writer, "{}", json)?;
+        Ok(())
+    }
+
+    /// Append a raw JSON string (for error entries, etc.)
+    pub fn append_raw(&self, json_str: &str) -> std::io::Result<()> {
+        let mut writer = self.writer.lock().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })?;
+        writeln!(writer, "{}", json_str)?;
+        Ok(())
+    }
+
+    /// Flush any remaining buffered data to disk.
+    pub fn flush(&self) -> std::io::Result<()> {
+        let mut writer = self.writer.lock().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Get the file path (for display purposes).
+    #[allow(dead_code)]
+    pub fn path(&self) -> String {
+        String::new()
+    }
+}
 
 /// Append satu komik ke JSONL file.
+#[allow(dead_code)]
 pub fn append_jsonl(filepath: &Path, komik: &KomikDetail) -> std::io::Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -23,6 +86,7 @@ pub fn append_jsonl(filepath: &Path, komik: &KomikDetail) -> std::io::Result<()>
 }
 
 /// Append raw JSON string ke JSONL file.
+#[allow(dead_code)]
 pub fn append_jsonl_raw(filepath: &Path, json_str: &str) -> std::io::Result<()> {
     let mut file = OpenOptions::new()
         .create(true)

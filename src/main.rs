@@ -92,12 +92,12 @@ struct Cli {
     #[arg(long, global = true)]
     worker_threads: Option<usize>,
 
-    /// Max blocking threads for libcurl spawn_blocking (default: 256).
-    #[arg(long, global = true, default_value_t = 256)]
+    /// Max blocking threads for libcurl spawn_blocking (default: 512).
+    #[arg(long, global = true, default_value_t = 512)]
     max_blocking_threads: usize,
 
-    /// Max in-flight HTTP requests (default: 64).
-    #[arg(long, global = true, default_value_t = 64)]
+    /// Max in-flight HTTP requests (default: 128).
+    #[arg(long, global = true, default_value_t = 128)]
     max_in_flight: usize,
 
     #[command(subcommand)]
@@ -130,6 +130,10 @@ enum Commands {
         /// SOCKS5/HTTP proxy URL (e.g. socks5://127.0.0.1:1080)
         #[arg(long)]
         proxy: Option<String>,
+
+        /// Automatically upload to DB after fetch completes
+        #[arg(long)]
+        auto_upload: bool,
     },
 
     /// Smart incremental update dari /komik-terbaru/
@@ -323,6 +327,7 @@ fn main() -> Result<()> {
                 resume,
                 timeout,
                 proxy,
+                auto_upload,
             } => {
                 run_full_fetch(FullFetchOpts {
                     limit,
@@ -332,6 +337,7 @@ fn main() -> Result<()> {
                     proxy,
                     verbose,
                     max_in_flight,
+                    auto_upload,
                 })
                 .await?;
             }
@@ -1081,6 +1087,7 @@ struct FullFetchOpts {
     proxy: Option<String>,
     verbose: bool,
     max_in_flight: usize,
+    auto_upload: bool,
 }
 
 async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
@@ -1192,15 +1199,18 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     let jsonl_path = Arc::new(jsonl_path);
     let writer_fetcher = Arc::clone(&fetcher);
 
-    // Spawn in chunks to keep memory bounded
-    const FETCH_CHUNK: usize = 50;
+    // Spawn in larger chunks for better pipelining
+    const FETCH_CHUNK: usize = 100;
     let total_chunks = (total + FETCH_CHUNK - 1) / FETCH_CHUNK;
     println!("[INFO] {} chunks of max {} komik", total_chunks, FETCH_CHUNK);
+
+    // Use buffered JSONL writer (keeps file open, 256KB buffer)
+    let buffered_writer = Arc::new(jsonl::BufferedJsonlWriter::new(&jsonl_path)?);
+    let bw = Arc::clone(&buffered_writer);
 
     let write_success = Arc::clone(&success);
     let write_failed = Arc::clone(&failed);
     let write_ch = Arc::clone(&total_chapters);
-    let write_jsonl = Arc::clone(&jsonl_path);
 
     let fetch_task = tokio::spawn(async move {
         for (chunk_idx, chunk) in komik_list.chunks(FETCH_CHUNK).enumerate() {
@@ -1227,8 +1237,8 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
                                 let ch_count = detail.chapters.len();
                                 write_ch.fetch_add(ch_count, Ordering::Relaxed);
 
-                                // Write to JSONL only (fast, local disk)
-                                if let Err(e) = jsonl::append_jsonl(&write_jsonl, &detail) {
+                                // Write to JSONL using buffered writer (fast)
+                                if let Err(e) = bw.append(&detail) {
                                     eprintln!("  [WARN] JSONL write error: {e}");
                                 }
 
@@ -1241,7 +1251,7 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
                                     "_status": "detail_failed",
                                     "_error": e.to_string(),
                                 });
-                                let _ = jsonl::append_jsonl_raw(&write_jsonl, &failed_json.to_string());
+                                let _ = bw.append_raw(&failed_json.to_string());
                             }
                         }
                     }
@@ -1291,6 +1301,9 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     let _ = fetch_task.await;
     progress_handle.abort();
 
+    // Flush buffered JSONL writer to ensure all data is on disk
+    buffered_writer.flush()?;
+
     let fetch_elapsed = start_time.elapsed().as_secs_f64();
     let stats = fetcher.stats();
     let s = success.load(Ordering::Relaxed);
@@ -1327,11 +1340,21 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     println!("  Downloaded:     {:.1} MB", stats.mb_downloaded());
     println!("  JSONL:          {} ({:.1} MB)",
         jsonl_path.display(), jsonl_size_mb);
-    if s > 0 {
+    if s > 0 && !opts.auto_upload {
         println!();
         println!("  >>> Untuk upload ke DB: komikindo-scraper upload-db <<<");
     }
     println!("{}", "=".repeat(70));
+
+    // === Auto Upload ===
+    if opts.auto_upload && s > 0 {
+        println!("\n[AUTO-UPLOAD] Starting automatic DB upload...");
+        let jsonl_path_str = jsonl_path.to_string_lossy().to_string();
+        match run_upload_db(Some(jsonl_path_str), 500).await {
+            Ok(()) => println!("[AUTO-UPLOAD] Complete!"),
+            Err(e) => eprintln!("[AUTO-UPLOAD] Failed: {e}"),
+        }
+    }
 
     Ok(())
 }

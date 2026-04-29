@@ -64,7 +64,7 @@ pub async fn connect(database_url: &str) -> Result<PgPool> {
         .ssl_mode(PgSslMode::Prefer);
 
     let pool = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(20)
         .acquire_timeout(std::time::Duration::from_secs(30))
         .connect_with(options)
         .await
@@ -499,8 +499,7 @@ pub async fn batch_write_komik(pool: &PgPool, details: &[KomikDetail]) -> Result
         komik_ids.push((detail.slug.clone(), komik_id, is_new));
     }
 
-    // Phase 2: Batch all chapters into single transaction
-    // Collect ALL (komik_id, chapter_number, chapter_url) triples
+    // Phase 2: Multi-row INSERT for chapters (100 rows per INSERT, much faster than per-row)
     let mut all_chapters: Vec<(i32, f64, String)> = Vec::new();
     for detail in details {
         if let Some((_, komik_id, _)) = komik_ids.iter().find(|(s, _, _)| s == &detail.slug) {
@@ -511,31 +510,39 @@ pub async fn batch_write_komik(pool: &PgPool, details: &[KomikDetail]) -> Result
     }
 
     if !all_chapters.is_empty() {
-        let mut tx = pool.begin().await.context("Failed to begin chapter batch transaction")?;
+        const MULTI_ROW_SIZE: usize = 100;
+        for chunk in all_chapters.chunks(MULTI_ROW_SIZE) {
+            let mut tx = pool.begin().await.context("Failed to begin chapter batch transaction")?;
 
-        for (komik_id, number, url) in &all_chapters {
-            sqlx::query(
-                r#"
-                INSERT INTO chapters (komik_id, chapter_number, chapter_url)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (komik_id, chapter_number) DO UPDATE SET
-                    chapter_url = EXCLUDED.chapter_url,
-                    updated_at = now()
-                "#,
-            )
-            .bind(*komik_id)
-            .bind(*number)
-            .bind(url)
-            .execute(&mut *tx)
-            .await
-            .with_context(|| format!("Failed to batch upsert chapter {} for komik_id={}", number, komik_id))?;
+            let mut query_str = String::from(
+                "INSERT INTO chapters (komik_id, chapter_number, chapter_url) VALUES "
+            );
+            let mut param_idx = 1usize;
+
+            for (i, _) in chunk.iter().enumerate() {
+                if i > 0 {
+                    query_str.push_str(", ");
+                }
+                query_str.push_str(&format!("(${},${},${})", param_idx, param_idx + 1, param_idx + 2));
+                param_idx += 3;
+            }
+            query_str.push_str(
+                " ON CONFLICT (komik_id, chapter_number) DO UPDATE SET chapter_url = EXCLUDED.chapter_url, updated_at = now()"
+            );
+
+            let mut query = sqlx::query(&query_str);
+            for (komik_id, number, url) in chunk {
+                query = query.bind(*komik_id).bind(*number).bind(url.as_str());
+            }
+            query.execute(&mut *tx)
+                .await
+                .context("Failed to multi-row insert chapters")?;
+
+            tx.commit().await.context("Failed to commit chapter batch")?;
         }
-
-        tx.commit().await.context("Failed to commit chapter batch")?;
     }
 
-    // Phase 3: Batch all genres
-    // Collect all (komik_id, genre_id) pairs
+    // Phase 3: Multi-row INSERT for genres
     let mut all_genres: Vec<(i32, i16)> = Vec::new();
     for detail in details {
         if let Some((_, komik_id, _)) = komik_ids.iter().find(|(s, _, _)| s == &detail.slug) {
@@ -546,7 +553,6 @@ pub async fn batch_write_komik(pool: &PgPool, details: &[KomikDetail]) -> Result
     }
 
     if !all_genres.is_empty() {
-        // Delete existing genres for these komik, then insert all
         let komik_id_list: Vec<i32> = komik_ids.iter().map(|(_, id, _)| *id).collect();
         let id_placeholders: Vec<String> = (1..=komik_id_list.len()).map(|i| format!("${i}")).collect();
         let delete_sql = format!(
@@ -560,19 +566,27 @@ pub async fn batch_write_komik(pool: &PgPool, details: &[KomikDetail]) -> Result
         }
         delete_query.execute(pool).await.context("Failed to batch delete genres")?;
 
-        // Insert all genres
-        let mut tx = pool.begin().await.context("Failed to begin genre batch transaction")?;
-        for (komik_id, genre_id) in &all_genres {
-            sqlx::query(
-                "INSERT INTO komik_genres (komik_id, genre_id) VALUES ($1, $2) ON CONFLICT DO NOTHING"
-            )
-            .bind(*komik_id)
-            .bind(*genre_id)
-            .execute(&mut *tx)
-            .await
-            .with_context(|| format!("Failed to insert genre {} for komik_id={}", genre_id, komik_id))?;
+        const MULTI_GENRE_SIZE: usize = 200;
+        for chunk in all_genres.chunks(MULTI_GENRE_SIZE) {
+            let mut query_str = String::from("INSERT INTO komik_genres (komik_id, genre_id) VALUES ");
+            let mut param_idx = 1usize;
+            for (i, _) in chunk.iter().enumerate() {
+                if i > 0 {
+                    query_str.push_str(", ");
+                }
+                query_str.push_str(&format!("(${},${})", param_idx, param_idx + 1));
+                param_idx += 2;
+            }
+            query_str.push_str(" ON CONFLICT DO NOTHING");
+
+            let mut query = sqlx::query(&query_str);
+            for (komik_id, genre_id) in chunk {
+                query = query.bind(*komik_id).bind(*genre_id);
+            }
+            query.execute(pool)
+                .await
+                .context("Failed to multi-row insert genres")?;
         }
-        tx.commit().await.context("Failed to commit genre batch")?;
     }
 
     Ok(result)
