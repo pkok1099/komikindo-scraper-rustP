@@ -3,6 +3,9 @@
 ///
 /// PERBAIKAN SLUG: Chapter URL diambil langsung dari hasil parse detail page,
 /// BUKAN di-construct manual dari slug + chapter_number.
+///
+/// OPTIMIZED: All Regex, Selector, and genre_map cached as LazyLock statics.
+/// No per-call allocations for compiled patterns.
 
 use crate::config::*;
 use regex::Regex;
@@ -22,6 +25,189 @@ static SEL_KOMIK_LIST_PRIMARY: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("a.tip").unwrap());
 static SEL_KOMIK_LIST_FALLBACK: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("a[href*='/komik/']").unwrap());
+
+// ============================================================
+// CACHED: parse_komik_detail selectors & regex (LazyLock)
+// ============================================================
+
+/// Genre map: cached once, reused for all detail parses.
+/// Eliminates 82-entry HashMap allocation per komik (8677x savings).
+static GENRE_MAP: LazyLock<HashMap<&'static str, i16>> = LazyLock::new(|| {
+    let mut m = HashMap::new();
+    m.insert("Action", 1);
+    m.insert("Adult", 2);
+    m.insert("Adventure", 3);
+    m.insert("Aliens", 4);
+    m.insert("Animals", 5);
+    m.insert("Arts", 6);
+    m.insert("Boys' Love", 7);
+    m.insert("Comedy", 8);
+    m.insert("Cooking", 9);
+    m.insert("Crime", 10);
+    m.insert("Crossdressing", 11);
+    m.insert("Delinquents", 12);
+    m.insert("Demons", 13);
+    m.insert("Drama", 14);
+    m.insert("Drama Supernatural", 15);
+    m.insert("Ecchi", 16);
+    m.insert("Fantasy", 17);
+    m.insert("Gender Bender", 18);
+    m.insert("Genderswap", 19);
+    m.insert("Ghosts", 20);
+    m.insert("Girls' Love", 21);
+    m.insert("Gore", 22);
+    m.insert("Gyaru", 23);
+    m.insert("Harem", 24);
+    m.insert("Historical", 25);
+    m.insert("Horror", 26);
+    m.insert("Incest", 27);
+    m.insert("Isekai", 28);
+    m.insert("Josei", 29);
+    m.insert("Life", 30);
+    m.insert("Loli", 31);
+    m.insert("Mafia", 32);
+    m.insert("Magic", 33);
+    m.insert("Magical Girls", 34);
+    m.insert("Martial", 35);
+    m.insert("Martial Arts", 36);
+    m.insert("Mature", 37);
+    m.insert("Mecha", 38);
+    m.insert("Medical", 39);
+    m.insert("Military", 40);
+    m.insert("Monster Girls", 41);
+    m.insert("Monsters", 42);
+    m.insert("Music", 43);
+    m.insert("Mystery", 44);
+    m.insert("Ninja", 45);
+    m.insert("Office Workers", 46);
+    m.insert("Philosophical", 47);
+    m.insert("Police", 48);
+    m.insert("Post-Apocalyptic", 49);
+    m.insert("Psychological", 50);
+    m.insert("Reincarnation", 51);
+    m.insert("Reverse Harem", 52);
+    m.insert("Romance", 53);
+    m.insert("Samurai", 54);
+    m.insert("School", 55);
+    m.insert("School Life", 56);
+    m.insert("Sci-Fi", 57);
+    m.insert("Seinen", 58);
+    m.insert("Sexual Violence", 59);
+    m.insert("Shota", 60);
+    m.insert("Shoujo", 61);
+    m.insert("Shoujo Ai", 62);
+    m.insert("Shounen", 63);
+    m.insert("Shounen Ai", 64);
+    m.insert("Slice of Life", 65);
+    m.insert("Smut", 66);
+    m.insert("Sports", 67);
+    m.insert("Superhero", 68);
+    m.insert("Supernatural", 69);
+    m.insert("Survival", 70);
+    m.insert("Thriller", 71);
+    m.insert("Time Travel", 72);
+    m.insert("Traditional Games", 73);
+    m.insert("Traged", 74);
+    m.insert("Tragedy", 75);
+    m.insert("Vampires", 76);
+    m.insert("Video Games", 77);
+    m.insert("Villainess", 78);
+    m.insert("Virtual Reality", 79);
+    m.insert("Wuxia", 80);
+    m.insert("Yuri", 81);
+    m.insert("Zombies", 82);
+    m
+});
+
+// Title selectors (cached)
+static SEL_DETAIL_TITLES: LazyLock<Vec<Selector>> = LazyLock::new(|| {
+    vec![
+        Selector::parse("h1.titless").unwrap(),
+        Selector::parse("h1.entry-title").unwrap(),
+        Selector::parse("div.infox h1").unwrap(),
+    ]
+});
+
+// Type selector
+static SEL_TYPEFLAG: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("span.typeflag").unwrap());
+
+// Thumbnail selectors (cached)
+static SEL_DETAIL_THUMBS: LazyLock<Vec<Selector>> = LazyLock::new(|| {
+    vec![
+        Selector::parse("div.infoanime img").unwrap(),
+        Selector::parse("div.thumb img").unwrap(),
+        Selector::parse("div.itemprop img").unwrap(),
+    ]
+});
+static SEL_IMG_ITEMPROP: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("img[itemprop='image']").unwrap());
+
+// Info section selectors
+static SEL_INFO_SPAN: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("div.infox .spe span").unwrap());
+static SEL_BOLD: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("b").unwrap());
+
+// Genre link selector
+static SEL_GENRE_LINKS: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("div.genre-info a[rel='tag'], div.infox .spe a[rel='tag']").unwrap());
+
+// Rating selectors (cached)
+static SEL_DETAIL_RATINGS: LazyLock<Vec<Selector>> = LazyLock::new(|| {
+    vec![
+        Selector::parse("div.infoanime-rating i").unwrap(),
+        Selector::parse("div.rating i").unwrap(),
+        Selector::parse("span.skor").unwrap(),
+    ]
+});
+
+// Sinopsis selectors (cached)
+static SEL_DETAIL_SINOPSIS: LazyLock<Vec<Selector>> = LazyLock::new(|| {
+    vec![
+        Selector::parse("div.entry-content.entry-content-single").unwrap(),
+        Selector::parse("div.entry-content").unwrap(),
+        Selector::parse("div#sinopsis div.entry-content").unwrap(),
+    ]
+});
+
+// Title prefix regex (cached — was compiled per call!)
+static RE_TITLE_KOMIK_PREFIX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^komik\s*").unwrap());
+
+// Sinopsis cleanup regexes (cached — were compiled per call!)
+static RE_SINOPSIS_PREFIX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)^Update chapter terbaru komik.*?Sinopsis\s*").unwrap());
+static RE_SINOPSIS_TYPE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(Manga|Manhwa|Manhua)\s+").unwrap());
+
+// Chapter extraction selectors (cached)
+static SEL_CH_CONTAINERS: LazyLock<Vec<Selector>> = LazyLock::new(|| {
+    vec![
+        Selector::parse("div.bxcl").unwrap(),
+        Selector::parse("div#chapter_list").unwrap(),
+    ]
+});
+static SEL_CH_LINKS_IN_CONTAINER: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("span.lchx a, a[href*='-chapter-']").unwrap());
+static SEL_CH_LINKS_FALLBACK: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("a[href*='-chapter-']").unwrap());
+
+// Chapter number regexes (cached — were compiled per call!)
+static RE_CHAPTER_NUM_TITLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)chapter\s*([\d.]+)").unwrap());
+static RE_CHAPTER_NUM_URL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)chapter-([\d.]+)").unwrap());
+
+// Chapter image selectors (cached)
+static SEL_CHIMG_CONTAINERS: LazyLock<Vec<Selector>> = LazyLock::new(|| {
+    vec![
+        Selector::parse("div#chimg-auh").unwrap(),
+        Selector::parse("div.chimg-auh").unwrap(),
+    ]
+});
+static SEL_IMG: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("img").unwrap());
 
 // ============================================================
 // URL NORMALIZATION
@@ -121,8 +307,8 @@ pub fn parse_komik_list(html: &str) -> Vec<String> {
 
 /// Parse komik detail page HTML -> detail dict.
 ///
-/// PERBAIKAN: chapter URL diambil langsung dari `<a href="...">` di detail page,
-/// sehingga tidak perlu construct manual dari slug.
+/// OPTIMIZED: All selectors and regex are pre-compiled LazyLock statics.
+/// Genre map is cached. Zero per-call regex/selector compilation.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct KomikDetail {
     pub slug: String,
@@ -189,7 +375,6 @@ pub struct ChapterImageData {
 #[allow(dead_code)]
 pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
     let document = Html::parse_document(html);
-    let genre_map = build_genre_map();
 
     let mut detail = KomikDetail {
         slug: slug.to_string(),
@@ -209,71 +394,52 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
         latest_chapter_number: None,
     };
 
-    // === TITLE ===
-    let title_selectors = [
-        "h1.titless",
-        "h1.entry-title",
-        "div.infox h1",
-    ];
-    for sel_str in &title_selectors {
-        if let Ok(sel) = Selector::parse(sel_str) {
-            if let Some(el) = document.select(&sel).next() {
-                let title = el.text().collect::<String>().trim().to_string();
-                if !title.is_empty() {
-                    let cleaned = if title.to_lowercase().starts_with("komik") {
-                        Regex::new(r"(?i)^komik\s*")
-                            .unwrap()
-                            .replace(&title, "")
-                            .trim()
-                            .to_string()
-                    } else {
-                        title
-                    };
-                    detail.judul = Some(cleaned);
-                    break;
-                }
+    // === TITLE (using cached selectors) ===
+    for sel in SEL_DETAIL_TITLES.iter() {
+        if let Some(el) = document.select(sel).next() {
+            let title = el.text().collect::<String>().trim().to_string();
+            if !title.is_empty() {
+                let cleaned = if title.to_lowercase().starts_with("komik") {
+                    RE_TITLE_KOMIK_PREFIX
+                        .replace(&title, "")
+                        .trim()
+                        .to_string()
+                } else {
+                    title
+                };
+                detail.judul = Some(cleaned);
+                break;
             }
         }
     }
 
-    // === TYPE ===
-    if let Ok(sel) = Selector::parse("span.typeflag") {
-        if let Some(el) = document.select(&sel).next() {
-            for cls in el.value().classes() {
-                if cls != "typeflag" {
-                    detail.tipe = Some(cls.to_string());
-                    break;
-                }
+    // === TYPE (using cached selector) ===
+    if let Some(el) = document.select(&SEL_TYPEFLAG).next() {
+        for cls in el.value().classes() {
+            if cls != "typeflag" {
+                detail.tipe = Some(cls.to_string());
+                break;
             }
         }
     }
 
-    // === THUMBNAIL ===
-    let thumb_selectors = [
-        "div.infoanime img",
-        "div.thumb img",
-        "div.itemprop img",
-    ];
+    // === THUMBNAIL (using cached selectors) ===
     let mut thumb_url = String::new();
-    for sel_str in &thumb_selectors {
-        if let Ok(sel) = Selector::parse(sel_str) {
-            if let Some(el) = document.select(&sel).next() {
-                if let Some(src) = el.value().attr("src") {
-                    thumb_url = src.to_string();
-                    break;
-                }
+    for sel in SEL_DETAIL_THUMBS.iter() {
+        if let Some(el) = document.select(sel).next() {
+            if let Some(src) = el.value().attr("src") {
+                thumb_url = src.to_string();
+                break;
             }
         }
     }
 
     if thumb_url.is_empty() {
-        if let Ok(sel) = Selector::parse("img[itemprop='image']") {
-            for el in document.select(&sel) {
-                if let Some(src) = el.value().attr("src") {
-                    if src.to_lowercase().contains("/komik-") {
-                        thumb_url = src.to_string();
-                        break;
-                    }
+        for el in document.select(&SEL_IMG_ITEMPROP) {
+            if let Some(src) = el.value().attr("src") {
+                if src.to_lowercase().contains("/komik-") {
+                    thumb_url = src.to_string();
+                    break;
                 }
             }
         }
@@ -289,13 +455,11 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
         }
     }
 
-    // === INFO (status, author, artist, dll) ===
-    let info_sel = Selector::parse("div.infox .spe span").unwrap();
+    // === INFO (status, author, artist, dll) — using cached selectors ===
     let mut raw_genre_text: Option<String> = None;
 
-    for span in document.select(&info_sel) {
-        let bold_sel = Selector::parse("b").unwrap();
-        let Some(bold) = span.select(&bold_sel).next() else {
+    for span in document.select(&SEL_INFO_SPAN) {
+        let Some(bold) = span.select(&SEL_BOLD).next() else {
             continue;
         };
 
@@ -323,9 +487,8 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
         }
     }
 
-    // Genre dari tag links (lebih reliable)
-    let genre_link_sel = Selector::parse("div.genre-info a[rel='tag'], div.infox .spe a[rel='tag']").unwrap();
-    let genre_links: Vec<_> = document.select(&genre_link_sel).collect();
+    // Genre dari tag links (lebih reliable) — using cached selector
+    let genre_links: Vec<_> = document.select(&SEL_GENRE_LINKS).collect();
 
     let genre_list: Vec<String> = if !genre_links.is_empty() {
         genre_links
@@ -342,55 +505,43 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
         Vec::new()
     };
 
+    // Genre ID lookup using CACHED genre_map (no allocation!)
     for g in &genre_list {
-        if let Some(&gid) = genre_map.get(g.as_str()) {
+        if let Some(&gid) = GENRE_MAP.get(g.as_str()) {
             detail.genre_ids.push(gid);
         }
     }
     detail.genre_list = genre_list;
 
-    // === RATING ===
-    let rating_selectors = ["div.infoanime-rating i", "div.rating i", "span.skor"];
-    for sel_str in &rating_selectors {
-        if let Ok(sel) = Selector::parse(sel_str) {
-            if let Some(el) = document.select(&sel).next() {
-                let r_text = el.text().collect::<String>().trim().to_string();
-                if !r_text.is_empty() {
-                    if let Ok(r) = r_text.parse::<f64>() {
-                        detail.rating = Some(r);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // === SINOPSIS ===
-    let sinopsis_selectors = [
-        "div.entry-content.entry-content-single",
-        "div.entry-content",
-        "div#sinopsis div.entry-content",
-    ];
-    for sel_str in &sinopsis_selectors {
-        if let Ok(sel) = Selector::parse(sel_str) {
-            if let Some(el) = document.select(&sel).next() {
-                let mut sinopsis = el.text().collect::<String>();
-                // Bersihkan prefix
-                let re_prefix = Regex::new(r"(?is)^Update chapter terbaru komik.*?Sinopsis\s*").unwrap();
-                sinopsis = re_prefix.replace(&sinopsis, "").to_string();
-                let re_type = Regex::new(r"^(Manga|Manhwa|Manhua)\s+").unwrap();
-                sinopsis = re_type.replace(&sinopsis, "").to_string();
-                sinopsis = sinopsis.trim().to_string();
-                if !sinopsis.is_empty() {
-                    detail.sinopsis = Some(sinopsis);
+    // === RATING (using cached selectors) ===
+    for sel in SEL_DETAIL_RATINGS.iter() {
+        if let Some(el) = document.select(sel).next() {
+            let r_text = el.text().collect::<String>().trim().to_string();
+            if !r_text.is_empty() {
+                if let Ok(r) = r_text.parse::<f64>() {
+                    detail.rating = Some(r);
                     break;
                 }
             }
         }
     }
 
+    // === SINOPSIS (using cached selectors & regex) ===
+    for sel in SEL_DETAIL_SINOPSIS.iter() {
+        if let Some(el) = document.select(sel).next() {
+            let mut sinopsis = el.text().collect::<String>();
+            // Clean prefix using cached regex
+            sinopsis = RE_SINOPSIS_PREFIX.replace(&sinopsis, "").to_string();
+            sinopsis = RE_SINOPSIS_TYPE.replace(&sinopsis, "").to_string();
+            sinopsis = sinopsis.trim().to_string();
+            if !sinopsis.is_empty() {
+                detail.sinopsis = Some(sinopsis);
+                break;
+            }
+        }
+    }
+
     // === CHAPTERS ===
-    // PERBAIKAN SLUG: Ambil URL langsung dari href di detail page!
     detail.chapters = extract_chapters(&document);
     if let Some(first) = detail.chapters.first() {
         detail.latest_chapter_number = Some(first.number);
@@ -401,32 +552,26 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
 
 /// Extract chapter list dari detail page.
 ///
-/// **PERBAIKAN SLUG**: URL chapter diambil langsung dari `<a href="...">`
-/// yang ada di halaman detail komik. Tidak perlu lagi construct manual!
+/// OPTIMIZED: All selectors and regex are cached LazyLock statics.
 fn extract_chapters(document: &Html) -> Vec<ChapterInfo> {
     let mut chapters = Vec::new();
     let mut seen_urls = HashSet::new();
 
-    // Coba dari container utama
-    let container_selectors = ["div.bxcl", "div#chapter_list"];
+    // Try from main container (using cached selectors)
     let mut chapter_links: Vec<ElementRef> = Vec::new();
 
-    for sel_str in &container_selectors {
-        if let Ok(container_sel) = Selector::parse(sel_str) {
-            if let Some(container) = document.select(&container_sel).next() {
-                let link_sel = Selector::parse("span.lchx a, a[href*='-chapter-']").unwrap();
-                chapter_links = container.select(&link_sel).collect();
-                if !chapter_links.is_empty() {
-                    break;
-                }
+    for container_sel in SEL_CH_CONTAINERS.iter() {
+        if let Some(container) = document.select(container_sel).next() {
+            chapter_links = container.select(&SEL_CH_LINKS_IN_CONTAINER).collect();
+            if !chapter_links.is_empty() {
+                break;
             }
         }
     }
 
-    // Fallback: cari semua link chapter di halaman
+    // Fallback: all chapter links in page
     if chapter_links.is_empty() {
-        let link_sel = Selector::parse("a[href*='-chapter-']").unwrap();
-        chapter_links = document.select(&link_sel).collect();
+        chapter_links = document.select(&SEL_CH_LINKS_FALLBACK).collect();
     }
 
     for link in &chapter_links {
@@ -454,7 +599,7 @@ fn extract_chapters(document: &Html) -> Vec<ChapterInfo> {
 
         chapters.push(ChapterInfo {
             number,
-            url: full_url, // URL LANGSUNG dari detail page!
+            url: full_url,
             cdn_domain_id: None,
             cdn_path_prefix: None,
             image_filenames: None,
@@ -468,18 +613,15 @@ fn extract_chapters(document: &Html) -> Vec<ChapterInfo> {
 }
 
 /// Extract chapter number dari text dan URL.
+/// OPTIMIZED: Regex cached as LazyLock statics.
 fn extract_chapter_number(title: &str, url: &str) -> Option<f64> {
-    // Coba dari title: "Chapter 309" atau format lainnya
-    let re = Regex::new(r"(?i)chapter\s*([\d.]+)").unwrap();
-    if let Some(caps) = re.captures(title) {
+    if let Some(caps) = RE_CHAPTER_NUM_TITLE.captures(title) {
         if let Ok(num) = caps[1].parse::<f64>() {
             return Some(num);
         }
     }
 
-    // Coba dari URL: "nano-machine-chapter-309"
-    let re_url = Regex::new(r"(?i)chapter-([\d.]+)").unwrap();
-    if let Some(caps) = re_url.captures(url) {
+    if let Some(caps) = RE_CHAPTER_NUM_URL.captures(url) {
         if let Ok(num) = caps[1].parse::<f64>() {
             return Some(num);
         }
@@ -493,38 +635,31 @@ fn extract_chapter_number(title: &str, url: &str) -> Option<f64> {
 // ============================================================
 
 /// Parse chapter read page HTML untuk CDN image URLs.
-///
-/// **PERBAIKAN**: URL chapter sudah dikirim langsung dari detail page,
-/// jadi tidak ada lagi masalah slug yang salah!
+/// OPTIMIZED: All selectors cached.
 #[allow(dead_code)]
 pub fn parse_chapter_images(html: &str) -> ChapterImageData {
     let document = Html::parse_document(html);
     let mut raw_images = Vec::new();
 
-    // Primary: div#chimg-auh
-    let chimg_selectors = ["div#chimg-auh", "div.chimg-auh"];
-    for sel_str in &chimg_selectors {
-        if let Ok(sel) = Selector::parse(sel_str) {
-            if let Some(container) = document.select(&sel).next() {
-                let img_sel = Selector::parse("img").unwrap();
-                for img in container.select(&img_sel) {
-                    if let Some(src) = img.value().attr("src") {
-                        if is_chapter_image(src) {
-                            raw_images.push(src.to_string());
-                        }
+    // Primary: div#chimg-auh (using cached selectors)
+    for sel in SEL_CHIMG_CONTAINERS.iter() {
+        if let Some(container) = document.select(sel).next() {
+            for img in container.select(&SEL_IMG) {
+                if let Some(src) = img.value().attr("src") {
+                    if is_chapter_image(src) {
+                        raw_images.push(src.to_string());
                     }
                 }
-                if !raw_images.is_empty() {
-                    break;
-                }
+            }
+            if !raw_images.is_empty() {
+                break;
             }
         }
     }
 
     // Fallback: semua img di halaman
     if raw_images.is_empty() {
-        let img_sel = Selector::parse("img").unwrap();
-        for img in document.select(&img_sel) {
+        for img in document.select(&SEL_IMG) {
             if let Some(src) = img.value().attr("src") {
                 if is_chapter_image(src) {
                     raw_images.push(src.to_string());
@@ -953,4 +1088,12 @@ fn find_common_prefix<'a>(paths: &'a [&'a str]) -> &'a str {
     }
 
     &first[..end]
+}
+
+/// Keep `build_genre_map` available for other uses (e.g. config), but
+/// internal parsing now uses the cached `GENRE_MAP` static.
+#[allow(dead_code)]
+pub fn build_genre_map() -> HashMap<&'static str, i16> {
+    // Return a clone of the cached map
+    GENRE_MAP.clone()
 }

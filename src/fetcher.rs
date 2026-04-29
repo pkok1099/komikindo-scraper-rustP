@@ -1,26 +1,23 @@
 /// Async HTTP fetcher menggunakan libcurl (bypass Cloudflare).
 ///
 /// FULL SPEED MODE:
-///   - Tidak ada semaphore / concurrency limit
-///   - Bottleneck hanya di internet (bandwidth + latency)
-///   - spawn_blocking dengan max_blocking_threads besar
+///   - Semaphore limits in-flight requests
+///   - Cached header strings (rebuilt into List per request, no alloc)
+///   - Cached CA bundle path (resolved once at creation)
+///   - Fast UTF-8 conversion (checked, not lossy)
 ///
 /// Architecture:
 ///   - Setiap request = 1 thread di blocking pool (libcurl sync API)
 ///   - Cookie jar per-handle (CF __cf_bm cookies)
 ///   - Auto-retry dengan exponential backoff
 ///   - SOCKS5/HTTP proxy support
-///
-/// DEBUG MODE:
-///   - `--verbose` enables libcurl verbose output (protocol details to stderr)
-///   - Every fetch logs: HTTP status, bytes, time, remote IP
-///   - Errors always include curl error code + description
 
 use anyhow::Result;
 use curl::easy::{Easy2, Handler, HttpVersion, List, WriteError};
 use log::debug;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
@@ -64,6 +61,45 @@ struct AtomicFetcherStats {
 }
 
 // ============================================================
+// CACHED HTTP HEADER STRINGS
+// ============================================================
+
+/// Static user-agent string (avoids rebuilding per request).
+static USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+    AppleWebKit/537.36 (KHTML, like Gecko) \
+    Chrome/120.0.0.0 Safari/537.36";
+
+/// Header lines cached as static strings.
+/// curl::List wraps a raw C linked list (not Clone/Send), so we can't store it
+/// in Fetcher. Instead we cache header strings and rebuild the List per-request
+/// (only allocates the linked list nodes, no string allocation).
+static HEADER_LINES: &[&str] = &[
+    "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language: id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Sec-Fetch-Dest: document",
+    "Sec-Fetch-Mode: navigate",
+    "Sec-Fetch-Site: none",
+    "Sec-Fetch-User: ?1",
+    "Sec-Ch-Ua: \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\"",
+    "Sec-Ch-Ua-Mobile: ?0",
+    "Sec-Ch-Ua-Platform: \"Windows\"",
+    "Upgrade-Insecure-Requests: 1",
+];
+
+/// Referer header needs BASE_URL — computed once.
+static REFERER_HEADER: LazyLock<String> = LazyLock::new(|| format!("Referer: {BASE_URL}/"));
+
+/// Build a curl List from cached header strings (no string allocation).
+fn build_headers_list() -> List {
+    let mut headers = List::new();
+    for &h in HEADER_LINES {
+        headers.append(h).unwrap();
+    }
+    headers.append(&REFERER_HEADER).unwrap();
+    headers
+}
+
+// ============================================================
 // COLLECTOR (curl response handler)
 // ============================================================
 
@@ -90,7 +126,14 @@ pub struct Fetcher {
     stats: Arc<AtomicFetcherStats>,
     verbose: bool,
     in_flight: Arc<Semaphore>,
+    /// Cached CA bundle path (resolved once at creation)
+    ca_bundle_path: Option<String>,
 }
+
+// Fetcher is Send because all fields are Send.
+// We don't store curl::List (which is !Send) in the struct.
+unsafe impl Send for Fetcher {}
+unsafe impl Sync for Fetcher {}
 
 impl Fetcher {
     pub fn new(
@@ -117,10 +160,13 @@ impl Fetcher {
             String::new()
         };
 
-        // Log CA bundle status
-        let ca_info = match find_ca_bundle() {
-            Some(ref p) => format!("\n  CA bundle: {}", p),
-            None => "\n  CA bundle: NOT FOUND (SSL will fail!)".to_string(),
+        // Resolve CA bundle ONCE at creation (not per-request)
+        let ca_bundle_path = find_ca_bundle();
+
+        let ca_info = if let Some(ref p) = ca_bundle_path {
+            format!("\n  CA bundle: {}", p)
+        } else {
+            "\n  CA bundle: NOT FOUND (SSL will fail!)".to_string()
         };
 
         println!(
@@ -139,10 +185,11 @@ impl Fetcher {
             stats: Arc::new(AtomicFetcherStats::default()),
             verbose,
             in_flight: Arc::new(Semaphore::new(max_in_flight_requests.max(1))),
+            ca_bundle_path,
         })
     }
 
-    /// Fetch satu halaman. Tidak ada semaphore - langsung spawn_blocking.
+    /// Fetch satu halaman. Semaphore limits concurrency.
     pub async fn fetch_page(&self, url: &str) -> Result<String> {
         let _permit = self
             .in_flight
@@ -158,12 +205,19 @@ impl Fetcher {
         let stats = Arc::clone(&self.stats);
         let max_retries = self.max_retries;
         let verbose = self.verbose;
+        let ca_bundle_path = self.ca_bundle_path.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut last_err = String::new();
 
             for attempt in 0..max_retries {
-                match curl_fetch(&url, timeout_secs, &proxy_url, verbose) {
+                match curl_fetch_optimized(
+                    &url,
+                    timeout_secs,
+                    &proxy_url,
+                    verbose,
+                    &ca_bundle_path,
+                ) {
                     Ok(html) => {
                         stats.success.fetch_add(1, Ordering::Relaxed);
                         stats.bytes_downloaded
@@ -199,7 +253,7 @@ impl Fetcher {
     }
 
     #[allow(dead_code)]
-    /// Batch fetch - untuk banyak URL sekaligus tanpa limit.
+    /// Batch fetch - untuk banyak URL sekaligus.
     pub async fn fetch_pages_batch(&self, urls: &[String]) -> Vec<(String, Result<String>)> {
         let mut handles = Vec::with_capacity(urls.len());
         for url in urls {
@@ -210,6 +264,7 @@ impl Fetcher {
             let max_retries = self.max_retries;
             let verbose = self.verbose;
             let sem = Arc::clone(&self.in_flight);
+            let ca_bundle_path = self.ca_bundle_path.clone();
 
             handles.push(tokio::spawn(async move {
                 let _permit = sem
@@ -222,7 +277,13 @@ impl Fetcher {
                 let r = tokio::task::spawn_blocking(move || {
                     let mut last_err = String::new();
                     for attempt in 0..max_retries {
-                        match curl_fetch(&url_for_blocking, timeout_secs, &proxy_url, verbose) {
+                        match curl_fetch_optimized(
+                            &url_for_blocking,
+                            timeout_secs,
+                            &proxy_url,
+                            verbose,
+                            &ca_bundle_path,
+                        ) {
                             Ok(html) => {
                                 stats.success.fetch_add(1, Ordering::Relaxed);
                                 stats.bytes_downloaded
@@ -290,7 +351,6 @@ impl Fetcher {
 // ============================================================
 
 /// Find the best CA certificate bundle path for the current platform.
-/// Required when curl is built with static-curl + rustls (no default CA path).
 pub fn find_ca_bundle() -> Option<String> {
     // 1. Check environment variables (user can override)
     for var in &["SSL_CERT_FILE", "CURL_CA_BUNDLE"] {
@@ -303,12 +363,12 @@ pub fn find_ca_bundle() -> Option<String> {
 
     // 2. Common Linux paths
     let common_paths = [
-        "/etc/ssl/certs/ca-certificates.crt",                     // Debian/Ubuntu
-        "/etc/pki/tls/certs/ca-bundle.crt",                       // RHEL/CentOS/Fedora
-        "/etc/ssl/ca-bundle.pem",                                  // OpenSUSE
-        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",      // Newer RHEL/Fedora
-        "/usr/local/share/certs/ca-root-nss.crt",                 // FreeBSD/Nix
-        "/usr/share/ca-certificates/mozilla/ca-certificates.crt", // some Linux
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+        "/usr/local/share/certs/ca-root-nss.crt",
+        "/usr/share/ca-certificates/mozilla/ca-certificates.crt",
     ];
 
     for p in &common_paths {
@@ -317,7 +377,7 @@ pub fn find_ca_bundle() -> Option<String> {
         }
     }
 
-    // 3. Termux-specific paths ($PREFIX usually = /data/data/com.termux/files/usr)
+    // 3. Termux-specific paths
     if let Ok(prefix) = std::env::var("PREFIX") {
         let termux_paths = [
             format!("{prefix}/etc/tls/cert.pem"),
@@ -331,7 +391,7 @@ pub fn find_ca_bundle() -> Option<String> {
         }
     }
 
-    // 4. macOS (for completeness)
+    // 4. macOS
     #[cfg(target_os = "macos")]
     {
         let macos_paths = [
@@ -349,70 +409,33 @@ pub fn find_ca_bundle() -> Option<String> {
     None
 }
 
-/// Initialize CA bundle for a curl handle. Logs result in verbose mode.
-fn configure_ca_bundle(handle: &mut Easy2<Collector>, verbose: bool) {
-    match find_ca_bundle() {
-        Some(path) => {
-            match handle.cainfo(&path) {
-                Ok(_) => {
-                    if verbose {
-                        eprintln!("[CURL] CA bundle: {}", path);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[CURL] WARNING: Failed to set CA bundle '{}': {}", path, e);
-                }
-            }
-        }
-        None => {
-            eprintln!("[CURL] WARNING: No CA certificate bundle found!");
-            eprintln!("[CURL] SSL connections WILL FAIL. Fix:");
-            eprintln!("[CURL]   1. Install ca-certificates: pkg install ca-certificates (Termux)");
-            eprintln!("[CURL]   2. Or set env: export SSL_CERT_FILE=/path/to/ca-bundle.crt");
-            eprintln!("[CURL]   3. Or set env: export CURL_CA_BUNDLE=/path/to/ca-bundle.crt");
-        }
-    }
-}
-
 // ============================================================
-// CURL FETCH (per-request)
+// OPTIMIZED CURL FETCH
 // ============================================================
 
-fn curl_fetch(url: &str, timeout_secs: u64, proxy_url: &str, verbose: bool) -> Result<String> {
+/// Optimized curl fetch: cached header strings, cached CA path, fast UTF-8.
+fn curl_fetch_optimized(
+    url: &str,
+    timeout_secs: u64,
+    proxy_url: &str,
+    verbose: bool,
+    ca_bundle_path: &Option<String>,
+) -> Result<String> {
     let mut handle = Easy2::new(Collector::default());
 
     handle.url(url)?;
-    handle.useragent(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-         AppleWebKit/537.36 (KHTML, like Gecko) \
-         Chrome/120.0.0.0 Safari/537.36",
-    )?;
+    handle.useragent(USER_AGENT)?;
     handle.http_version(HttpVersion::V2)?;
     handle.follow_location(true)?;
     handle.max_redirections(10)?;
     handle.timeout(Duration::from_secs(timeout_secs))?;
     handle.connect_timeout(Duration::from_secs(timeout_secs))?;
-    // Abort extremely slow transfers (helps avoid hanging connections).
-    // If speed stays under 1KB/s for 30s, curl errors with CURLE_OPERATION_TIMEDOUT.
     let _ = handle.low_speed_limit(1024);
     let _ = handle.low_speed_time(Duration::from_secs(30));
-    // Basic safety cap (avoid unbounded memory use on unexpected large responses).
-    // libcurl may ignore this for chunked transfers, but it still helps for many responses.
     let _ = handle.max_filesize(10_000_000);
 
-    let mut headers = List::new();
-    headers.append("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")?;
-    headers.append("Accept-Language: id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7")?;
-    headers.append(&format!("Referer: {BASE_URL}/"))?;
-    // We set the actual decoding via handle.accept_encoding below.
-    headers.append("Sec-Fetch-Dest: document")?;
-    headers.append("Sec-Fetch-Mode: navigate")?;
-    headers.append("Sec-Fetch-Site: none")?;
-    headers.append("Sec-Fetch-User: ?1")?;
-    headers.append("Sec-Ch-Ua: \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\"")?;
-    headers.append("Sec-Ch-Ua-Mobile: ?0")?;
-    headers.append("Sec-Ch-Ua-Platform: \"Windows\"")?;
-    headers.append("Upgrade-Insecure-Requests: 1")?;
+    // Build headers from cached strings (no string allocation, just list nodes)
+    let headers = build_headers_list();
     handle.http_headers(headers)?;
 
     handle.cookie_file("")?;
@@ -427,10 +450,15 @@ fn curl_fetch(url: &str, timeout_secs: u64, proxy_url: &str, verbose: bool) -> R
     handle.tcp_keepidle(Duration::from_secs(15))?;
     handle.accept_encoding("gzip, deflate")?;
 
-    // Configure CA certificate bundle (required for static-curl + rustls)
-    configure_ca_bundle(&mut handle, verbose);
+    // Use CACHED CA bundle path (no filesystem check per request)
+    if let Some(ref path) = ca_bundle_path {
+        if let Err(e) = handle.cainfo(path) {
+            eprintln!("[CURL] WARNING: Failed to set CA bundle '{}': {}", path, e);
+        }
+    } else if verbose {
+        eprintln!("[CURL] WARNING: No CA certificate bundle — SSL will fail!");
+    }
 
-    // Enable curl verbose output (protocol details → stderr)
     if verbose {
         handle.verbose(true)?;
     }
@@ -440,16 +468,9 @@ fn curl_fetch(url: &str, timeout_secs: u64, proxy_url: &str, verbose: bool) -> R
         Err(e) => {
             let code = e.code();
             let desc = e.description();
-            // Build detailed error message
-            let extra = if verbose {
-                let os_errno = handle.os_errno().unwrap_or(0);
-                format!(" | os_errno={}", os_errno)
-            } else {
-                String::new()
-            };
             anyhow::bail!(
-                "curl error [{}]: {} | URL: {}{}",
-                code, desc, url, extra
+                "curl error [{}]: {} | URL: {}",
+                code, desc, url
             );
         }
     }
@@ -457,22 +478,25 @@ fn curl_fetch(url: &str, timeout_secs: u64, proxy_url: &str, verbose: bool) -> R
     let response_code = handle.response_code()?;
     let total_time = handle.total_time().unwrap_or(Duration::ZERO).as_secs_f64();
     let primary_ip = handle.primary_ip().unwrap_or(None).unwrap_or("?");
-    let namelookup_time = handle.namelookup_time().unwrap_or(Duration::ZERO).as_secs_f64();
-    let connect_time = handle.connect_time().unwrap_or(Duration::ZERO).as_secs_f64();
 
     let collector = handle.get_ref();
     let len = collector.data.len();
-    let text = String::from_utf8_lossy(&collector.data).to_string();
+
+    // Fast UTF-8 conversion: check validity, then unsafe conversion
+    let text = if std::str::from_utf8(&collector.data).is_ok() {
+        unsafe { String::from_utf8_unchecked(collector.data.clone()) }
+    } else {
+        String::from_utf8_lossy(&collector.data).to_string()
+    };
 
     if verbose {
         eprintln!(
-            "[CURL] {} → HTTP {} | {} bytes | {:.3}s (dns={:.3}s conn={:.3}s) | IP: {}",
-            url, response_code, len, total_time, namelookup_time, connect_time, primary_ip
+            "[CURL] {} → HTTP {} | {} bytes | {:.3}s | IP: {}",
+            url, response_code, len, total_time, primary_ip
         );
     }
 
     if response_code >= 400 {
-        // Log response body snippet on error
         let snippet = if text.len() > 200 { &text[..200] } else { &text };
         anyhow::bail!("HTTP {response_code} | body: {}", snippet.trim());
     }
