@@ -36,6 +36,12 @@ mod jsonl;
 mod parsers;
 mod scraper;
 
+// jemalloc: better allocation performance for allocation-heavy workloads (5-15% improvement).
+// Only linked on Linux/macOS (not Android/Termux or Windows).
+#[cfg(all(unix, not(target_os = "android")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use clap::Parser;
@@ -1223,8 +1229,9 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
         for slug in slug_iter.by_ref().take(window_size) {
             let fetcher = Arc::clone(&writer_fetcher);
             join_set.spawn(async move {
-                let result = scrape_komik_detail(&slug, &fetcher).await;
-                (slug, result)
+                let slug_clone = slug.clone();
+                let result = scrape_komik_detail(slug, &fetcher).await;
+                (slug_clone, result)
             });
         }
 
@@ -1264,8 +1271,9 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
             if let Some(slug) = slug_iter.next() {
                 let fetcher = Arc::clone(&writer_fetcher);
                 join_set.spawn(async move {
-                    let result = scrape_komik_detail(&slug, &fetcher).await;
-                    (slug, result)
+                    let slug_clone = slug.clone();
+                    let result = scrape_komik_detail(slug, &fetcher).await;
+                    (slug_clone, result)
                 });
             }
         }
@@ -1516,38 +1524,22 @@ async fn run_update(opts: UpdateOpts) -> Result<()> {
             let fetcher = Arc::clone(&fetcher);
             let slug = item.slug.clone();
             detail_handles.push(tokio::spawn(async move {
-                let result = scrape_komik_detail(&slug, &fetcher).await;
-                (slug, result)
+                let slug_clone = slug.clone();
+                let result = scrape_komik_detail(slug, &fetcher).await;
+                (slug_clone, result)
             }));
         }
 
         let mut new_success = 0usize;
         let mut new_failed = 0usize;
+        let mut new_details: Vec<KomikDetail> = Vec::new();
 
         for handle in detail_handles {
             match handle.await {
                 Ok((slug, Ok(detail))) => {
                     println!("[NEW] + {} — {}", slug, detail.judul.as_deref().unwrap_or("?"));
                     new_success += 1;
-
-                    if let Some((pool, _)) = &db_pool {
-                        if !opts.dry_run {
-                            match db::write_komik(pool, &detail).await {
-                                Ok(wr) => println!("  [DB] id={}, chapters={}, genres={} ({})",
-                                    wr.komik_id, wr.chapters_inserted, wr.genres_synced,
-                                    if wr.is_new { "NEW" } else { "UPDATED" }),
-                                Err(e) => {
-                                    if let Some(db_err) = e.downcast_ref::<sqlx::Error>() {
-                                        eprintln!("  [DB ERR] {}: {} | {:?}", slug, e, db_err);
-                                    } else {
-                                        eprintln!("  [DB ERR] {}: {:#}", slug, e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    jsonl_db.insert(slug.clone(), detail);
+                    new_details.push(detail);
                 }
                 Ok((slug, Err(e))) => {
                     eprintln!("[NEW FAIL] {} — {}", slug, e);
@@ -1560,31 +1552,42 @@ async fn run_update(opts: UpdateOpts) -> Result<()> {
             }
         }
 
+        // Batch write all new komik to DB — single UNNEST query instead of N sequential writes.
+        // With 20 new komiks × ~1s per write_komik (4-5 DB round-trips each),
+        // batch_write_komik reduces this to ~2-3 total queries.
+        if let Some((pool, _)) = &db_pool {
+            if !opts.dry_run && !new_details.is_empty() {
+                match db::batch_write_komik(pool, &new_details).await {
+                    Ok(result) => println!("[DB] Batch wrote {} new, {} updated",
+                        result.new_count, result.updated_count),
+                    Err(e) => eprintln!("[DB ERR] Batch write failed: {e}"),
+                }
+            }
+        }
+
+        // Update JSONL after batch
+        for detail in &new_details {
+            jsonl_db.insert(detail.slug.clone(), detail.clone());
+        }
+
         println!("[NEW] {} success, {} failed", new_success, new_failed);
     }
 
     // === Step 5: Update latest_chapter_number in DB for chapter-only updates ===
+    // Batch UNNEST UPDATE instead of N individual queries — saves ~200ms × N.
     if !opts.dry_run {
         if let Some((pool, _)) = &db_pool {
             if !updated_chapters.is_empty() {
                 println!("\n--- Step 5: Updating latest_chapter_number in DB ---");
-                let mut db_ch_updated = 0usize;
-                for (slug, _old_ch, new_ch, _gap) in &updated_chapters {
-                    if let Some(&(komik_id, _)) = db_chapter_map.get(slug) {
-                        match db::update_latest_chapter(pool, komik_id, *new_ch).await {
-                            Ok(true) => {
-                                db_ch_updated += 1;
-                            }
-                            Ok(false) => {
-                                // Already up to date (concurrent update)
-                            }
-                            Err(e) => {
-                                eprintln!("  [DB WARN] Failed to update {slug}: {e}");
-                            }
-                        }
-                    }
+                let batch_updates: Vec<(i32, f64)> = updated_chapters.iter()
+                    .filter_map(|(slug, _, new_ch, _)| {
+                        db_chapter_map.get(slug).map(|&(id, _)| (id, *new_ch))
+                    })
+                    .collect();
+                match db::batch_update_latest_chapters(pool, &batch_updates).await {
+                    Ok(n) => println!("[DB] Updated latest_chapter_number for {n} komik (batch)"),
+                    Err(e) => eprintln!("[DB WARN] Batch update failed: {e}"),
                 }
-                println!("[DB] Updated latest_chapter_number for {db_ch_updated} komik");
             }
         }
     }

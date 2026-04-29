@@ -614,7 +614,7 @@ fn extract_chapters(document: &Html) -> Vec<ChapterInfo> {
         });
     }
 
-    chapters.sort_by(|a, b| b.number.partial_cmp(&a.number).unwrap_or(std::cmp::Ordering::Equal));
+    chapters.sort_by(|a, b| b.number.total_cmp(&a.number));
     chapters
 }
 

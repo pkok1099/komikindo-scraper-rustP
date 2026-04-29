@@ -6,7 +6,8 @@ description = "KomikIndo scraper - Rust version for Termux"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
+# Only include needed tokio features — 'full' adds unused fs/net/process/signal/etc.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 
 # HTTP client - curl untuk bypass Cloudflare
 # static-curl = compile libcurl from source (no system lib needed)
@@ -41,6 +42,15 @@ thiserror = "2"
 # dotenv for .env support
 dotenvy = "0.15"
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "tls-rustls", "chrono"] }
+
+# Lightweight Mutex — no poisoning checks, spin-then-park strategy
+# ~30-50ns less overhead per lock/unlock vs std::sync::Mutex
+parking_lot = "0.12"
+
+# jemalloc for better allocation performance (5-15% improvement for allocation-heavy workloads)
+# Only available on Linux/macOS, not on Windows or some embedded targets
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
+tikv-jemallocator = "0.6"
 
 [profile.release]
 opt-level = 3

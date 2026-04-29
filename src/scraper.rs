@@ -31,15 +31,16 @@ pub async fn scrape_full_komik_list(fetcher: &Fetcher) -> Result<Vec<String>> {
 /// OPTIMIZED: No spawn_blocking. Parsing uses cached LazyLock selectors/regex,
 /// so it's fast enough (~0.1ms) to run inline on the async task.
 /// This eliminates the tokio task scheduling overhead per komik.
-pub async fn scrape_komik_detail(slug: &str, fetcher: &Fetcher) -> Result<parsers::KomikDetail> {
-    let komik_url = build_komik_url(slug);
+/// Takes String by value — avoids unnecessary slug.to_string() clone when
+/// caller already owns the String.
+pub async fn scrape_komik_detail(slug: String, fetcher: &Fetcher) -> Result<parsers::KomikDetail> {
+    let komik_url = build_komik_url(&slug);
     let html = fetcher.fetch_page(&komik_url).await
         .map_err(|e| anyhow::anyhow!("Gagal fetch detail {}: {e}", komik_url))?;
 
     // Parse directly — no spawn_blocking needed (cached selectors make this fast)
-    let slug_owned = slug.to_string();
-    parsers::parse_komik_detail(&slug_owned, &html)
-        .ok_or_else(|| anyhow::anyhow!("Gagal parse detail untuk slug: {}", slug_owned))
+    parsers::parse_komik_detail(&slug, &html)
+        .ok_or_else(|| anyhow::anyhow!("Gagal parse detail untuk slug: {}", slug))
 }
 
 /// Scrape chapter image URLs dari chapter read page.

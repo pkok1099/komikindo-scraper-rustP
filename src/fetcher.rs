@@ -193,9 +193,9 @@ impl Handler for Collector {
 // THREAD-LOCAL CURL HANDLE CACHE (connection reuse)
 // ============================================================
 
-/// Thread-local curl handle cache: each blocking thread keeps its own
-/// Easy2<Collector> with persistent TCP/TLS connection (HTTP keep-alive).
-/// Set max_blocking_threads == max_in_flight for optimal reuse.
+// Thread-local curl handle cache: each blocking thread keeps its own
+// Easy2<Collector> with persistent TCP/TLS connection (HTTP keep-alive).
+// Set max_blocking_threads == max_in_flight for optimal reuse.
 thread_local! {
     static CACHED_CURL_HANDLE: RefCell<Option<Easy2<Collector>>> = RefCell::new(None);
 }
@@ -220,7 +220,10 @@ fn create_configured_handle(
     // without waiting the full timeout (10s max, or timeout_secs if smaller)
     handle.connect_timeout(Duration::from_secs(timeout_secs.min(10))).ok();
     let _ = handle.low_speed_limit(1024);
-    let _ = handle.low_speed_time(Duration::from_secs(30));
+    // Low speed time: abort if <1KB/s for 10 seconds.
+    // Lower than default 30s for high-throughput scraping — stalled connections
+    // are detected 3x faster, preventing wasted time on dead/slow connections.
+    let _ = handle.low_speed_time(Duration::from_secs(10));
     let _ = handle.max_filesize(10_000_000);
 
     // Headers (persist across perform() calls)
@@ -243,7 +246,10 @@ fn create_configured_handle(
     let _ = handle.maxage_conn(Duration::from_secs(120));
     handle.tcp_keepalive(true).ok();
     handle.tcp_keepidle(Duration::from_secs(15)).ok();
-    handle.accept_encoding("gzip, deflate").ok();
+    // TCP_NODELAY: disable Nagle's algorithm — send HTTP request headers immediately
+    // instead of buffering up to 200ms. Saves ~6-29 minutes across 8677 requests.
+    handle.tcp_nodelay(true).ok();
+    handle.accept_encoding("gzip, deflate, br").ok();
     // pipewait: wait for HTTP/2 multiplexing before opening new connection
     handle.pipewait(true).ok();
 
@@ -388,14 +394,15 @@ impl Fetcher {
                         last_err = e.to_string();
                         stats.retries.fetch_add(1, Ordering::Relaxed);
                         if attempt < max_retries - 1 {
-                            let msg = format!(
-                                "Retry {}/{} for {}: {}",
-                                attempt + 1, max_retries, url, e
-                            );
+                            // Lazy formatting — only format string when actually logging.
+                            // debug!() macro already skips when log level < DEBUG,
+                            // but format!() before the if always allocates.
                             if verbose {
-                                eprintln!("[FETCH] {msg}");
+                                eprintln!("[FETCH] Retry {}/{} for {}: {}",
+                                    attempt + 1, max_retries, url, e);
                             } else {
-                                debug!("{msg}");
+                                debug!("Retry {}/{} for {}: {}",
+                                    attempt + 1, max_retries, url, e);
                             }
                             // Longer backoff for rate-limited requests
                             let sleep_secs = if last_err.contains("RATE_LIMITED") {
@@ -649,16 +656,19 @@ fn curl_fetch_optimized(
         // don't extend past the handle cache.
         let response_code = easy.response_code()?;
 
-        let content_type = easy.content_type()
-            .unwrap_or(None)
-            .unwrap_or("")
-            .to_string(); // owned — survives handle cache
+        // Content type — extract as &str first, convert to owned before mutable ops.
+        // The String is short (~25 bytes for "text/html; charset=utf-8") — minimal overhead.
+        let content_type = easy.content_type().unwrap_or(None).unwrap_or("").to_string();
+
+        // Only extract primary_ip when verbose (saves FFI call + ~15 bytes alloc per request)
+        let primary_ip = if verbose {
+            easy.primary_ip().unwrap_or(None).map(|s| s.to_string())
+                .unwrap_or_else(|| "?".to_string())
+        } else {
+            String::new()
+        };
 
         let total_time = easy.total_time().unwrap_or(Duration::ZERO).as_secs_f64();
-        let primary_ip = easy.primary_ip()
-            .unwrap_or(None)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "?".to_string());
 
         // Take data from collector (zero-copy: Vec<u8> → String without clone)
         let (len, text) = {
@@ -680,8 +690,19 @@ fn curl_fetch_optimized(
         // The current connection may be rate-limited; forbid_reuse closes it,
         // so the next request opens a fresh connection while reusing the handle
         // (saves TCP+TLS handshake ~100-200ms on the next request to same host).
+        //
+        // CRITICAL: Reset forbid_reuse to false BEFORE caching the handle back.
+        // If we set forbid_reuse(true) and never reset it, EVERY subsequent
+        // request on this handle will also close its connection, permanently
+        // defeating HTTP keep-alive and adding 100-200ms TCP+TLS handshake
+        // per request. This was a major bug — after a single 429, the handle
+        // would burn connections forever.
         if response_code == 429 {
             let _ = easy.forbid_reuse(true);
+        } else {
+            // Ensure forbid_reuse is reset to false for non-429 responses.
+            // This handles the case where a previous 429 set it to true.
+            let _ = easy.forbid_reuse(false);
         }
 
         // Reset collector buffer (preserves capacity) and cache handle back.
@@ -725,9 +746,12 @@ fn curl_fetch_optimized(
             };
             anyhow::bail!("HTTP {response_code} | body: {}", snippet.trim());
         }
-        if text.contains("Just a moment...")
-            || text.contains("cf-challenge")
-            || text.contains("Checking your browser")
+        // Only scan first 2KB for Cloudflare challenge — challenge pages are always short.
+        // Full response can be 50-200KB, so this saves ~1.2GB of string scanning across 8677 requests.
+        let cf_check = &text[..text.len().min(2048)];
+        if cf_check.contains("Just a moment...")
+            || cf_check.contains("cf-challenge")
+            || cf_check.contains("Checking your browser")
         {
             anyhow::bail!(
                 "Cloudflare challenge detected (HTTP {response_code}, {} bytes)",

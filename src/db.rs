@@ -418,15 +418,20 @@ pub async fn upsert_chapters(pool: &PgPool, komik_id: i32, chapters: &[ChapterIn
 
 /// Sync genres untuk satu komik.
 /// Delete lama, insert baru.
+/// Wrapped in a transaction for atomicity — prevents a window where genre data
+/// is missing if the INSERT fails after the DELETE.
 pub async fn sync_genres(pool: &PgPool, komik_id: i32, genre_ids: &[i16]) -> Result<usize> {
+    let mut tx = pool.begin().await.context("Failed to begin genre sync transaction")?;
+
     // Delete existing
     sqlx::query("DELETE FROM komik_genres WHERE komik_id = $1")
         .bind(komik_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .context("Failed to delete existing genres")?;
 
     if genre_ids.is_empty() {
+        tx.commit().await.context("Failed to commit genre sync")?;
         return Ok(0);
     }
 
@@ -451,11 +456,12 @@ pub async fn sync_genres(pool: &PgPool, komik_id: i32, genre_ids: &[i16]) -> Res
         for &genre_id in chunk {
             query = query.bind(komik_id).bind(genre_id);
         }
-        query.execute(pool)
+        query.execute(&mut *tx)
             .await
             .context("Failed to multi-row insert genres")?;
     }
 
+    tx.commit().await.context("Failed to commit genre sync")?;
     Ok(inserted)
 }
 
@@ -503,7 +509,11 @@ pub struct BatchWriteResult {
 }
 
 /// Batch write multiple komik details ke DB.
-/// Optimized: batch upsert komik, then all chapters in one transaction, then genres.
+/// Optimized:
+///   - Phase 1: Batch upsert ALL komik using UNNEST (single query, not N queries)
+///   - Phase 2: Multi-row INSERT for chapters in one transaction
+///   - Phase 3: Multi-row INSERT for genres
+///   - HashMap for slug→komik_id lookup (O(1) instead of O(n²))
 pub async fn batch_write_komik(pool: &PgPool, details: &[KomikDetail]) -> Result<BatchWriteResult> {
     if details.is_empty() {
         return Ok(BatchWriteResult::default());
@@ -511,37 +521,124 @@ pub async fn batch_write_komik(pool: &PgPool, details: &[KomikDetail]) -> Result
 
     let mut result = BatchWriteResult::default();
 
-    // Phase 1: Upsert all komik (one query each - unavoidable for ON CONFLICT RETURNING)
-    let mut komik_ids: Vec<(String, i32, bool)> = Vec::with_capacity(details.len());
+    // Phase 1: Batch upsert ALL komik using UNNEST — single query instead of N individual queries.
+    // This reduces DB round-trips from N to 1, which is critical for remote databases
+    // (Supabase: ~100-300ms round-trip per query). With 1000 komik per batch,
+    // this saves ~100-300 seconds of DB latency per batch.
+    let n = details.len();
+    let mut slugs = Vec::with_capacity(n);
+    let mut juduls = Vec::with_capacity(n);
+    let mut thumb_domain_ids = Vec::with_capacity(n);
+    let mut thumb_paths = Vec::with_capacity(n);
+    let mut types = Vec::with_capacity(n);
+    let mut status_ids = Vec::with_capacity(n);
+    let mut authors = Vec::with_capacity(n);
+    let mut artists = Vec::with_capacity(n);
+    let mut alternative_titles = Vec::with_capacity(n);
+    let mut sinopses = Vec::with_capacity(n);
+    let mut ratings = Vec::with_capacity(n);
+    let mut latest_chapter_numbers = Vec::with_capacity(n);
+    let mut chapter_counts = Vec::with_capacity(n);
+
     for detail in details {
-        let (komik_id, is_new) = upsert_komik(pool, detail).await?;
+        slugs.push(detail.slug.as_str());
+        juduls.push(detail.judul.as_deref().unwrap_or(&detail.slug));
+        thumb_domain_ids.push(detail.thumb_domain_id);
+        thumb_paths.push(detail.thumb_path.as_deref().unwrap_or(""));
+        types.push(detail.tipe.as_deref().unwrap_or(""));
+        status_ids.push(detail.status_id);
+        authors.push(detail.author.as_deref().unwrap_or(""));
+        artists.push(detail.artist.as_deref().unwrap_or(""));
+        alternative_titles.push(detail.alternative_title.as_deref().unwrap_or(""));
+        sinopses.push(detail.sinopsis.as_deref().unwrap_or(""));
+        ratings.push(detail.rating);
+        latest_chapter_numbers.push(detail.latest_chapter_number);
+        chapter_counts.push(detail.chapters.len() as i32);
+    }
+
+    // Build UNNEST query with 13 parameter arrays
+    let batch_upsert_sql = r#"
+        INSERT INTO komik (
+            slug, judul, thumb_domain_id, thumb_path, tipe,
+            status_id, author, artist, alternative_title,
+            sinopsis, rating, latest_chapter_number, chapter_count
+        )
+        SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::smallint[], $4::text[], $5::text[],
+            $6::smallint[], $7::text[], $8::text[], $9::text[],
+            $10::text[], $11::float8[], $12::float8[], $13::integer[]
+        )
+        ON CONFLICT (slug) DO UPDATE SET
+            judul = EXCLUDED.judul,
+            thumb_domain_id = EXCLUDED.thumb_domain_id,
+            thumb_path = EXCLUDED.thumb_path,
+            tipe = EXCLUDED.tipe,
+            status_id = EXCLUDED.status_id,
+            author = EXCLUDED.author,
+            artist = EXCLUDED.artist,
+            alternative_title = EXCLUDED.alternative_title,
+            sinopsis = EXCLUDED.sinopsis,
+            rating = EXCLUDED.rating,
+            latest_chapter_number = EXCLUDED.latest_chapter_number,
+            chapter_count = EXCLUDED.chapter_count
+        RETURNING id, slug, (xmax = 0) AS is_new
+    "#;
+
+    let rows = sqlx::query(batch_upsert_sql)
+        .bind(&slugs)
+        .bind(&juduls)
+        .bind(&thumb_domain_ids as &[Option<i16>])
+        .bind(&thumb_paths)
+        .bind(&types)
+        .bind(&status_ids as &[Option<i16>])
+        .bind(&authors)
+        .bind(&artists)
+        .bind(&alternative_titles)
+        .bind(&sinopses)
+        .bind(&ratings as &[Option<f64>])
+        .bind(&latest_chapter_numbers as &[Option<f64>])
+        .bind(&chapter_counts)
+        .fetch_all(pool)
+        .await
+        .context("Failed to batch upsert komik with UNNEST")?;
+
+    // Build HashMap<slug, (komik_id, is_new)> for O(1) lookup in Phase 2/3
+    let mut komik_id_map: std::collections::HashMap<String, (i32, bool)> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let id: i32 = row.get("id");
+        let slug: String = row.get("slug");
+        let is_new: bool = row.try_get("is_new").unwrap_or(false);
         if is_new {
             result.new_count += 1;
         } else {
             result.updated_count += 1;
         }
-        komik_ids.push((detail.slug.clone(), komik_id, is_new));
+        komik_id_map.insert(slug, (id, is_new));
     }
 
-    // Phase 2: Multi-row INSERT for chapters (100 rows per INSERT, much faster than per-row)
-    let mut all_chapters: Vec<(i32, f64, String)> = Vec::new();
+    // Phase 2: Multi-row INSERT for chapters using HashMap for O(1) slug→komik_id
+    let mut all_chapters: Vec<(i32, f64, &str)> = Vec::new();
     for detail in details {
-        if let Some((_, komik_id, _)) = komik_ids.iter().find(|(s, _, _)| s == &detail.slug) {
+        if let Some(&(komik_id, _)) = komik_id_map.get(&detail.slug) {
             for ch in &detail.chapters {
-                all_chapters.push((*komik_id, ch.number, ch.url.clone()));
+                all_chapters.push((komik_id, ch.number, ch.url.as_str()));
             }
         }
     }
 
     if !all_chapters.is_empty() {
         const MULTI_ROW_SIZE: usize = 500;
+        // Pre-built query template for 500 rows (avoids rebuilding per chunk)
+        let chapter_insert_prefix = "INSERT INTO chapters (komik_id, chapter_number, chapter_url) VALUES ";
+        let chapter_insert_suffix = " ON CONFLICT (komik_id, chapter_number) DO UPDATE SET chapter_url = EXCLUDED.chapter_url, updated_at = now()";
+
         // Single transaction for ALL chapter chunks (reduces commit overhead)
         let mut tx = pool.begin().await.context("Failed to begin chapter batch transaction")?;
 
         for chunk in all_chapters.chunks(MULTI_ROW_SIZE) {
-            let mut query_str = String::from(
-                "INSERT INTO chapters (komik_id, chapter_number, chapter_url) VALUES "
-            );
+            let mut query_str = String::with_capacity(chapter_insert_prefix.len() + chapter_insert_suffix.len() + chunk.len() * 20);
+            query_str.push_str(chapter_insert_prefix);
             let mut param_idx = 1usize;
 
             for (i, _) in chunk.iter().enumerate() {
@@ -551,13 +648,11 @@ pub async fn batch_write_komik(pool: &PgPool, details: &[KomikDetail]) -> Result
                 query_str.push_str(&format!("(${},${},${})", param_idx, param_idx + 1, param_idx + 2));
                 param_idx += 3;
             }
-            query_str.push_str(
-                " ON CONFLICT (komik_id, chapter_number) DO UPDATE SET chapter_url = EXCLUDED.chapter_url, updated_at = now()"
-            );
+            query_str.push_str(chapter_insert_suffix);
 
             let mut query = sqlx::query(&query_str);
             for (komik_id, number, url) in chunk {
-                query = query.bind(*komik_id).bind(*number).bind(url.as_str());
+                query = query.bind(*komik_id).bind(*number).bind(*url);
             }
             query.execute(&mut *tx)
                 .await
@@ -567,18 +662,18 @@ pub async fn batch_write_komik(pool: &PgPool, details: &[KomikDetail]) -> Result
         tx.commit().await.context("Failed to commit chapter batch")?;
     }
 
-    // Phase 3: Multi-row INSERT for genres
+    // Phase 3: Multi-row INSERT for genres using HashMap for O(1) slug→komik_id
     let mut all_genres: Vec<(i32, i16)> = Vec::new();
     for detail in details {
-        if let Some((_, komik_id, _)) = komik_ids.iter().find(|(s, _, _)| s == &detail.slug) {
+        if let Some(&(komik_id, _)) = komik_id_map.get(&detail.slug) {
             for &gid in &detail.genre_ids {
-                all_genres.push((*komik_id, gid));
+                all_genres.push((komik_id, gid));
             }
         }
     }
 
     if !all_genres.is_empty() {
-        let komik_id_list: Vec<i32> = komik_ids.iter().map(|(_, id, _)| *id).collect();
+        let komik_id_list: Vec<i32> = komik_id_map.values().map(|(id, _)| *id).collect();
         let id_placeholders: Vec<String> = (1..=komik_id_list.len()).map(|i| format!("${i}")).collect();
         let delete_sql = format!(
             "DELETE FROM komik_genres WHERE komik_id IN ({})",
@@ -592,8 +687,12 @@ pub async fn batch_write_komik(pool: &PgPool, details: &[KomikDetail]) -> Result
         delete_query.execute(pool).await.context("Failed to batch delete genres")?;
 
         const MULTI_GENRE_SIZE: usize = 200;
+        let genre_insert_prefix = "INSERT INTO komik_genres (komik_id, genre_id) VALUES ";
+        let genre_insert_suffix = " ON CONFLICT DO NOTHING";
+
         for chunk in all_genres.chunks(MULTI_GENRE_SIZE) {
-            let mut query_str = String::from("INSERT INTO komik_genres (komik_id, genre_id) VALUES ");
+            let mut query_str = String::with_capacity(genre_insert_prefix.len() + genre_insert_suffix.len() + chunk.len() * 12);
+            query_str.push_str(genre_insert_prefix);
             let mut param_idx = 1usize;
             for (i, _) in chunk.iter().enumerate() {
                 if i > 0 {
@@ -602,7 +701,7 @@ pub async fn batch_write_komik(pool: &PgPool, details: &[KomikDetail]) -> Result
                 query_str.push_str(&format!("(${},${})", param_idx, param_idx + 1));
                 param_idx += 2;
             }
-            query_str.push_str(" ON CONFLICT DO NOTHING");
+            query_str.push_str(genre_insert_suffix);
 
             let mut query = sqlx::query(&query_str);
             for (komik_id, genre_id) in chunk {
@@ -890,6 +989,39 @@ pub async fn get_chapter_count(pool: &PgPool, komik_id: i32) -> Result<i32> {
 // ============================================================
 // UPDATE LATEST CHAPTER (for smart update without full re-scrape)
 // ============================================================
+
+/// Batch update latest_chapter_number for multiple komik using UNNEST.
+/// Replaces N individual UPDATE queries with a single query — critical for
+/// remote databases (Supabase: ~200ms round-trip per query).
+/// With 50 updates, saves ~10s of pure DB latency.
+/// Returns the number of rows actually updated.
+pub async fn batch_update_latest_chapters(
+    pool: &PgPool,
+    updates: &[(i32, f64)], // (komik_id, new_chapter_number)
+) -> Result<usize> {
+    if updates.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<i32> = updates.iter().map(|(id, _)| *id).collect();
+    let numbers: Vec<f64> = updates.iter().map(|(_, n)| *n).collect();
+
+    let result = sqlx::query(
+        r#"
+        UPDATE komik
+        SET latest_chapter_number = data.new_ch
+        FROM (SELECT * FROM UNNEST($1::integer[], $2::float8[])) AS data(id, new_ch)
+        WHERE komik.id = data.id
+          AND (komik.latest_chapter_number IS NULL OR komik.latest_chapter_number::float8 < data.new_ch)
+        "#,
+    )
+    .bind(&ids)
+    .bind(&numbers)
+    .execute(pool)
+    .await
+    .context("Failed to batch update latest chapter numbers")?;
+
+    Ok(result.rows_affected() as usize)
+}
 
 /// Update latest_chapter_number for existing komik (smart update optimization).
 /// Used when we detect a new chapter number from /komik-terbaru/ but don't
