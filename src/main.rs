@@ -1200,10 +1200,12 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     let jsonl_path = Arc::new(jsonl_path);
     let writer_fetcher = Arc::clone(&fetcher);
 
-    // Spawn in larger chunks for better pipelining
-    const FETCH_CHUNK: usize = 500;
-    let total_chunks = (total + FETCH_CHUNK - 1) / FETCH_CHUNK;
-    println!("[INFO] {} chunks of max {} komik", total_chunks, FETCH_CHUNK);
+    // Sliding window with JoinSet — eliminates chunk barriers for continuous pipelining.
+    // The Fetcher's internal semaphore already limits actual HTTP concurrency,
+    // so we maintain a window of max_in_flight spawned tasks for optimal throughput.
+    // As each task completes, we immediately spawn the next one — no idle gaps.
+    let window_size = opts.max_in_flight.min(total);
+    println!("[INFO] Sliding window: {} in-flight tasks (no chunk barriers)", window_size);
 
     // Use buffered JSONL writer (keeps file open, 1MB buffer)
     let buffered_writer = Arc::new(jsonl::BufferedJsonlWriter::new(&jsonl_path)?);
@@ -1214,52 +1216,57 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     let write_ch = Arc::clone(&total_chapters);
 
     let fetch_task = tokio::spawn(async move {
-        for (chunk_idx, chunk) in komik_list.chunks(FETCH_CHUNK).enumerate() {
-            if chunk_idx > 0 {
-                eprintln!("  [FETCH] Chunk {}/{} ({} komik)...",
-                    chunk_idx + 1, total_chunks, chunk.len());
-            }
+        let mut join_set = tokio::task::JoinSet::new();
+        let mut slug_iter = komik_list.into_iter();
 
-            let mut handles = Vec::with_capacity(chunk.len());
-            for slug in chunk {
-                let fetcher = Arc::clone(&writer_fetcher);
-                let slug = slug.clone();
-                handles.push(tokio::spawn(async move {
-                    let result = scrape_komik_detail(&slug, &fetcher).await;
-                    (slug, result)
-                }));
-            }
+        // Fill initial window
+        for slug in slug_iter.by_ref().take(window_size) {
+            let fetcher = Arc::clone(&writer_fetcher);
+            join_set.spawn(async move {
+                let result = scrape_komik_detail(&slug, &fetcher).await;
+                (slug, result)
+            });
+        }
 
-            for handle in handles {
-                match handle.await {
-                    Ok((slug, result)) => {
-                        match result {
-                            Ok(detail) => {
-                                let ch_count = detail.chapters.len();
-                                write_ch.fetch_add(ch_count, Ordering::Relaxed);
+        // Process results and spawn new tasks as slots free up
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok((slug, detail_result)) => {
+                    match detail_result {
+                        Ok(detail) => {
+                            let ch_count = detail.chapters.len();
+                            write_ch.fetch_add(ch_count, Ordering::Relaxed);
 
-                                // Write to JSONL using buffered writer (fast)
-                                if let Err(e) = bw.append(&detail) {
-                                    eprintln!("  [WARN] JSONL write error: {e}");
-                                }
-
-                                write_success.fetch_add(1, Ordering::Relaxed);
+                            // Write to JSONL using buffered writer (fast)
+                            if let Err(e) = bw.append(&detail) {
+                                eprintln!("  [WARN] JSONL write error: {e}");
                             }
-                            Err(e) => {
-                                write_failed.fetch_add(1, Ordering::Relaxed);
-                                let failed_json = serde_json::json!({
-                                    "slug": slug,
-                                    "_status": "detail_failed",
-                                    "_error": e.to_string(),
-                                });
-                                let _ = bw.append_raw(&failed_json.to_string());
-                            }
+
+                            write_success.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            write_failed.fetch_add(1, Ordering::Relaxed);
+                            let failed_json = serde_json::json!({
+                                "slug": slug,
+                                "_status": "detail_failed",
+                                "_error": e.to_string(),
+                            });
+                            let _ = bw.append_raw(&failed_json.to_string());
                         }
                     }
-                    Err(_) => {
-                        write_failed.fetch_add(1, Ordering::Relaxed);
-                    }
                 }
+                Err(_) => {
+                    write_failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            // Spawn next task if there are more slugs
+            if let Some(slug) = slug_iter.next() {
+                let fetcher = Arc::clone(&writer_fetcher);
+                join_set.spawn(async move {
+                    let result = scrape_komik_detail(&slug, &fetcher).await;
+                    (slug, result)
+                });
             }
         }
     });
@@ -1298,11 +1305,23 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
         }
     });
 
+    // Periodic JSONL flush (every 30 seconds to prevent data loss on crash)
+    let flush_writer = Arc::clone(&buffered_writer);
+    let flush_handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if let Err(e) = flush_writer.flush() {
+                eprintln!("  [WARN] Periodic JSONL flush error: {e}");
+            }
+        }
+    });
+
     // Wait for fetch to complete
     let _ = fetch_task.await;
     progress_handle.abort();
+    flush_handle.abort();
 
-    // Flush buffered JSONL writer to ensure all data is on disk
+    // Final flush buffered JSONL writer to ensure all data is on disk
     buffered_writer.flush()?;
 
     let fetch_elapsed = start_time.elapsed().as_secs_f64();

@@ -64,8 +64,10 @@ pub async fn connect(database_url: &str) -> Result<PgPool> {
         .ssl_mode(PgSslMode::Prefer);
 
     let pool = PgPoolOptions::new()
-        .max_connections(30)
+        .max_connections(50) // Increased for high-concurrency scraper workload
         .acquire_timeout(std::time::Duration::from_secs(30))
+        .idle_timeout(std::time::Duration::from_secs(300)) // Close idle conns after 5min
+        .max_lifetime(std::time::Duration::from_secs(1800)) // Recycle conns after 30min
         .connect_with(options)
         .await
         .map_err(|e| {
@@ -372,30 +374,37 @@ pub async fn upsert_chapters(pool: &PgPool, komik_id: i32, chapters: &[ChapterIn
         return Ok(0);
     }
 
-    // Use transaction for atomicity
+    let upserted = chapters.len();
+
+    // Multi-row INSERT with chunks of 500 (same pattern as batch_write_komik).
+    // Much faster than per-row INSERT — reduces round-trips to the DB.
+    const MULTI_ROW_SIZE: usize = 500;
     let mut tx = pool.begin().await.context("Failed to begin transaction")?;
 
-    // UPSERT each chapter using INSERT ON CONFLICT DO UPDATE.
-    // This preserves existing chapter IDs (unlike DELETE + INSERT).
-    let mut upserted = 0usize;
-    for ch in chapters {
-        sqlx::query(
-            r#"
-            INSERT INTO chapters (komik_id, chapter_number, chapter_url)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (komik_id, chapter_number) DO UPDATE SET
-                chapter_url = EXCLUDED.chapter_url,
-                updated_at = now()
-            "#,
-        )
-        .bind(komik_id)
-        .bind(ch.number)
-        .bind(&ch.url)
-        .execute(&mut *tx)
-        .await
-        .with_context(|| format!("Failed to upsert chapter {} for komik_id={}", ch.number, komik_id))?;
+    for chunk in chapters.chunks(MULTI_ROW_SIZE) {
+        let mut query_str = String::from(
+            "INSERT INTO chapters (komik_id, chapter_number, chapter_url) VALUES "
+        );
+        let mut param_idx = 1usize;
 
-        upserted += 1;
+        for (i, _) in chunk.iter().enumerate() {
+            if i > 0 {
+                query_str.push_str(", ");
+            }
+            query_str.push_str(&format!("(${},${},${})", param_idx, param_idx + 1, param_idx + 2));
+            param_idx += 3;
+        }
+        query_str.push_str(
+            " ON CONFLICT (komik_id, chapter_number) DO UPDATE SET chapter_url = EXCLUDED.chapter_url, updated_at = now()"
+        );
+
+        let mut query = sqlx::query(&query_str);
+        for ch in chunk {
+            query = query.bind(komik_id).bind(ch.number).bind(ch.url.as_str());
+        }
+        query.execute(&mut *tx)
+            .await
+            .with_context(|| format!("Failed to multi-row upsert chapters for komik_id={}", komik_id))?;
     }
 
     tx.commit().await.context("Failed to commit transaction")?;
@@ -417,19 +426,34 @@ pub async fn sync_genres(pool: &PgPool, komik_id: i32, genre_ids: &[i16]) -> Res
         .await
         .context("Failed to delete existing genres")?;
 
-    // Insert new
-    let mut inserted = 0usize;
-    for &genre_id in genre_ids {
-        sqlx::query(
-            "INSERT INTO komik_genres (komik_id, genre_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-        )
-        .bind(komik_id)
-        .bind(genre_id)
-        .execute(pool)
-        .await
-        .context("Failed to insert genre")?;
+    if genre_ids.is_empty() {
+        return Ok(0);
+    }
 
-        inserted += 1;
+    let inserted = genre_ids.len();
+
+    // Multi-row INSERT with chunks of 200 (same pattern as batch_write_komik).
+    // Much faster than per-row INSERT — reduces round-trips to the DB.
+    const MULTI_GENRE_SIZE: usize = 200;
+    for chunk in genre_ids.chunks(MULTI_GENRE_SIZE) {
+        let mut query_str = String::from("INSERT INTO komik_genres (komik_id, genre_id) VALUES ");
+        let mut param_idx = 1usize;
+        for (i, _) in chunk.iter().enumerate() {
+            if i > 0 {
+                query_str.push_str(", ");
+            }
+            query_str.push_str(&format!("(${},${})", param_idx, param_idx + 1));
+            param_idx += 2;
+        }
+        query_str.push_str(" ON CONFLICT DO NOTHING");
+
+        let mut query = sqlx::query(&query_str);
+        for &genre_id in chunk {
+            query = query.bind(komik_id).bind(genre_id);
+        }
+        query.execute(pool)
+            .await
+            .context("Failed to multi-row insert genres")?;
     }
 
     Ok(inserted)

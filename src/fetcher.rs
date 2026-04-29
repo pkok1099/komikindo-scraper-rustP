@@ -1,10 +1,18 @@
 /// Async HTTP fetcher menggunakan libcurl (bypass Cloudflare).
 ///
-/// OPTIMIZED V2 (optimize-beta):
+/// OPTIMIZED V3 (optimize-beta):
 ///   - Connection reuse via thread-local curl handle cache
 ///     Setiap blocking thread mempertahankan curl handle-nya sendiri,
 ///     sehingga HTTP keep-alive / HTTP/2 connection dipertahankan.
 ///     Hindari TCP+TLS handshake (~100-200ms) per request.
+///   - Handle caching AFTER successful perform() even on HTTP errors
+///     (429, content-type mismatch, CF challenge) — TCP/TLS connection
+///     is still valid and should be reused. Only drop on network errors.
+///   - FORBID_REUSE on 429: closes rate-limited connection but keeps
+///     handle cached for fresh connection on next request.
+///   - Separate connect_timeout (10s max) for fast-fail on dead hosts
+///   - maxage_conn(120s): closes idle connections after 120s
+///   - DNS cache timeout 3600s (1 hour)
 ///   - Zero-copy response: UnsafeCell take data alih-alih .clone()
 ///   - Pre-allocated Collector buffer (256KB) mengurangi re-allocation
 ///   - Arc<str> untuk shared config (proxy_url, ca_bundle_path)
@@ -208,7 +216,9 @@ fn create_configured_handle(
     handle.follow_location(true).ok();
     handle.max_redirections(10).ok();
     handle.timeout(Duration::from_secs(timeout_secs)).ok();
-    handle.connect_timeout(Duration::from_secs(timeout_secs)).ok();
+    // Separate shorter connect timeout: fail fast on unreachable hosts
+    // without waiting the full timeout (10s max, or timeout_secs if smaller)
+    handle.connect_timeout(Duration::from_secs(timeout_secs.min(10))).ok();
     let _ = handle.low_speed_limit(1024);
     let _ = handle.low_speed_time(Duration::from_secs(30));
     let _ = handle.max_filesize(10_000_000);
@@ -227,7 +237,10 @@ fn create_configured_handle(
     }
 
     // Connection optimization (persist across perform() calls)
-    handle.dns_cache_timeout(Duration::from_secs(600)).ok();
+    // DNS cache: 1 hour — avoids repeated DNS lookups for the same host
+    handle.dns_cache_timeout(Duration::from_secs(3600)).ok();
+    // maxage_conn: close connections idle >120s to prevent stale reuse
+    let _ = handle.maxage_conn(Duration::from_secs(120));
     handle.tcp_keepalive(true).ok();
     handle.tcp_keepidle(Duration::from_secs(15)).ok();
     handle.accept_encoding("gzip, deflate").ok();
@@ -307,12 +320,17 @@ impl Fetcher {
         };
 
         println!(
-            "[FETCHER] Started (libcurl v2 - connection reuse): \
-             timeout={}s, in_flight_limit={}{}{}{}\
+            "[FETCHER] Started (libcurl v3 - connection reuse): \
+             timeout={}s, connect_timeout={}s, in_flight_limit={}{}{}{}\
              \n  [PERF] Thread-local handle cache: ENABLED (HTTP keep-alive)\
+             \n  [PERF] Handle caching on HTTP errors: ENABLED (reuses TCP/TLS)\
+             \n  [PERF] FORBID_REUSE on 429: ENABLED (fresh conn, same handle)\
+             \n  [PERF] maxage_conn: 120s (idle connection cleanup)\
+             \n  [PERF] DNS cache: 3600s\
              \n  [PERF] Pre-allocated buffer: 256KB\
              \n  [PERF] Zero-copy response: ENABLED",
             timeout_secs,
+            timeout_secs.min(10),
             max_in_flight_requests,
             proxy_info,
             if verbose { " [VERBOSE]" } else { "" },
@@ -622,62 +640,73 @@ fn curl_fetch_optimized(
             }
         }
 
-        // Extract response code first for early rejection.
+        // ===== After perform() succeeds: ALWAYS cache handle back =====
+        // The TCP/TLS connection is still valid even on HTTP errors (429,
+        // content-type mismatch, CF challenge). Only drop on network errors.
+        // Extract all metadata first, then cache handle, then validate.
+
+        // Extract response metadata. Copy into owned values so borrows
+        // don't extend past the handle cache.
         let response_code = easy.response_code()?;
 
-        // Rate limit detection: longer backoff in retry loop
-        if response_code == 429 {
-            // Don't cache handle — connection may be throttled
-            anyhow::bail!("HTTP 429 RATE_LIMITED");
-        }
-
-        // Content-type check: skip processing non-HTML responses
         let content_type = easy.content_type()
             .unwrap_or(None)
-            .unwrap_or("");
-        if !content_type.contains("text/html") {
-            anyhow::bail!(
-                "Unexpected content type: {} (HTTP {})",
-                content_type, response_code
-            );
-        }
+            .unwrap_or("")
+            .to_string(); // owned — survives handle cache
 
-        // Extract remaining response metadata.
-        // Copy into owned values so borrows don't extend past the handle cache.
         let total_time = easy.total_time().unwrap_or(Duration::ZERO).as_secs_f64();
         let primary_ip = easy.primary_ip()
             .unwrap_or(None)
             .map(|s| s.to_string())
             .unwrap_or_else(|| "?".to_string());
 
-        // Get response length
-        let len = {
-            let collector = easy.get_ref();
-            collector.len()
-        };
-
         // Take data from collector (zero-copy: Vec<u8> → String without clone)
-        // Scoped borrow to release easy.get_ref() before caching handle
-        let text = {
+        let (len, text) = {
             let collector = easy.get_ref();
+            let len = collector.len();
             let response_bytes = collector.take_data();
 
-            if std::str::from_utf8(&response_bytes).is_ok() {
+            let text = if std::str::from_utf8(&response_bytes).is_ok() {
                 // SAFETY: We just verified the bytes are valid UTF-8
                 unsafe { String::from_utf8_unchecked(response_bytes) }
             } else {
                 String::from_utf8_lossy(&response_bytes).into_owned()
-            }
+            };
+            (len, text)
             // collector borrow released here
         };
 
-        // Reset collector buffer (preserves capacity) and cache handle back
+        // On HTTP 429: mark connection for closure but keep handle cached.
+        // The current connection may be rate-limited; forbid_reuse closes it,
+        // so the next request opens a fresh connection while reusing the handle
+        // (saves TCP+TLS handshake ~100-200ms on the next request to same host).
+        if response_code == 429 {
+            let _ = easy.forbid_reuse(true);
+        }
+
+        // Reset collector buffer (preserves capacity) and cache handle back.
+        // ALWAYS cache after successful perform() — connection is still valid.
         {
             let collector = easy.get_ref();
             collector.reset();
-            // collector borrow released here
         }
         *entry = Some(easy);
+
+        // ===== All validation below; handle is already cached =====
+        // Bailing from here still preserves the cached handle for reuse.
+
+        // Rate limit detection: longer backoff in retry loop
+        if response_code == 429 {
+            anyhow::bail!("HTTP 429 RATE_LIMITED");
+        }
+
+        // Content-type check: skip processing non-HTML responses
+        if !content_type.contains("text/html") {
+            anyhow::bail!(
+                "Unexpected content type: {} (HTTP {})",
+                content_type, response_code
+            );
+        }
 
         // Verbose logging
         if verbose {
