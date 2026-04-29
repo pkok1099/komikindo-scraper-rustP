@@ -12,7 +12,7 @@ name: Smart Update
 on:
   schedule:
     # Every 6 hours (UTC) = 07:00, 13:00, 19:00, 01:00 WIB
-    - cron: '0 0,6,12,18 * * *'
+  #  - cron: '0 0,6,12,18 * * *'
   workflow_dispatch:
 
 permissions:
