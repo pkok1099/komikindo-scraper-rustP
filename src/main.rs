@@ -92,13 +92,13 @@ struct Cli {
     #[arg(long, global = true)]
     worker_threads: Option<usize>,
 
-    /// Max blocking threads for libcurl spawn_blocking (default: 256).
+    /// Max blocking threads for libcurl spawn_blocking (default: 512).
     /// Set equal to max-in-flight for optimal connection reuse.
-    #[arg(long, global = true, default_value_t = 256)]
+    #[arg(long, global = true, default_value_t = 512)]
     max_blocking_threads: usize,
 
-    /// Max in-flight HTTP requests (default: 256).
-    #[arg(long, global = true, default_value_t = 256)]
+    /// Max in-flight HTTP requests (default: 512).
+    #[arg(long, global = true, default_value_t = 512)]
     max_in_flight: usize,
 
     #[command(subcommand)]
@@ -285,8 +285,8 @@ enum Commands {
         #[arg(long)]
         file: Option<String>,
 
-        /// Batch size untuk DB insert (default: 500)
-        #[arg(long, default_value_t = 500)]
+        /// Batch size untuk DB insert (default: 1000)
+        #[arg(long, default_value_t = 1000)]
         batch_size: usize,
     },
 
@@ -1201,11 +1201,11 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     let writer_fetcher = Arc::clone(&fetcher);
 
     // Spawn in larger chunks for better pipelining
-    const FETCH_CHUNK: usize = 200;
+    const FETCH_CHUNK: usize = 500;
     let total_chunks = (total + FETCH_CHUNK - 1) / FETCH_CHUNK;
     println!("[INFO] {} chunks of max {} komik", total_chunks, FETCH_CHUNK);
 
-    // Use buffered JSONL writer (keeps file open, 256KB buffer)
+    // Use buffered JSONL writer (keeps file open, 1MB buffer)
     let buffered_writer = Arc::new(jsonl::BufferedJsonlWriter::new(&jsonl_path)?);
     let bw = Arc::clone(&buffered_writer);
 

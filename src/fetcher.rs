@@ -6,7 +6,7 @@
 ///     sehingga HTTP keep-alive / HTTP/2 connection dipertahankan.
 ///     Hindari TCP+TLS handshake (~100-200ms) per request.
 ///   - Zero-copy response: UnsafeCell take data alih-alih .clone()
-///   - Pre-allocated Collector buffer (128KB) mengurangi re-allocation
+///   - Pre-allocated Collector buffer (256KB) mengurangi re-allocation
 ///   - Arc<str> untuk shared config (proxy_url, ca_bundle_path)
 ///   - Cached header strings (rebuilt into List per handle, no alloc)
 ///   - Cached CA bundle path (resolved once at creation)
@@ -115,7 +115,7 @@ fn build_headers_list() -> List {
 // COLLECTOR (curl response handler) — pre-allocated + UnsafeCell
 // ============================================================
 
-/// Response collector with pre-allocated 128KB buffer and interior mutability.
+/// Response collector with pre-allocated 256KB buffer and interior mutability.
 ///
 /// Uses `UnsafeCell<Vec<u8>>` to allow data extraction and reset between
 /// `perform()` calls via `Easy2::get_ref() -> &Collector` (immutable ref).
@@ -134,10 +134,10 @@ struct Collector {
 unsafe impl Send for Collector {}
 
 impl Collector {
-    /// Create collector with 128KB pre-allocated buffer.
+    /// Create collector with 256KB pre-allocated buffer.
     fn new() -> Self {
         Self {
-            data: UnsafeCell::new(Vec::with_capacity(131_072)), // 128KB
+            data: UnsafeCell::new(Vec::with_capacity(262_144)), // 256KB
         }
     }
 
@@ -310,7 +310,7 @@ impl Fetcher {
             "[FETCHER] Started (libcurl v2 - connection reuse): \
              timeout={}s, in_flight_limit={}{}{}{}\
              \n  [PERF] Thread-local handle cache: ENABLED (HTTP keep-alive)\
-             \n  [PERF] Pre-allocated buffer: 128KB\
+             \n  [PERF] Pre-allocated buffer: 256KB\
              \n  [PERF] Zero-copy response: ENABLED",
             timeout_secs,
             max_in_flight_requests,
@@ -379,9 +379,13 @@ impl Fetcher {
                             } else {
                                 debug!("{msg}");
                             }
-                            std::thread::sleep(Duration::from_secs_f64(
-                                0.3 * (attempt + 1) as f64,
-                            ));
+                            // Longer backoff for rate-limited requests
+                            let sleep_secs = if last_err.contains("RATE_LIMITED") {
+                                2.0
+                            } else {
+                                0.3 * (attempt + 1) as f64
+                            };
+                            std::thread::sleep(Duration::from_secs_f64(sleep_secs));
                         }
                     }
                 }
@@ -442,9 +446,12 @@ impl Fetcher {
                                 last_err = e.to_string();
                                 stats.retries.fetch_add(1, Ordering::Relaxed);
                                 if attempt < max_retries - 1 {
-                                    std::thread::sleep(Duration::from_secs_f64(
-                                        0.3 * (attempt + 1) as f64,
-                                    ));
+                                    let sleep_secs = if last_err.contains("RATE_LIMITED") {
+                                        2.0
+                                    } else {
+                                        0.3 * (attempt + 1) as f64
+                                    };
+                                    std::thread::sleep(Duration::from_secs_f64(sleep_secs));
                                 }
                             }
                         }
@@ -615,9 +622,28 @@ fn curl_fetch_optimized(
             }
         }
 
-        // Extract response metadata BEFORE accessing collector data.
-        // Copy into owned values so borrows don't extend past the handle cache.
+        // Extract response code first for early rejection.
         let response_code = easy.response_code()?;
+
+        // Rate limit detection: longer backoff in retry loop
+        if response_code == 429 {
+            // Don't cache handle — connection may be throttled
+            anyhow::bail!("HTTP 429 RATE_LIMITED");
+        }
+
+        // Content-type check: skip processing non-HTML responses
+        let content_type = easy.content_type()
+            .unwrap_or(None)
+            .unwrap_or("");
+        if !content_type.contains("text/html") {
+            anyhow::bail!(
+                "Unexpected content type: {} (HTTP {})",
+                content_type, response_code
+            );
+        }
+
+        // Extract remaining response metadata.
+        // Copy into owned values so borrows don't extend past the handle cache.
         let total_time = easy.total_time().unwrap_or(Duration::ZERO).as_secs_f64();
         let primary_ip = easy.primary_ip()
             .unwrap_or(None)

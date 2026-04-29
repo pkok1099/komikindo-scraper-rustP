@@ -26,7 +26,7 @@ impl BufferedJsonlWriter {
             .create(true)
             .append(true)
             .open(filepath)?;
-        let writer = BufWriter::with_capacity(1024 * 256, file); // 256KB buffer
+        let writer = BufWriter::with_capacity(1024 * 1024, file); // 1MB buffer
         Ok(Self {
             writer: Mutex::new(writer),
         })
@@ -34,13 +34,14 @@ impl BufferedJsonlWriter {
 
     /// Append a KomikDetail to the JSONL file (thread-safe).
     pub fn append(&self, komik: &KomikDetail) -> std::io::Result<()> {
-        let json = serde_json::to_string(komik).map_err(|e| {
+        let mut bytes = serde_json::to_vec(komik).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
         })?;
+        bytes.push(b'\n');
         let mut writer = self.writer.lock().map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
         })?;
-        writeln!(writer, "{}", json)?;
+        writer.write_all(&bytes)?;
         Ok(())
     }
 
@@ -77,11 +78,11 @@ pub fn append_jsonl(filepath: &Path, komik: &KomikDetail) -> std::io::Result<()>
         .append(true)
         .open(filepath)?;
 
-    let json = serde_json::to_string(komik).map_err(|e| {
+    let mut bytes = serde_json::to_vec(komik).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
     })?;
-
-    writeln!(file, "{}", json)?;
+    bytes.push(b'\n');
+    file.write_all(&bytes)?;
     Ok(())
 }
 

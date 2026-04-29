@@ -64,7 +64,7 @@ pub async fn connect(database_url: &str) -> Result<PgPool> {
         .ssl_mode(PgSslMode::Prefer);
 
     let pool = PgPoolOptions::new()
-        .max_connections(20)
+        .max_connections(30)
         .acquire_timeout(std::time::Duration::from_secs(30))
         .connect_with(options)
         .await
@@ -510,10 +510,11 @@ pub async fn batch_write_komik(pool: &PgPool, details: &[KomikDetail]) -> Result
     }
 
     if !all_chapters.is_empty() {
-        const MULTI_ROW_SIZE: usize = 100;
-        for chunk in all_chapters.chunks(MULTI_ROW_SIZE) {
-            let mut tx = pool.begin().await.context("Failed to begin chapter batch transaction")?;
+        const MULTI_ROW_SIZE: usize = 500;
+        // Single transaction for ALL chapter chunks (reduces commit overhead)
+        let mut tx = pool.begin().await.context("Failed to begin chapter batch transaction")?;
 
+        for chunk in all_chapters.chunks(MULTI_ROW_SIZE) {
             let mut query_str = String::from(
                 "INSERT INTO chapters (komik_id, chapter_number, chapter_url) VALUES "
             );
@@ -537,9 +538,9 @@ pub async fn batch_write_komik(pool: &PgPool, details: &[KomikDetail]) -> Result
             query.execute(&mut *tx)
                 .await
                 .context("Failed to multi-row insert chapters")?;
-
-            tx.commit().await.context("Failed to commit chapter batch")?;
         }
+
+        tx.commit().await.context("Failed to commit chapter batch")?;
     }
 
     // Phase 3: Multi-row INSERT for genres
