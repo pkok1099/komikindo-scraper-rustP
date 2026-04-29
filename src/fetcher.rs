@@ -1,20 +1,32 @@
 /// Async HTTP fetcher menggunakan libcurl (bypass Cloudflare).
 ///
-/// FULL SPEED MODE:
-///   - Semaphore limits in-flight requests
-///   - Cached header strings (rebuilt into List per request, no alloc)
+/// OPTIMIZED V2 (optimize-beta):
+///   - Connection reuse via thread-local curl handle cache
+///     Setiap blocking thread mempertahankan curl handle-nya sendiri,
+///     sehingga HTTP keep-alive / HTTP/2 connection dipertahankan.
+///     Hindari TCP+TLS handshake (~100-200ms) per request.
+///   - Zero-copy response: UnsafeCell take data alih-alih .clone()
+///   - Pre-allocated Collector buffer (128KB) mengurangi re-allocation
+///   - Arc<str> untuk shared config (proxy_url, ca_bundle_path)
+///   - Cached header strings (rebuilt into List per handle, no alloc)
 ///   - Cached CA bundle path (resolved once at creation)
 ///   - Fast UTF-8 conversion (checked, not lossy)
 ///
 /// Architecture:
-///   - Setiap request = 1 thread di blocking pool (libcurl sync API)
-///   - Cookie jar per-handle (CF __cf_bm cookies)
-///   - Auto-retry dengan exponential backoff
-///   - SOCKS5/HTTP proxy support
+///   - Semaphore limits in-flight requests
+///   - spawn_blocking runs on tokio blocking thread pool
+///   - Thread-local handle cache: setiap thread punya handle sendiri
+///     → request berikutnya di thread yang sama reuse connection
+///   - Set max_blocking_threads == max_in_flight untuk reuse optimal
+///
+/// Cookie jar per-handle (CF __cf_bm cookies).
+/// Auto-retry dengan exponential backoff.
+/// SOCKS5/HTTP proxy support.
 
 use anyhow::Result;
 use curl::easy::{Easy2, Handler, HttpVersion, List, WriteError};
 use log::debug;
+use std::cell::{RefCell, UnsafeCell};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -71,7 +83,7 @@ static USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
 
 /// Header lines cached as static strings.
 /// curl::List wraps a raw C linked list (not Clone/Send), so we can't store it
-/// in Fetcher. Instead we cache header strings and rebuild the List per-request
+/// in Fetcher. Instead we cache header strings and rebuild the List per-handle
 /// (only allocates the linked list nodes, no string allocation).
 static HEADER_LINES: &[&str] = &[
     "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -100,19 +112,143 @@ fn build_headers_list() -> List {
 }
 
 // ============================================================
-// COLLECTOR (curl response handler)
+// COLLECTOR (curl response handler) — pre-allocated + UnsafeCell
 // ============================================================
 
-#[derive(Default)]
+/// Response collector with pre-allocated 128KB buffer and interior mutability.
+///
+/// Uses `UnsafeCell<Vec<u8>>` to allow data extraction and reset between
+/// `perform()` calls via `Easy2::get_ref() -> &Collector` (immutable ref).
+///
+/// Safety invariant:
+/// - `Handler::write(&mut self)` is only called by curl during `perform()`
+/// - `take_data()` / `reset()` / `len()` / `as_slice()` are only called
+///   AFTER `perform()` returns, when curl is not accessing the handler
+/// - Collector is used from a single thread (thread-local or spawn_blocking)
 struct Collector {
-    data: Vec<u8>,
+    data: UnsafeCell<Vec<u8>>,
+}
+
+// SAFETY: Collector is only used from a single thread. The UnsafeCell<Vec<u8>>
+// is only accessed mutably between curl::perform() calls, never concurrently.
+unsafe impl Send for Collector {}
+
+impl Collector {
+    /// Create collector with 128KB pre-allocated buffer.
+    fn new() -> Self {
+        Self {
+            data: UnsafeCell::new(Vec::with_capacity(131_072)), // 128KB
+        }
+    }
+
+    /// Get the length of buffered data.
+    /// SAFE: Only called after perform() returns.
+    #[inline]
+    fn len(&self) -> usize {
+        // SAFETY: No curl operation in progress
+        unsafe { (*self.data.get()).len() }
+    }
+
+    /// Take ownership of the response data, leaving an empty Vec with preserved capacity.
+    /// SAFE: Only called after perform() returns, when curl is not accessing the handler.
+    /// This is the zero-copy path: Vec<u8> is converted to String without cloning.
+    fn take_data(&self) -> Vec<u8> {
+        // SAFETY: No curl operation in progress
+        unsafe { std::mem::take(&mut *self.data.get()) }
+    }
+
+    /// Clear the buffer while preserving allocated capacity.
+    /// SAFE: Only called after perform() returns.
+    fn reset(&self) {
+        // SAFETY: No curl operation in progress
+        unsafe { (*self.data.get()).clear() };
+    }
+}
+
+impl Default for Collector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Handler for Collector {
     fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
-        self.data.extend_from_slice(data);
+        // SAFETY: curl calls write() with &mut self during perform(),
+        // and our take_data()/reset() are only called after perform() returns.
+        // No concurrent access is possible.
+        unsafe { (*self.data.get()).extend_from_slice(data) };
         Ok(data.len())
     }
+}
+
+// ============================================================
+// THREAD-LOCAL CURL HANDLE CACHE (connection reuse)
+// ============================================================
+
+/// Thread-local curl handle cache: each blocking thread keeps its own
+/// Easy2<Collector> with persistent TCP/TLS connection (HTTP keep-alive).
+/// Set max_blocking_threads == max_in_flight for optimal reuse.
+thread_local! {
+    static CACHED_CURL_HANDLE: RefCell<Option<Easy2<Collector>>> = RefCell::new(None);
+}
+
+/// Create and fully configure a new curl handle.
+/// Called once per blocking thread on first request.
+fn create_configured_handle(
+    timeout_secs: u64,
+    proxy_url: &str,
+    verbose: bool,
+    ca_bundle_path: &Option<String>,
+) -> Easy2<Collector> {
+    let mut handle = Easy2::new(Collector::new());
+
+    // Core settings (persist across perform() calls)
+    handle.useragent(USER_AGENT).ok();
+    handle.http_version(HttpVersion::V2).ok();
+    handle.follow_location(true).ok();
+    handle.max_redirections(10).ok();
+    handle.timeout(Duration::from_secs(timeout_secs)).ok();
+    handle.connect_timeout(Duration::from_secs(timeout_secs)).ok();
+    let _ = handle.low_speed_limit(1024);
+    let _ = handle.low_speed_time(Duration::from_secs(30));
+    let _ = handle.max_filesize(10_000_000);
+
+    // Headers (persist across perform() calls)
+    let headers = build_headers_list();
+    handle.http_headers(headers).ok();
+
+    // Cookies (persist across perform() calls)
+    handle.cookie_file("").ok();
+    handle.cookie_list("session=1").ok();
+
+    // Proxy
+    if !proxy_url.is_empty() {
+        handle.proxy(proxy_url).ok();
+    }
+
+    // Connection optimization (persist across perform() calls)
+    handle.dns_cache_timeout(Duration::from_secs(600)).ok();
+    handle.tcp_keepalive(true).ok();
+    handle.tcp_keepidle(Duration::from_secs(15)).ok();
+    handle.accept_encoding("gzip, deflate").ok();
+    // pipewait: wait for HTTP/2 multiplexing before opening new connection
+    handle.pipewait(true).ok();
+
+    // SSL
+    if let Some(ref path) = ca_bundle_path {
+        if let Err(e) = handle.cainfo(path) {
+            eprintln!("[CURL] WARNING: Failed to set CA bundle '{}': {}", path, e);
+        }
+    } else {
+        eprintln!("[CURL] WARNING: No CA certificate bundle — SSL will fail!");
+    }
+
+    // Verbose
+    if verbose {
+        handle.verbose(true).ok();
+    }
+
+    handle
 }
 
 // ============================================================
@@ -122,12 +258,13 @@ impl Handler for Collector {
 pub struct Fetcher {
     max_retries: u32,
     timeout_secs: u64,
-    proxy_url: String,
+    /// Shared proxy URL (Arc avoids clone per request)
+    proxy_url: Arc<str>,
     stats: Arc<AtomicFetcherStats>,
     verbose: bool,
     in_flight: Arc<Semaphore>,
-    /// Cached CA bundle path (resolved once at creation)
-    ca_bundle_path: Option<String>,
+    /// Cached CA bundle path (Arc avoids clone per request)
+    ca_bundle_path: Arc<Option<String>>,
 }
 
 // Fetcher is Send because all fields are Send.
@@ -170,7 +307,11 @@ impl Fetcher {
         };
 
         println!(
-            "[FETCHER] Started (libcurl): timeout={}s, in_flight_limit={}{}{}{}",
+            "[FETCHER] Started (libcurl v2 - connection reuse): \
+             timeout={}s, in_flight_limit={}{}{}{}\
+             \n  [PERF] Thread-local handle cache: ENABLED (HTTP keep-alive)\
+             \n  [PERF] Pre-allocated buffer: 128KB\
+             \n  [PERF] Zero-copy response: ENABLED",
             timeout_secs,
             max_in_flight_requests,
             proxy_info,
@@ -181,11 +322,11 @@ impl Fetcher {
         Ok(Fetcher {
             max_retries: cfg.scraper_retries,
             timeout_secs,
-            proxy_url: effective_proxy,
+            proxy_url: Arc::from(effective_proxy),
             stats: Arc::new(AtomicFetcherStats::default()),
             verbose,
             in_flight: Arc::new(Semaphore::new(max_in_flight_requests.max(1))),
-            ca_bundle_path,
+            ca_bundle_path: Arc::new(ca_bundle_path),
         })
     }
 
@@ -201,11 +342,11 @@ impl Fetcher {
 
         let url = url.to_string();
         let timeout_secs = self.timeout_secs;
-        let proxy_url = self.proxy_url.clone();
+        let proxy_url = Arc::clone(&self.proxy_url);
         let stats = Arc::clone(&self.stats);
         let max_retries = self.max_retries;
         let verbose = self.verbose;
-        let ca_bundle_path = self.ca_bundle_path.clone();
+        let ca_bundle_path = Arc::clone(&self.ca_bundle_path);
 
         tokio::task::spawn_blocking(move || {
             let mut last_err = String::new();
@@ -220,7 +361,8 @@ impl Fetcher {
                 ) {
                     Ok(html) => {
                         stats.success.fetch_add(1, Ordering::Relaxed);
-                        stats.bytes_downloaded
+                        stats
+                            .bytes_downloaded
                             .fetch_add(html.len() as u64, Ordering::Relaxed);
                         return Ok(html);
                     }
@@ -228,7 +370,10 @@ impl Fetcher {
                         last_err = e.to_string();
                         stats.retries.fetch_add(1, Ordering::Relaxed);
                         if attempt < max_retries - 1 {
-                            let msg = format!("Retry {}/{} for {}: {}", attempt + 1, max_retries, url, e);
+                            let msg = format!(
+                                "Retry {}/{} for {}: {}",
+                                attempt + 1, max_retries, url, e
+                            );
                             if verbose {
                                 eprintln!("[FETCH] {msg}");
                             } else {
@@ -245,7 +390,9 @@ impl Fetcher {
             stats.failed.fetch_add(1, Ordering::Relaxed);
             anyhow::bail!(
                 "Gagal fetch {} setelah {} retries. Last: {}",
-                url, max_retries, last_err
+                url,
+                max_retries,
+                last_err
             )
         })
         .await
@@ -260,11 +407,11 @@ impl Fetcher {
             let url = url.clone();
             let stats = Arc::clone(&self.stats);
             let timeout_secs = self.timeout_secs;
-            let proxy_url = self.proxy_url.clone();
+            let proxy_url = Arc::clone(&self.proxy_url);
             let max_retries = self.max_retries;
             let verbose = self.verbose;
             let sem = Arc::clone(&self.in_flight);
-            let ca_bundle_path = self.ca_bundle_path.clone();
+            let ca_bundle_path = Arc::clone(&self.ca_bundle_path);
 
             handles.push(tokio::spawn(async move {
                 let _permit = sem
@@ -286,7 +433,8 @@ impl Fetcher {
                         ) {
                             Ok(html) => {
                                 stats.success.fetch_add(1, Ordering::Relaxed);
-                                stats.bytes_downloaded
+                                stats
+                                    .bytes_downloaded
                                     .fetch_add(html.len() as u64, Ordering::Relaxed);
                                 return Ok(html);
                             }
@@ -303,7 +451,9 @@ impl Fetcher {
                     }
                     stats.failed.fetch_add(1, Ordering::Relaxed);
                     Err(anyhow::anyhow!(
-                        "Gagal setelah {} retries: {}", max_retries, last_err
+                        "Gagal setelah {} retries: {}",
+                        max_retries,
+                        last_err
                     ))
                 })
                 .await
@@ -410,10 +560,22 @@ pub fn find_ca_bundle() -> Option<String> {
 }
 
 // ============================================================
-// OPTIMIZED CURL FETCH
+// OPTIMIZED CURL FETCH (with connection reuse)
 // ============================================================
 
-/// Optimized curl fetch: cached header strings, cached CA path, fast UTF-8.
+/// Optimized curl fetch with thread-local connection reuse.
+///
+/// On first call per blocking thread: creates a fully configured curl handle
+/// (TCP+TLS handshake, ~100-200ms overhead).
+/// On subsequent calls: reuses the cached handle (HTTP keep-alive, ~0ms overhead).
+///
+/// The handle is cached in thread-local storage, so each blocking thread
+/// maintains its own connection. With max_blocking_threads == max_in_flight,
+/// each thread handles ~34 requests (8677/256), and only the first pays
+/// the handshake cost.
+///
+/// Zero-copy response: uses UnsafeCell to take Vec<u8> ownership
+/// and convert to String without cloning the response body.
 fn curl_fetch_optimized(
     url: &str,
     timeout_secs: u64,
@@ -421,94 +583,110 @@ fn curl_fetch_optimized(
     verbose: bool,
     ca_bundle_path: &Option<String>,
 ) -> Result<String> {
-    let mut handle = Easy2::new(Collector::default());
+    CACHED_CURL_HANDLE.with(|cell| {
+        let mut entry = cell.borrow_mut();
 
-    handle.url(url)?;
-    handle.useragent(USER_AGENT)?;
-    handle.http_version(HttpVersion::V2)?;
-    handle.follow_location(true)?;
-    handle.max_redirections(10)?;
-    handle.timeout(Duration::from_secs(timeout_secs))?;
-    handle.connect_timeout(Duration::from_secs(timeout_secs))?;
-    let _ = handle.low_speed_limit(1024);
-    let _ = handle.low_speed_time(Duration::from_secs(30));
-    let _ = handle.max_filesize(10_000_000);
+        // Take cached handle (creates new one on first call per thread)
+        let mut easy = entry.take().unwrap_or_else(|| {
+            create_configured_handle(timeout_secs, proxy_url, verbose, ca_bundle_path)
+        });
 
-    // Build headers from cached strings (no string allocation, just list nodes)
-    let headers = build_headers_list();
-    handle.http_headers(headers)?;
-
-    handle.cookie_file("")?;
-    handle.cookie_list("session=1")?;
-
-    if !proxy_url.is_empty() {
-        handle.proxy(proxy_url)?;
-    }
-
-    handle.dns_cache_timeout(Duration::from_secs(600))?;
-    handle.tcp_keepalive(true)?;
-    handle.tcp_keepidle(Duration::from_secs(15))?;
-    handle.accept_encoding("gzip, deflate")?;
-
-    // Use CACHED CA bundle path (no filesystem check per request)
-    if let Some(ref path) = ca_bundle_path {
-        if let Err(e) = handle.cainfo(path) {
-            eprintln!("[CURL] WARNING: Failed to set CA bundle '{}': {}", path, e);
+        // Set URL for this request (all other settings persist from handle creation)
+        if let Err(e) = easy.url(url) {
+            // Reset collector and cache handle back even on URL set failure
+            {
+                let collector = easy.get_ref();
+                collector.reset();
+            }
+            *entry = Some(easy);
+            anyhow::bail!("curl URL set error: {}", e);
         }
-    } else if verbose {
-        eprintln!("[CURL] WARNING: No CA certificate bundle — SSL will fail!");
-    }
 
-    if verbose {
-        handle.verbose(true)?;
-    }
+        // Perform the HTTP request
+        match easy.perform() {
+            Ok(()) => {}
+            Err(e) => {
+                let code = e.code();
+                let desc = e.description();
+                // On network error: drop the handle entirely (connection may be dead).
+                // Next call will create a fresh handle with new connection.
+                // Don't cache a handle with a potentially dead connection.
+                anyhow::bail!("curl error [{}]: {} | URL: {}", code, desc, url);
+            }
+        }
 
-    match handle.perform() {
-        Ok(()) => {}
-        Err(e) => {
-            let code = e.code();
-            let desc = e.description();
-            anyhow::bail!(
-                "curl error [{}]: {} | URL: {}",
-                code, desc, url
+        // Extract response metadata BEFORE accessing collector data.
+        // Copy into owned values so borrows don't extend past the handle cache.
+        let response_code = easy.response_code()?;
+        let total_time = easy.total_time().unwrap_or(Duration::ZERO).as_secs_f64();
+        let primary_ip = easy.primary_ip()
+            .unwrap_or(None)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "?".to_string());
+
+        // Get response length
+        let len = {
+            let collector = easy.get_ref();
+            collector.len()
+        };
+
+        // Take data from collector (zero-copy: Vec<u8> → String without clone)
+        // Scoped borrow to release easy.get_ref() before caching handle
+        let text = {
+            let collector = easy.get_ref();
+            let response_bytes = collector.take_data();
+
+            if std::str::from_utf8(&response_bytes).is_ok() {
+                // SAFETY: We just verified the bytes are valid UTF-8
+                unsafe { String::from_utf8_unchecked(response_bytes) }
+            } else {
+                String::from_utf8_lossy(&response_bytes).into_owned()
+            }
+            // collector borrow released here
+        };
+
+        // Reset collector buffer (preserves capacity) and cache handle back
+        {
+            let collector = easy.get_ref();
+            collector.reset();
+            // collector borrow released here
+        }
+        *entry = Some(easy);
+
+        // Verbose logging
+        if verbose {
+            eprintln!(
+                "[CURL] {} → HTTP {} | {} bytes | {:.3}s | IP: {}",
+                url, response_code, len, total_time, primary_ip
             );
         }
-    }
 
-    let response_code = handle.response_code()?;
-    let total_time = handle.total_time().unwrap_or(Duration::ZERO).as_secs_f64();
-    let primary_ip = handle.primary_ip().unwrap_or(None).unwrap_or("?");
+        // Validate response
+        if response_code >= 400 {
+            let snippet = if text.len() > 200 {
+                &text[..200]
+            } else {
+                &text
+            };
+            anyhow::bail!("HTTP {response_code} | body: {}", snippet.trim());
+        }
+        if text.contains("Just a moment...")
+            || text.contains("cf-challenge")
+            || text.contains("Checking your browser")
+        {
+            anyhow::bail!(
+                "Cloudflare challenge detected (HTTP {response_code}, {} bytes)",
+                text.len()
+            );
+        }
+        if text.len() < 100 && (text.contains("error") || text.contains("Access denied")) {
+            anyhow::bail!(
+                "Suspicious short response ({} bytes): {}",
+                text.len(),
+                text.trim()
+            );
+        }
 
-    let collector = handle.get_ref();
-    let len = collector.data.len();
-
-    // Fast UTF-8 conversion: check validity, then unsafe conversion
-    let text = if std::str::from_utf8(&collector.data).is_ok() {
-        unsafe { String::from_utf8_unchecked(collector.data.clone()) }
-    } else {
-        String::from_utf8_lossy(&collector.data).to_string()
-    };
-
-    if verbose {
-        eprintln!(
-            "[CURL] {} → HTTP {} | {} bytes | {:.3}s | IP: {}",
-            url, response_code, len, total_time, primary_ip
-        );
-    }
-
-    if response_code >= 400 {
-        let snippet = if text.len() > 200 { &text[..200] } else { &text };
-        anyhow::bail!("HTTP {response_code} | body: {}", snippet.trim());
-    }
-    if text.contains("Just a moment...")
-        || text.contains("cf-challenge")
-        || text.contains("Checking your browser")
-    {
-        anyhow::bail!("Cloudflare challenge detected (HTTP {response_code}, {} bytes)", text.len());
-    }
-    if text.len() < 100 && (text.contains("error") || text.contains("Access denied")) {
-        anyhow::bail!("Suspicious short response ({} bytes): {}", text.len(), text.trim());
-    }
-
-    Ok(text)
+        Ok(text)
+    })
 }

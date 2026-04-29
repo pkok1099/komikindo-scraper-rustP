@@ -273,8 +273,9 @@ pub fn normalize_thumbnail(full_url: &str) -> Option<(i16, String)> {
 /// Parse komik list page HTML -> list of slugs.
 pub fn parse_komik_list(html: &str) -> Vec<String> {
     let document = Html::parse_document(html);
-    let mut slugs = Vec::new();
-    let mut seen = HashSet::new();
+    // Pre-allocate for ~8000+ entries (typical komikindo list page)
+    let mut slugs = Vec::with_capacity(8000);
+    let mut seen = HashSet::with_capacity(8000);
 
     // Try primary selector first, fallback if empty.
     let mut iter = document.select(&SEL_KOMIK_LIST_PRIMARY);
@@ -506,6 +507,8 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
     };
 
     // Genre ID lookup using CACHED genre_map (no allocation!)
+    // Pre-allocate genre_ids (typically 2-5 genres per komik)
+    detail.genre_ids = Vec::with_capacity(genre_list.len().min(8));
     for g in &genre_list {
         if let Some(&gid) = GENRE_MAP.get(g.as_str()) {
             detail.genre_ids.push(gid);
@@ -553,12 +556,15 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
 /// Extract chapter list dari detail page.
 ///
 /// OPTIMIZED: All selectors and regex are cached LazyLock statics.
+/// Pre-allocated vectors reduce re-alloc for komik with many chapters.
 fn extract_chapters(document: &Html) -> Vec<ChapterInfo> {
-    let mut chapters = Vec::new();
-    let mut seen_urls = HashSet::new();
+    // Pre-allocate for typical chapter count (~100-500 chapters per komik)
+    let mut chapters = Vec::with_capacity(100);
+    let mut seen_urls = HashSet::with_capacity(100);
 
     // Try from main container (using cached selectors)
-    let mut chapter_links: Vec<ElementRef> = Vec::new();
+    // Pre-allocate for typical chapter count
+    let mut chapter_links: Vec<ElementRef> = Vec::with_capacity(100);
 
     for container_sel in SEL_CH_CONTAINERS.iter() {
         if let Some(container) = document.select(container_sel).next() {
@@ -802,8 +808,9 @@ static SEL_HOME_TYPEFLAG: LazyLock<Selector> = LazyLock::new(|| Selector::parse(
 
 pub fn parse_homepage_updates(html: &str) -> Vec<HomepageUpdate> {
     let document = Html::parse_document(html);
-    let mut updates = Vec::new();
-    let mut seen = HashSet::new();
+    // Homepage typically shows 15-30 recent updates
+    let mut updates = Vec::with_capacity(30);
+    let mut seen = HashSet::with_capacity(30);
 
     // Primary: div.listupd div.animepost
     let mut iter = document.select(&SEL_HOME_POST_PRIMARY);
@@ -932,8 +939,9 @@ static RE_TIME_DAY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s*hari
 /// Parse halaman /komik-terbaru/ -> list of TerbaruItem.
 pub fn parse_komik_terbaru(html: &str) -> Vec<TerbaruItem> {
     let document = Html::parse_document(html);
-    let mut items = Vec::new();
-    let mut seen = HashSet::new();
+    // Each page shows ~30-40 items
+    let mut items = Vec::with_capacity(40);
+    let mut seen = HashSet::with_capacity(40);
 
     for post in document.select(&SEL_TERBARU_POST) {
         // --- Komik link & slug ---
