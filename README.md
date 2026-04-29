@@ -6,7 +6,7 @@ Scraper untuk [KomikIndo](https://komikindo.ch) yang ditulis di Rust. Dirancang 
 
 ## Fitur
 
-- **Full Speed** — tidak ada concurrency limit, 8192 blocking threads, bottleneck hanya di internet
+- **Configurable Speed** — concurrency bisa di-limit (lebih aman untuk CPU/RAM)
 - **Smart Update** — incremental update dari halaman `/komik-terbaru/`, deteksi komik baru & chapter baru
 - **Supabase DB** — upsert otomatis ke PostgreSQL (komik, chapters, genres, scrape log)
 - **JSONL Backup** — output crash-safe format JSONL sebagai fallback/backup
@@ -110,6 +110,9 @@ Options:
   --dry-run         Hanya tampilkan perubahan, tanpa save
   --proxy <URL>     SOCKS5/HTTP proxy
   --timeout <SEC>   Timeout per request (default: 30)
+  --worker-threads <N>        Limit CPU (Tokio worker threads)
+  --max-blocking-threads <N>  Limit thread pool untuk curl (default: 256)
+  --max-in-flight <N>         Limit request aktif bersamaan (default: 64)
 ```
 
 ## GitHub Actions
@@ -155,7 +158,7 @@ komikindo-scraper-rust/
 | `curl` | HTTP client, TLS fingerprint Chrome, Cloudflare bypass |
 | `scraper` | HTML parsing (CSS selector) |
 | `sqlx` | PostgreSQL async client (Supabase) |
-| `tokio` | Async runtime, 8192 blocking threads |
+| `tokio` | Async runtime (worker + blocking thread pool configurable) |
 | `clap` | CLI argument parser |
 | `serde` / `serde_json` | Serialization / JSONL |
 | `chrono` | Date/time |

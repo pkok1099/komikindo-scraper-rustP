@@ -8,6 +8,20 @@ use crate::config::*;
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+
+// ============================================================
+// CACHED SELECTORS / REGEX (avoid re-parse per page)
+// ============================================================
+
+static RE_THUMB_DIM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-\d+x\d+\.").unwrap());
+static RE_SLUG_FROM_KOMIK_URL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/komik/([^/]+)/?").unwrap());
+
+static SEL_KOMIK_LIST_PRIMARY: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("a.tip").unwrap());
+static SEL_KOMIK_LIST_FALLBACK: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("a[href*='/komik/']").unwrap());
 
 // ============================================================
 // URL NORMALIZATION
@@ -37,8 +51,7 @@ pub fn reconstruct_url(domain_id: i16, path: &str) -> String {
 
 /// Remove -NNNxNNN dimension suffix dari thumbnail URL/path.
 pub fn strip_thumbnail_dimensions(s: &str) -> String {
-    let re = Regex::new(r"-\d+x\d+\.").unwrap();
-    re.replace(s, ".").to_string()
+    RE_THUMB_DIM.replace(s, ".").to_string()
 }
 
 /// Normalize thumbnail: domain ref + strip wp prefix + Komik- + dimensions.
@@ -77,27 +90,28 @@ pub fn parse_komik_list(html: &str) -> Vec<String> {
     let mut slugs = Vec::new();
     let mut seen = HashSet::new();
 
-    // Coba selector utama
-    let selector = Selector::parse("a.tip").unwrap();
-    let mut links: Vec<ElementRef> = document.select(&selector).collect();
+    // Try primary selector first, fallback if empty.
+    let mut iter = document.select(&SEL_KOMIK_LIST_PRIMARY);
+    let primary_empty = iter.next().is_none();
 
-    // Fallback
-    if links.is_empty() {
-        let sel2 = Selector::parse("a[href*='/komik/']").unwrap();
-        links = document.select(&sel2).collect();
-    }
+    let links: Box<dyn Iterator<Item = ElementRef>> = if primary_empty {
+        Box::new(document.select(&SEL_KOMIK_LIST_FALLBACK))
+    } else {
+        // Restart iterator (we consumed one item)
+        Box::new(document.select(&SEL_KOMIK_LIST_PRIMARY))
+    };
 
-    let re = Regex::new(r"/komik/([^/]+)/?").unwrap();
-
-    for link in &links {
-        if let Some(href) = link.value().attr("href") {
-            if href.contains("/komik/") {
-                if let Some(caps) = re.captures(href) {
-                    let slug = caps[1].to_string();
-                    if !slug.is_empty() && seen.insert(slug.clone()) {
-                        slugs.push(slug);
-                    }
-                }
+    for link in links {
+        let Some(href) = link.value().attr("href") else {
+            continue;
+        };
+        if !href.contains("/komik/") {
+            continue;
+        }
+        if let Some(caps) = RE_SLUG_FROM_KOMIK_URL.captures(href) {
+            let slug = caps[1].to_string();
+            if !slug.is_empty() && seen.insert(slug.clone()) {
+                slugs.push(slug);
             }
         }
     }
@@ -151,6 +165,7 @@ pub struct ChapterInfo {
 }
 
 impl ChapterInfo {
+    #[allow(dead_code)]
     pub fn set_image_data(&mut self, data: ChapterImageData) {
         self.cdn_domain_id = Some(data.cdn_domain_id);
         self.cdn_path_prefix = Some(data.cdn_path_prefix);
@@ -161,6 +176,7 @@ impl ChapterInfo {
 }
 
 /// Optimized image data dari chapter read page.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ChapterImageData {
     pub cdn_domain_id: i16,
@@ -170,6 +186,7 @@ pub struct ChapterImageData {
     pub total_images: usize,
 }
 
+#[allow(dead_code)]
 pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
     let document = Html::parse_document(html);
     let genre_map = build_genre_map();
@@ -479,6 +496,7 @@ fn extract_chapter_number(title: &str, url: &str) -> Option<f64> {
 ///
 /// **PERBAIKAN**: URL chapter sudah dikirim langsung dari detail page,
 /// jadi tidak ada lagi masalah slug yang salah!
+#[allow(dead_code)]
 pub fn parse_chapter_images(html: &str) -> ChapterImageData {
     let document = Html::parse_document(html);
     let mut raw_images = Vec::new();
@@ -587,6 +605,7 @@ pub fn parse_chapter_images(html: &str) -> ChapterImageData {
 }
 
 /// Cek apakah URL adalah chapter image (bukan ads/logo).
+#[allow(dead_code)]
 fn is_chapter_image(url: &str) -> bool {
     let url_lower = url.to_lowercase();
 
@@ -631,27 +650,36 @@ pub struct HomepageUpdate {
     pub thumbnail: Option<String>,
 }
 
+static RE_CHAPTER_FROM_URL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)chapter-([\d.]+)").unwrap());
+static SEL_HOME_POST_PRIMARY: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("div.listupd div.animepost").unwrap());
+static SEL_HOME_POST_FALLBACK: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("div.listupd div.bsx, div.listupd div.bs div.bsx").unwrap());
+static SEL_HOME_TITLE_LINK: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("div.bigors div.tt h3 a, h3 a, a[href*='/komik/']").unwrap());
+static SEL_HOME_CH_LINK: LazyLock<Selector> = LazyLock::new(|| {
+    Selector::parse("div.bigors div.adds a[href*='chapter'], a[href*='-chapter-']").unwrap()
+});
+static SEL_HOME_IMG: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("div.limit img, img").unwrap());
+static SEL_HOME_TYPEFLAG: LazyLock<Selector> = LazyLock::new(|| Selector::parse("span.typeflag").unwrap());
+
 pub fn parse_homepage_updates(html: &str) -> Vec<HomepageUpdate> {
     let document = Html::parse_document(html);
     let mut updates = Vec::new();
     let mut seen = HashSet::new();
 
-    let slug_re = Regex::new(r"/komik/([^/]+)/?").unwrap();
-    let ch_re = Regex::new(r"(?i)chapter-([\d.]+)").unwrap();
-
     // Primary: div.listupd div.animepost
-    let post_sel = Selector::parse("div.listupd div.animepost").unwrap();
-    let posts: Vec<_> = document.select(&post_sel).collect();
-
-    let items: Vec<ElementRef> = if !posts.is_empty() {
-        posts
+    let mut iter = document.select(&SEL_HOME_POST_PRIMARY);
+    let primary_empty = iter.next().is_none();
+    let posts: Box<dyn Iterator<Item = ElementRef>> = if primary_empty {
+        Box::new(document.select(&SEL_HOME_POST_FALLBACK))
     } else {
-        // Fallback: div.listupd div.bsx
-        let bsx_sel = Selector::parse("div.listupd div.bsx, div.listupd div.bs div.bsx").unwrap();
-        document.select(&bsx_sel).collect()
+        Box::new(document.select(&SEL_HOME_POST_PRIMARY))
     };
 
-    for post in &items {
+    for post in posts {
         let mut item = HomepageUpdate {
             slug: String::new(),
             judul: None,
@@ -661,9 +689,7 @@ pub fn parse_homepage_updates(html: &str) -> Vec<HomepageUpdate> {
         };
 
         // Title link
-        let title_sel =
-            Selector::parse("div.bigors div.tt h3 a, h3 a, a[href*='/komik/']").unwrap();
-        if let Some(title_link) = post.select(&title_sel).next() {
+        if let Some(title_link) = post.select(&SEL_HOME_TITLE_LINK).next() {
             item.judul = Some(
                 title_link
                     .text()
@@ -677,7 +703,7 @@ pub fn parse_homepage_updates(html: &str) -> Vec<HomepageUpdate> {
                 } else {
                     href.to_string()
                 };
-                if let Some(caps) = slug_re.captures(&full_href) {
+                if let Some(caps) = RE_SLUG_FROM_KOMIK_URL.captures(&full_href) {
                     item.slug = caps[1].to_string();
                 }
             }
@@ -692,16 +718,14 @@ pub fn parse_homepage_updates(html: &str) -> Vec<HomepageUpdate> {
         }
 
         // Chapter link
-        let ch_sel = Selector::parse("div.bigors div.adds a[href*='chapter'], a[href*='-chapter-']")
-            .unwrap();
-        if let Some(ch_link) = post.select(&ch_sel).next() {
+        if let Some(ch_link) = post.select(&SEL_HOME_CH_LINK).next() {
             if let Some(href) = ch_link.value().attr("href") {
                 let full_href = if href.starts_with('/') {
                     format!("{BASE_URL}{href}")
                 } else {
                     href.to_string()
                 };
-                if let Some(caps) = ch_re.captures(&full_href) {
+                if let Some(caps) = RE_CHAPTER_FROM_URL.captures(&full_href) {
                     if let Ok(num) = caps[1].parse::<f64>() {
                         item.latest_chapter_number = Some(num);
                     }
@@ -710,20 +734,17 @@ pub fn parse_homepage_updates(html: &str) -> Vec<HomepageUpdate> {
         }
 
         // Type
-        if let Ok(type_sel) = Selector::parse("span.typeflag") {
-            if let Some(type_el) = post.select(&type_sel).next() {
-                for cls in type_el.value().classes() {
-                    if cls != "typeflag" {
-                        item.tipe = Some(cls.to_string());
-                        break;
-                    }
+        if let Some(type_el) = post.select(&SEL_HOME_TYPEFLAG).next() {
+            for cls in type_el.value().classes() {
+                if cls != "typeflag" {
+                    item.tipe = Some(cls.to_string());
+                    break;
                 }
             }
         }
 
         // Thumbnail
-        let img_sel = Selector::parse("div.limit img, img").unwrap();
-        if let Some(img) = post.select(&img_sel).next() {
+        if let Some(img) = post.select(&SEL_HOME_IMG).next() {
             item.thumbnail = img.value().attr("src").map(|s| s.to_string());
         }
 
@@ -758,22 +779,30 @@ pub struct TerbaruItem {
     pub time_minutes: u32,
 }
 
+static SEL_TERBARU_POST: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("div.animepost").unwrap());
+static SEL_TERBARU_KOMIK: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("h3 a[href*='/komik/'], a.animposx[href*='/komik/']").unwrap());
+static SEL_TERBARU_CH: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("div.lsch a[href*='-chapter-']").unwrap());
+static SEL_TERBARU_TIME: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("span.datech").unwrap());
+static RE_TERBARU_CH_NUM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)chapter-([\d.]+)").unwrap());
+
+static RE_TIME_MIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s*menit").unwrap());
+static RE_TIME_HOUR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s*jam").unwrap());
+static RE_TIME_DAY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s*hari").unwrap());
+
 /// Parse halaman /komik-terbaru/ -> list of TerbaruItem.
 pub fn parse_komik_terbaru(html: &str) -> Vec<TerbaruItem> {
     let document = Html::parse_document(html);
     let mut items = Vec::new();
     let mut seen = HashSet::new();
 
-    let post_sel = Selector::parse("div.animepost").unwrap();
-    let komik_sel = Selector::parse("h3 a[href*='/komik/'], a.animposx[href*='/komik/']").unwrap();
-    let ch_sel = Selector::parse("div.lsch a[href*='-chapter-']").unwrap();
-    let time_sel = Selector::parse("span.datech").unwrap();
-    let slug_re = Regex::new(r"/komik/([^/]+)/?").unwrap();
-    let ch_num_re = Regex::new(r"(?i)chapter-([\d.]+)").unwrap();
-
-    for post in document.select(&post_sel) {
+    for post in document.select(&SEL_TERBARU_POST) {
         // --- Komik link & slug ---
-        let komik_link = match post.select(&komik_sel).next() {
+        let komik_link = match post.select(&SEL_TERBARU_KOMIK).next() {
             Some(el) => el,
             None => continue,
         };
@@ -781,7 +810,7 @@ pub fn parse_komik_terbaru(html: &str) -> Vec<TerbaruItem> {
             Some(h) => h,
             None => continue,
         };
-        let slug = match slug_re.captures(komik_href) {
+        let slug = match RE_SLUG_FROM_KOMIK_URL.captures(komik_href) {
             Some(caps) => caps[1].to_string(),
             None => continue,
         };
@@ -792,7 +821,7 @@ pub fn parse_komik_terbaru(html: &str) -> Vec<TerbaruItem> {
         let judul = komik_link.text().collect::<String>().trim().to_string();
 
         // --- Chapter link ---
-        let ch_link = match post.select(&ch_sel).next() {
+        let ch_link = match post.select(&SEL_TERBARU_CH).next() {
             Some(el) => el,
             None => continue,
         };
@@ -801,14 +830,14 @@ pub fn parse_komik_terbaru(html: &str) -> Vec<TerbaruItem> {
             None => continue,
         };
         let ch_url = normalize_url_full(ch_url_raw);
-        let chapter_number = match ch_num_re.captures(&ch_url) {
+        let chapter_number = match RE_TERBARU_CH_NUM.captures(&ch_url) {
             Some(caps) => caps[1].parse::<f64>().unwrap_or(0.0),
             None => continue,
         };
 
         // --- Time ---
         let time_str = post
-            .select(&time_sel)
+            .select(&SEL_TERBARU_TIME)
             .next()
             .map(|el| el.text().collect::<String>().trim().to_string())
             .unwrap_or_default();
@@ -835,13 +864,13 @@ pub fn parse_komik_terbaru(html: &str) -> Vec<TerbaruItem> {
 fn parse_time_to_minutes(time_str: &str) -> u32 {
     let s = time_str.trim().to_lowercase();
 
-    if let Some(m) = Regex::new(r"(\d+)\s*menit").unwrap().captures(&s) {
+    if let Some(m) = RE_TIME_MIN.captures(&s) {
         return m[1].parse::<u32>().unwrap_or(0);
     }
-    if let Some(m) = Regex::new(r"(\d+)\s*jam").unwrap().captures(&s) {
+    if let Some(m) = RE_TIME_HOUR.captures(&s) {
         return m[1].parse::<u32>().unwrap_or(0) * 60;
     }
-    if let Some(m) = Regex::new(r"(\d+)\s*hari").unwrap().captures(&s) {
+    if let Some(m) = RE_TIME_DAY.captures(&s) {
         return m[1].parse::<u32>().unwrap_or(0) * 60 * 24;
     }
 
@@ -854,15 +883,17 @@ fn parse_time_to_minutes(time_str: &str) -> u32 {
 /// "https://komikindo.ch/blue-lock-chapter-342/"
 /// → "https://komikindo.ch/blue-lock"
 pub fn extract_url_base(chapter_url: &str) -> String {
-    let re = Regex::new(r"-chapter-[\d.]+/?$").unwrap();
+    static RE_STRIP_CH_SUFFIX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"-chapter-[\d.]+/?$").unwrap());
     let trimmed = chapter_url.trim_end_matches('/');
-    re.replace(trimmed, "").to_string()
+    RE_STRIP_CH_SUFFIX.replace(trimmed, "").to_string()
 }
 
 /// Construct chapter URL dari base dan nomor chapter.
 ///
 /// ("https://komikindo.ch/blue-lock", 341)
 /// → "https://komikindo.ch/blue-lock-chapter-341/"
+#[allow(dead_code)]
 pub fn construct_chapter_url(url_base: &str, chapter_number: f64) -> String {
     if chapter_number.fract() == 0.0 {
         format!("{}-chapter-{}/", url_base, chapter_number as i64)
@@ -896,6 +927,7 @@ fn normalize_url_full(raw: &str) -> String {
 // HELPERS
 // ============================================================
 
+#[allow(dead_code)]
 fn find_common_prefix<'a>(paths: &'a [&'a str]) -> &'a str {
     if paths.is_empty() {
         return "";

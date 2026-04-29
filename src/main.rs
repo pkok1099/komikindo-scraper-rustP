@@ -4,7 +4,7 @@
 ///   - Tidak ada semaphore / concurrency limit
 ///   - Bottleneck hanya di internet (bandwidth + latency)
 ///   - Streaming pipeline: detail selesai → chapter langsung jalan
-///   - tokio blocking pool 8192 threads (1 thread per curl request)
+///   - Sekarang ada limit: --max-blocking-threads dan --max-in-flight
 ///   - No batch barrier: semua 8671 komik detail + chapter paralel
 ///
 /// SMART UPDATE:
@@ -35,13 +35,13 @@ mod scraper;
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use clap::Parser;
-use parsers::KomikDetail;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use sqlx::PgPool;
+use sqlx::Row;
 
 use crate::fetcher::Fetcher;
 use crate::scraper::{scrape_full_komik_list, scrape_komik_detail, scrape_komik_terbaru};
@@ -79,6 +79,18 @@ struct Cli {
     /// Specify .env file path (searches: ./, binary dir, parent dirs if not set)
     #[arg(long, global = true)]
     env: Option<String>,
+
+    /// Tokio worker threads (CPU). Default = Tokio default.
+    #[arg(long, global = true)]
+    worker_threads: Option<usize>,
+
+    /// Max blocking threads for libcurl spawn_blocking (default: 256).
+    #[arg(long, global = true, default_value_t = 256)]
+    max_blocking_threads: usize,
+
+    /// Max in-flight HTTP requests (default: 64).
+    #[arg(long, global = true, default_value_t = 64)]
+    max_in_flight: usize,
 
     #[command(subcommand)]
     command: Commands,
@@ -189,10 +201,78 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         timeout: u64,
     },
+
+    /// Benchmark parsing speed (fetch once, parse N times)
+    BenchParse {
+        /// What to benchmark
+        #[arg(long, value_parser = ["list", "homepage", "terbaru", "detail"])]
+        kind: String,
+
+        /// Iterations (parse repeats)
+        #[arg(long, default_value_t = 200)]
+        iters: u32,
+
+        /// Slug for --kind detail
+        #[arg(long)]
+        slug: Option<String>,
+
+        /// Timeout per request dalam detik
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+
+        /// SOCKS5/HTTP proxy URL (e.g. socks5://127.0.0.1:1080)
+        #[arg(long)]
+        proxy: Option<String>,
+    },
+
+    /// Query DB and show saved data (readback verification)
+    DbShow {
+        /// Limit rows to show (default 5)
+        #[arg(long, default_value_t = 5)]
+        limit: i64,
+
+        /// Show specific komik by slug (if set, ignores --limit for komik list)
+        #[arg(long)]
+        slug: Option<String>,
+
+        /// Also show last N chapters per komik (default 5)
+        #[arg(long, default_value_t = 5)]
+        chapters: i64,
+    },
+
+    /// Print full komik detail from DB (JSON) by slug
+    DbDetail {
+        #[arg(long)]
+        slug: String,
+
+        /// Limit number of chapters returned (default 200)
+        #[arg(long, default_value_t = 200)]
+        chapters: i64,
+    },
+
+    /// Inspect DB schema (tables/columns) without psql
+    DbSchema {
+        /// Which table to inspect (komik, chapters, komik_genres, scrape_log)
+        #[arg(long, default_value = "chapters")]
+        table: String,
+    },
+
+    /// Reset DB data (alpha/testing): TRUNCATE main tables
+    DbReset {
+        /// Also reset identity/serial counters
+        #[arg(long, default_value_t = true)]
+        restart_identity: bool,
+    },
+
+    /// Setup DB schema (create tables/columns/indexes if missing)
+    DbSetup,
+
+    /// Drop all scraper tables (DANGEROUS): removes tables completely
+    DbDropAll,
 }
 
 // ============================================================
-// MAIN (8192 blocking threads)
+// MAIN (bounded concurrency)
 // ============================================================
 
 fn main() -> Result<()> {
@@ -206,13 +286,16 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
         .init();
 
-    // 8192 blocking threads = 8192 concurrent curl requests
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .max_blocking_threads(8192)
-        .build()?;
+    let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
+    rt_builder.enable_all();
+    if let Some(n) = cli.worker_threads {
+        rt_builder.worker_threads(n.max(1));
+    }
+    rt_builder.max_blocking_threads(cli.max_blocking_threads.max(1));
+    let runtime = rt_builder.build()?;
 
     let verbose = cli.verbose;
+    let max_in_flight = cli.max_in_flight;
 
     runtime.block_on(async move {
         match cli.command {
@@ -232,6 +315,7 @@ fn main() -> Result<()> {
                     proxy,
                     use_db: db,
                     verbose,
+                    max_in_flight,
                 })
                 .await?;
             }
@@ -251,11 +335,12 @@ fn main() -> Result<()> {
                     dry_run,
                     use_db: db,
                     verbose,
+                    max_in_flight,
                 })
                 .await?;
             }
             Commands::Homepage { proxy } => {
-                let fetcher = Fetcher::new(30, proxy.as_deref(), verbose)?;
+                let fetcher = Fetcher::new(30, proxy.as_deref(), verbose, max_in_flight)?;
                 let updates = scraper::scrape_homepage_updates(&fetcher).await?;
                 println!("\n=== Homepage Updates ({}) ===", updates.len());
                 for u in &updates {
@@ -268,14 +353,303 @@ fn main() -> Result<()> {
                 }
             }
             Commands::Check { proxy, timeout } => {
-                run_check(&proxy, timeout, verbose).await?;
+                run_check(&proxy, timeout, verbose, max_in_flight).await?;
             }
             Commands::Debug { all, db, network, env, info, proxy, timeout } => {
-                run_debug(DebugOpts { all, db, network, env, info, proxy, timeout, verbose }).await?;
+                run_debug(DebugOpts {
+                    all,
+                    db,
+                    network,
+                    env,
+                    info,
+                    proxy,
+                    timeout,
+                    verbose,
+                    max_in_flight,
+                })
+                .await?;
+            }
+            Commands::BenchParse { kind, iters, slug, timeout, proxy } => {
+                run_bench_parse(kind, iters, slug, timeout, proxy, verbose, max_in_flight).await?;
+            }
+            Commands::DbShow { limit, slug, chapters } => {
+                run_db_show(limit, slug, chapters).await?;
+            }
+            Commands::DbDetail { slug, chapters } => {
+                run_db_detail(slug, chapters).await?;
+            }
+            Commands::DbSchema { table } => {
+                run_db_schema(table).await?;
+            }
+            Commands::DbReset { restart_identity } => {
+                run_db_reset(restart_identity).await?;
+            }
+            Commands::DbSetup => {
+                run_db_setup().await?;
+            }
+            Commands::DbDropAll => {
+                run_db_drop_all().await?;
             }
         }
         Ok(())
     })
+}
+
+async fn run_db_show(limit: i64, slug: Option<String>, chapters: i64) -> Result<()> {
+    let cfg = config::env_config();
+    if cfg.database_url.is_empty() {
+        anyhow::bail!("DATABASE_URL kosong. Set DATABASE_URL di .env lalu coba lagi.");
+    }
+    let pool = db::connect(&cfg.database_url).await?;
+
+    println!("{}", "=".repeat(60));
+    println!("  DB READBACK");
+    println!("{}", "=".repeat(60));
+
+    if let Some(slug) = slug {
+        let Some(komik_id) = db::get_komik_id_by_slug(&pool, &slug).await? else {
+            println!("[DB] slug not found: {slug}");
+            return Ok(());
+        };
+        let ch = db::list_chapters(&pool, komik_id, chapters).await?;
+        println!("[DB] slug={slug} id={komik_id} chapters_shown={}", ch.len());
+        for n in ch {
+            println!("  - ch.{n}");
+        }
+        return Ok(());
+    }
+
+    let rows = db::list_komik(&pool, limit).await?;
+    println!("[DB] komik rows shown: {}", rows.len());
+    for r in rows {
+        println!(
+            "- id={} slug={} judul={} latest={:?} chapter_count={:?}",
+            r.id, r.slug, r.judul, r.latest_chapter_number, r.chapter_count
+        );
+        let ch = db::list_chapters(&pool, r.id, chapters).await.unwrap_or_default();
+        if !ch.is_empty() {
+            print!("  chapters: ");
+            for (i, n) in ch.iter().enumerate() {
+                if i > 0 {
+                    print!(", ");
+                }
+                print!("{n}");
+            }
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_db_detail(slug: String, chapters: i64) -> Result<()> {
+    let cfg = config::env_config();
+    if cfg.database_url.is_empty() {
+        anyhow::bail!("DATABASE_URL kosong. Set DATABASE_URL di .env lalu coba lagi.");
+    }
+    let pool = db::connect(&cfg.database_url).await?;
+
+    let Some(detail) = db::get_komik_detail_by_slug(&pool, &slug, chapters).await? else {
+        anyhow::bail!("slug tidak ditemukan di DB: {slug}");
+    };
+
+    let json = serde_json::to_string_pretty(&detail)?;
+    println!("{json}");
+    Ok(())
+}
+
+async fn db_connect_from_env() -> Result<sqlx::PgPool> {
+    let cfg = config::env_config();
+    if cfg.database_url.is_empty() {
+        anyhow::bail!("DATABASE_URL kosong. Set DATABASE_URL di .env lalu coba lagi.");
+    }
+    let pool = db::connect(&cfg.database_url).await?;
+    Ok(pool)
+}
+
+async fn run_db_schema(table: String) -> Result<()> {
+    let pool = db_connect_from_env().await?;
+    let table = table.to_lowercase();
+    let allowed = ["komik", "chapters", "komik_genres", "scrape_log"];
+    if !allowed.contains(&table.as_str()) {
+        anyhow::bail!("table tidak valid: {table}. Pilih: komik|chapters|komik_genres|scrape_log");
+    }
+
+    println!("{}", "=".repeat(60));
+    println!("  DB SCHEMA: {table}");
+    println!("{}", "=".repeat(60));
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            column_name,
+            data_type,
+            is_nullable,
+            COALESCE(column_default, '') AS column_default
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = $1
+        ORDER BY ordinal_position
+        "#,
+    )
+    .bind(&table)
+    .fetch_all(&pool)
+    .await?;
+
+    if rows.is_empty() {
+        println!("(no columns found; table may not exist)");
+        return Ok(());
+    }
+
+    for r in rows {
+        let name: String = r.get("column_name");
+        let data_type: String = r.get("data_type");
+        let nullable: String = r.get("is_nullable");
+        let default_v: String = r.get("column_default");
+        if default_v.is_empty() {
+            println!("- {name}: {data_type} nullable={nullable}");
+        } else {
+            println!("- {name}: {data_type} nullable={nullable} default={default_v}");
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_db_reset(restart_identity: bool) -> Result<()> {
+    let pool = db_connect_from_env().await?;
+
+    println!("{}", "=".repeat(60));
+    println!("  DB RESET (TRUNCATE)");
+    println!("{}", "=".repeat(60));
+
+    // TRUNCATE is fast and keeps schema; CASCADE to clear dependent rows.
+    // Order doesn't matter with CASCADE, but list all main tables explicitly.
+    let stmt = if restart_identity {
+        "TRUNCATE TABLE komik, chapters, komik_genres, scrape_log RESTART IDENTITY CASCADE"
+    } else {
+        "TRUNCATE TABLE komik, chapters, komik_genres, scrape_log CASCADE"
+    };
+
+    sqlx::query(stmt).execute(&pool).await?;
+    println!("[DB] OK: {stmt}");
+    Ok(())
+}
+
+async fn run_db_setup() -> Result<()> {
+    let pool = db_connect_from_env().await?;
+
+    println!("{}", "=".repeat(60));
+    println!("  DB SETUP (SCHEMA)");
+    println!("{}", "=".repeat(60));
+
+    db::setup_schema(&pool).await?;
+    db::ensure_schema(&pool).await?;
+    println!("[DB] OK: schema ensured");
+    Ok(())
+}
+
+async fn run_db_drop_all() -> Result<()> {
+    let pool = db_connect_from_env().await?;
+
+    println!("{}", "=".repeat(60));
+    println!("  DB DROP ALL (DANGEROUS)");
+    println!("{}", "=".repeat(60));
+
+    // Drop dependent tables first doesn't matter with CASCADE, but keep explicit list.
+    sqlx::query("DROP TABLE IF EXISTS komik_genres CASCADE").execute(&pool).await?;
+    sqlx::query("DROP TABLE IF EXISTS chapters CASCADE").execute(&pool).await?;
+    sqlx::query("DROP TABLE IF EXISTS scrape_log CASCADE").execute(&pool).await?;
+    sqlx::query("DROP TABLE IF EXISTS komik CASCADE").execute(&pool).await?;
+
+    println!("[DB] OK: dropped komik, chapters, komik_genres, scrape_log");
+    Ok(())
+}
+
+async fn run_bench_parse(
+    kind: String,
+    iters: u32,
+    slug: Option<String>,
+    timeout: u64,
+    proxy: Option<String>,
+    verbose: bool,
+    max_in_flight: usize,
+) -> Result<()> {
+    use std::hint::black_box;
+
+    let fetcher = Fetcher::new(timeout, proxy.as_deref(), verbose, max_in_flight)?;
+    let t_fetch = Instant::now();
+
+    let (label, html, parse_fn): (&'static str, String, Box<dyn Fn(&str) + Send + Sync>) =
+        match kind.as_str() {
+            "list" => {
+                let url = format!("{BASE_URL}/daftar-manga/?list");
+                let html = fetcher.fetch_page(&url).await?;
+                (
+                    "parse_komik_list",
+                    html,
+                    Box::new(|h| {
+                        let v = parsers::parse_komik_list(h);
+                        black_box(v.len());
+                    }),
+                )
+            }
+            "homepage" => {
+                let html = fetcher.fetch_page(BASE_URL).await?;
+                (
+                    "parse_homepage_updates",
+                    html,
+                    Box::new(|h| {
+                        let v = parsers::parse_homepage_updates(h);
+                        black_box(v.len());
+                    }),
+                )
+            }
+            "terbaru" => {
+                let url = format!("{BASE_URL}/komik-terbaru/");
+                let html = fetcher.fetch_page(&url).await?;
+                (
+                    "parse_komik_terbaru",
+                    html,
+                    Box::new(|h| {
+                        let v = parsers::parse_komik_terbaru(h);
+                        black_box(v.len());
+                    }),
+                )
+            }
+            "detail" => {
+                let slug = slug.unwrap_or_else(|| "one-piece".to_string());
+                let url = format!("{BASE_URL}/komik/{slug}/");
+                let html = fetcher.fetch_page(&url).await?;
+                (
+                    "parse_komik_detail",
+                    html,
+                    Box::new(move |h| {
+                        let v = parsers::parse_komik_detail(&slug, h);
+                        black_box(v.as_ref().map(|d| d.chapters.len()).unwrap_or(0));
+                    }),
+                )
+            }
+            _ => anyhow::bail!("Unknown kind: {kind}"),
+        };
+
+    let fetch_secs = t_fetch.elapsed().as_secs_f64();
+    println!("[BENCH] fetched HTML in {:.3}s ({} bytes)", fetch_secs, html.len());
+    println!("[BENCH] running {label} iters={iters} ...");
+
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        parse_fn(black_box(&html));
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    let per_iter_ms = elapsed / iters as f64 * 1000.0;
+    let iters_per_sec = iters as f64 / elapsed.max(1e-9);
+    println!(
+        "[BENCH] {}: {:.3}s total | {:.3} ms/iter | {:.1} iters/s",
+        label, elapsed, per_iter_ms, iters_per_sec
+    );
+
+    Ok(())
 }
 
 // ============================================================
@@ -291,6 +665,7 @@ struct DebugOpts {
     proxy: Option<String>,
     timeout: u64,
     verbose: bool,
+    max_in_flight: usize,
 }
 
 async fn run_debug(opts: DebugOpts) -> Result<()> {
@@ -416,7 +791,7 @@ async fn run_debug(opts: DebugOpts) -> Result<()> {
         if effective_proxy.is_none() || run_all {
             println!("\n  --- Test 1: Direct connection ---");
             let t0 = Instant::now();
-            let fetcher_direct = Fetcher::new(opts.timeout, None, opts.verbose)?;
+            let fetcher_direct = Fetcher::new(opts.timeout, None, opts.verbose, opts.max_in_flight)?;
             match fetcher_direct.fetch_page(BASE_URL).await {
                 Ok(html) => {
                     let elapsed = t0.elapsed();
@@ -439,7 +814,7 @@ async fn run_debug(opts: DebugOpts) -> Result<()> {
         if let Some(proxy) = proxy_to_test {
             println!("\n  --- Test 2: Proxy connection ({}) ---", proxy);
             let t0 = Instant::now();
-            let fetcher_proxy = Fetcher::new(opts.timeout, Some(proxy), opts.verbose)?;
+            let fetcher_proxy = Fetcher::new(opts.timeout, Some(proxy), opts.verbose, opts.max_in_flight)?;
             match fetcher_proxy.fetch_page(BASE_URL).await {
                 Ok(html) => {
                     let elapsed = t0.elapsed();
@@ -461,7 +836,7 @@ async fn run_debug(opts: DebugOpts) -> Result<()> {
 
         // Test 3: /komik-terbaru/ (quick content check)
         println!("\n  --- Test 3: Content check (/komik-terbaru/) ---");
-        let fetcher = Fetcher::new(opts.timeout, proxy_to_test, opts.verbose)?;
+        let fetcher = Fetcher::new(opts.timeout, proxy_to_test, opts.verbose, opts.max_in_flight)?;
         let t0 = Instant::now();
         match fetcher.fetch_page(&format!("{BASE_URL}/komik-terbaru/")).await {
             Ok(html) => {
@@ -558,7 +933,12 @@ async fn run_debug(opts: DebugOpts) -> Result<()> {
 // CHECK (connectivity test)
 // ============================================================
 
-async fn run_check(proxy: &Option<String>, timeout: u64, verbose: bool) -> Result<()> {
+async fn run_check(
+    proxy: &Option<String>,
+    timeout: u64,
+    verbose: bool,
+    max_in_flight: usize,
+) -> Result<()> {
     println!("{}", "=".repeat(50));
     println!("  KOMIKINDO CONNECTIVITY CHECK");
     if let Some(ref p) = proxy {
@@ -571,7 +951,7 @@ async fn run_check(proxy: &Option<String>, timeout: u64, verbose: bool) -> Resul
     }
     println!("{}", "=".repeat(50));
 
-    let fetcher = Fetcher::new(timeout, proxy.as_deref(), verbose)?;
+    let fetcher = Fetcher::new(timeout, proxy.as_deref(), verbose, max_in_flight)?;
 
     // Test 1: Homepage
     println!("\n--- Test 1: Fetch homepage ---");
@@ -682,6 +1062,7 @@ struct FullFetchOpts {
     proxy: Option<String>,
     use_db: bool,
     verbose: bool,
+    max_in_flight: usize,
 }
 
 async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
@@ -749,11 +1130,16 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     } else {
         println!("  Storage: JSONL file");
     }
-    println!("  Blocking threads: 8192 (1 per curl request)");
+    println!("  In-flight requests: {}", opts.max_in_flight);
     println!("{proxy_info}");
     println!("{}", "=".repeat(70));
 
-    let fetcher = Arc::new(Fetcher::new(opts.timeout, proxy_url, opts.verbose)?);
+    let fetcher = Arc::new(Fetcher::new(
+        opts.timeout,
+        proxy_url,
+        opts.verbose,
+        opts.max_in_flight,
+    )?);
 
     // === Step 1: Fetch komik list ===
     println!("\n--- Step 1: Fetching komik list ---");
@@ -996,6 +1382,7 @@ struct UpdateOpts {
     dry_run: bool,
     use_db: bool,
     verbose: bool,
+    max_in_flight: usize,
 }
 
 async fn run_update(opts: UpdateOpts) -> Result<()> {
@@ -1054,7 +1441,12 @@ async fn run_update(opts: UpdateOpts) -> Result<()> {
         println!("[DATA] No existing data — starting fresh");
     }
 
-    let fetcher = Arc::new(Fetcher::new(opts.timeout, opts.proxy.as_deref(), opts.verbose)?);
+    let fetcher = Arc::new(Fetcher::new(
+        opts.timeout,
+        opts.proxy.as_deref(),
+        opts.verbose,
+        opts.max_in_flight,
+    )?);
 
     // === Step 2: Fetch /komik-terbaru/ ===
     println!("\n--- Step 2: Fetching /komik-terbaru/ ---");

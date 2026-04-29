@@ -27,6 +27,7 @@ pub struct EnvLoadInfo {
     /// The path that was successfully loaded (None if no .env found)
     pub loaded_path: Option<String>,
     /// Whether DATABASE_URL was found after all loading attempts
+    #[allow(dead_code)]
     pub has_database_url: bool,
 }
 
@@ -318,6 +319,7 @@ pub fn ext_to_id(ext: &str) -> i16 {
     }
 }
 
+#[allow(dead_code)]
 pub fn id_to_ext(id: i16) -> &'static str {
     match id {
         1 => ".jpg",
@@ -420,6 +422,7 @@ pub fn build_genre_map() -> HashMap<&'static str, i16> {
     m
 }
 
+#[allow(dead_code)]
 pub fn build_genre_names() -> HashMap<i16, &'static str> {
     let m = build_genre_map();
     m.into_iter().map(|(k, v)| (v, k)).collect()

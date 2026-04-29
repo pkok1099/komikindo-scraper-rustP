@@ -21,7 +21,8 @@ use curl::easy::{Easy2, Handler, HttpVersion, List, WriteError};
 use log::debug;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::sync::Semaphore;
 
 use crate::config::{env_config, BASE_URL};
 
@@ -87,12 +88,17 @@ pub struct Fetcher {
     timeout_secs: u64,
     proxy_url: String,
     stats: Arc<AtomicFetcherStats>,
-    start_time: Instant,
     verbose: bool,
+    in_flight: Arc<Semaphore>,
 }
 
 impl Fetcher {
-    pub fn new(timeout_secs: u64, proxy_url: Option<&str>, verbose: bool) -> Result<Self> {
+    pub fn new(
+        timeout_secs: u64,
+        proxy_url: Option<&str>,
+        verbose: bool,
+        max_in_flight_requests: usize,
+    ) -> Result<Self> {
         let cfg = env_config();
 
         let effective_proxy = proxy_url
@@ -118,8 +124,9 @@ impl Fetcher {
         };
 
         println!(
-            "[FETCHER] Started (libcurl, NO LIMIT): timeout={}s{}{}{}",
+            "[FETCHER] Started (libcurl): timeout={}s, in_flight_limit={}{}{}{}",
             timeout_secs,
+            max_in_flight_requests,
             proxy_info,
             if verbose { " [VERBOSE]" } else { "" },
             ca_info
@@ -130,13 +137,19 @@ impl Fetcher {
             timeout_secs,
             proxy_url: effective_proxy,
             stats: Arc::new(AtomicFetcherStats::default()),
-            start_time: Instant::now(),
             verbose,
+            in_flight: Arc::new(Semaphore::new(max_in_flight_requests.max(1))),
         })
     }
 
     /// Fetch satu halaman. Tidak ada semaphore - langsung spawn_blocking.
     pub async fn fetch_page(&self, url: &str) -> Result<String> {
+        let _permit = self
+            .in_flight
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("Fetcher semaphore closed"))?;
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
 
         let url = url.to_string();
@@ -185,51 +198,68 @@ impl Fetcher {
         .map_err(|e| anyhow::anyhow!("Task error: {e}"))?
     }
 
+    #[allow(dead_code)]
     /// Batch fetch - untuk banyak URL sekaligus tanpa limit.
     pub async fn fetch_pages_batch(&self, urls: &[String]) -> Vec<(String, Result<String>)> {
         let mut handles = Vec::with_capacity(urls.len());
         for url in urls {
             let url = url.clone();
             let stats = Arc::clone(&self.stats);
-            stats.requests.fetch_add(1, Ordering::Relaxed);
-
             let timeout_secs = self.timeout_secs;
             let proxy_url = self.proxy_url.clone();
             let max_retries = self.max_retries;
             let verbose = self.verbose;
+            let sem = Arc::clone(&self.in_flight);
 
-            handles.push(tokio::task::spawn_blocking(move || {
-                let mut last_err = String::new();
-                for attempt in 0..max_retries {
-                    match curl_fetch(&url, timeout_secs, &proxy_url, verbose) {
-                        Ok(html) => {
-                            stats.success.fetch_add(1, Ordering::Relaxed);
-                            stats.bytes_downloaded
-                                .fetch_add(html.len() as u64, Ordering::Relaxed);
-                            return (url, Ok(html));
-                        }
-                        Err(e) => {
-                            last_err = e.to_string();
-                            stats.retries.fetch_add(1, Ordering::Relaxed);
-                            if attempt < max_retries - 1 {
-                                std::thread::sleep(Duration::from_secs_f64(
-                                    0.5 * (attempt + 1) as f64,
-                                ));
+            handles.push(tokio::spawn(async move {
+                let _permit = sem
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Fetcher semaphore closed"))?;
+
+                stats.requests.fetch_add(1, Ordering::Relaxed);
+                let url_for_blocking = url.clone();
+                let r = tokio::task::spawn_blocking(move || {
+                    let mut last_err = String::new();
+                    for attempt in 0..max_retries {
+                        match curl_fetch(&url_for_blocking, timeout_secs, &proxy_url, verbose) {
+                            Ok(html) => {
+                                stats.success.fetch_add(1, Ordering::Relaxed);
+                                stats.bytes_downloaded
+                                    .fetch_add(html.len() as u64, Ordering::Relaxed);
+                                return Ok(html);
+                            }
+                            Err(e) => {
+                                last_err = e.to_string();
+                                stats.retries.fetch_add(1, Ordering::Relaxed);
+                                if attempt < max_retries - 1 {
+                                    std::thread::sleep(Duration::from_secs_f64(
+                                        0.5 * (attempt + 1) as f64,
+                                    ));
+                                }
                             }
                         }
                     }
-                }
-                stats.failed.fetch_add(1, Ordering::Relaxed);
-                (url, Err(anyhow::anyhow!(
-                    "Gagal setelah {} retries: {}", max_retries, last_err
-                )))
+                    stats.failed.fetch_add(1, Ordering::Relaxed);
+                    Err(anyhow::anyhow!(
+                        "Gagal setelah {} retries: {}", max_retries, last_err
+                    ))
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("Task error: {e}"))?;
+
+                Ok::<_, anyhow::Error>((url, r))
             }));
         }
 
         let mut results = Vec::with_capacity(handles.len());
         for handle in handles {
             match handle.await {
-                Ok(r) => results.push(r),
+                Ok(Ok(r)) => results.push(r),
+                Ok(Err(e)) => results.push((
+                    "task-error".into(),
+                    Err(anyhow::anyhow!("Task error: {e}")),
+                )),
                 Err(e) => results.push((
                     "task-error".into(),
                     Err(anyhow::anyhow!("Task join error: {e}")),
@@ -249,6 +279,7 @@ impl Fetcher {
         }
     }
 
+    #[allow(dead_code)]
     pub fn verbose(&self) -> bool {
         self.verbose
     }
@@ -361,12 +392,19 @@ fn curl_fetch(url: &str, timeout_secs: u64, proxy_url: &str, verbose: bool) -> R
     handle.max_redirections(10)?;
     handle.timeout(Duration::from_secs(timeout_secs))?;
     handle.connect_timeout(Duration::from_secs(timeout_secs))?;
+    // Abort extremely slow transfers (helps avoid hanging connections).
+    // If speed stays under 1KB/s for 30s, curl errors with CURLE_OPERATION_TIMEDOUT.
+    let _ = handle.low_speed_limit(1024);
+    let _ = handle.low_speed_time(Duration::from_secs(30));
+    // Basic safety cap (avoid unbounded memory use on unexpected large responses).
+    // libcurl may ignore this for chunked transfers, but it still helps for many responses.
+    let _ = handle.max_filesize(10_000_000);
 
     let mut headers = List::new();
     headers.append("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")?;
     headers.append("Accept-Language: id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7")?;
     headers.append(&format!("Referer: {BASE_URL}/"))?;
-    headers.append("Accept-Encoding: gzip, deflate")?;
+    // We set the actual decoding via handle.accept_encoding below.
     headers.append("Sec-Fetch-Dest: document")?;
     headers.append("Sec-Fetch-Mode: navigate")?;
     headers.append("Sec-Fetch-Site: none")?;

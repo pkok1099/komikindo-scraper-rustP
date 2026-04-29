@@ -11,7 +11,9 @@ pub async fn scrape_full_komik_list(fetcher: &Fetcher) -> Result<Vec<String>> {
     println!("[LIST] Fetching full komik list: {url}");
 
     let html = fetcher.fetch_page(&url).await?;
-    let komik_list = parsers::parse_komik_list(&html);
+    let komik_list = tokio::task::spawn_blocking(move || parsers::parse_komik_list(&html))
+        .await
+        .map_err(|e| anyhow::anyhow!("Task error: {e}"))?;
 
     println!("[LIST] Found {} komik entries", komik_list.len());
     Ok(komik_list)
@@ -26,14 +28,20 @@ pub async fn scrape_komik_detail(slug: &str, fetcher: &Fetcher) -> Result<parser
     let html = fetcher.fetch_page(&komik_url).await
         .map_err(|e| anyhow::anyhow!("Gagal fetch detail {}: {e}", komik_url))?;
 
-    parsers::parse_komik_detail(slug, &html)
-        .ok_or_else(|| anyhow::anyhow!("Gagal parse detail untuk slug: {}", slug))
+    let slug = slug.to_string();
+    tokio::task::spawn_blocking(move || {
+        parsers::parse_komik_detail(&slug, &html)
+            .ok_or_else(|| anyhow::anyhow!("Gagal parse detail untuk slug: {}", slug))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Task error: {e}"))?
 }
 
 /// Scrape chapter image URLs dari chapter read page.
 ///
 /// **PERBAIKAN**: `chapter_url` sudah dikirim langsung dari hasil parse detail page.
 /// Tidak ada lagi build_chapter_url() yang bisa salah!
+#[allow(dead_code)]
 pub async fn scrape_chapter_images(
     chapter_url: &str,
     fetcher: &Fetcher,
@@ -51,7 +59,9 @@ pub async fn scrape_homepage_updates(fetcher: &Fetcher) -> Result<Vec<parsers::H
     let html = fetcher.fetch_page(BASE_URL).await
         .map_err(|e| anyhow::anyhow!("Gagal fetch homepage: {e}"))?;
 
-    let updates = parsers::parse_homepage_updates(&html);
+    let updates = tokio::task::spawn_blocking(move || parsers::parse_homepage_updates(&html))
+        .await
+        .map_err(|e| anyhow::anyhow!("Task error: {e}"))?;
     println!("[HOME] Found {} recently updated komik", updates.len());
     Ok(updates)
 }
@@ -91,7 +101,9 @@ pub async fn scrape_komik_terbaru(
             }
         };
 
-        let items = parsers::parse_komik_terbaru(&html);
+        let items = tokio::task::spawn_blocking(move || parsers::parse_komik_terbaru(&html))
+            .await
+            .map_err(|e| anyhow::anyhow!("Task error: {e}"))?;
         println!("[TERBARU] Page {page}: {} items", items.len());
 
         if items.is_empty() {
