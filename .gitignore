@@ -31,5 +31,8 @@ komikindo-scraper-rust/
 # Agent skills (not part of this project)
 skills/
 
+# Log files
+*.log
+
 # Work log
 worklog.md

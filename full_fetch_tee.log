@@ -1,29 +1,0 @@
-[ENV] Loaded .env from: /home/z/my-project/komikindo-scraper-rust/.env
-[DB] Connecting to Supabase PostgreSQL...
-[DB] Connecting to aws-1-ap-southeast-1.pooler.supabase.com:5432 (direct port)...
-[DB] Connected!
-[DB] Connected!
-[DB] Ensuring schema...
-[DB] Schema OK!
-======================================================================
-  KOMIKINDO FULL FETCH → Supabase DB
-  Started at 2026-04-29 06:52:25
-  Timeout: 30s
-  Mode: Method 2 (tanpa image)
-  Storage: Supabase PostgreSQL + JSONL backup
-  In-flight requests: 64
-
-======================================================================
-[FETCHER] Started (libcurl): timeout=30s, in_flight_limit=64
-  CA bundle: /etc/ssl/certs/ca-certificates.crt
-
---- Step 1: Fetching komik list ---
-[LIST] Fetching full komik list: https://komikindo.ch/daftar-manga/?list
-[LIST] Found 8677 komik entries
-Total komik found: 8677
-Komik to process: 8677
-
---- Step 2: FULL SPEED PIPELINE ---
-[INFO] Spawning 8677 detail fetches (no chapter scraping)
-[INFO] Processing 8677 komik in 174 chunk(s) of max 50
-  [2/8677 0.0%] 20 komik/min | ETA: 428min | OK: 2 FAIL: 0 | DB new: 0 upd: 2 | Ch: 125 | DL: 9.2MB | req: 51  [2/8677 0.0%] 13 komik/min | ETA: 645min | OK: 2 FAIL: 0 | DB new: 0 upd: 2 | Ch: 125 | DL: 9.2MB | req: 51  [5/8677 0.1%] 25 komik/min | ETA: 345min | OK: 5 FAIL: 0 | DB new: 0 upd: 5 | Ch: 171 | DL: 9.2MB | req: 51  [7/8677 0.1%] 28 komik/min | ETA: 308min | OK: 7 FAIL: 0 | DB new: 0 upd: 7 | Ch: 211 | DL: 9.2MB | req: 51  [9/8677 0.1%] 30 komik/min | ETA: 288min | OK: 9 FAIL: 0 | DB new: 0 upd: 9 | Ch: 254 | DL: 9.2MB | req: 51  [11/8677 0.1%] 32 komik/min | ETA: 275min | OK: 11 FAIL: 0 | DB new: 0 upd: 11 | Ch: 281 | DL: 9.2MB | req: 51  [15/8677 0.2%] 38 komik/min | ETA: 230min | OK: 15 FAIL: 0 | DB new: 0 upd: 15 | Ch: 325 | DL: 9.2MB | req: 51  [17/8677 0.2%] 38 komik/min | ETA: 229min | OK: 17 FAIL: 0 | DB new: 0 upd: 17 | Ch: 433 | DL: 9.2MB | req: 51  [17/8677 0.2%] 34 komik/min | ETA: 254min | OK: 17 FAIL: 0 | DB new: 0 upd: 17 | Ch: 433 | DL: 9.2MB | req: 51
