@@ -12,6 +12,13 @@
 ///     (tl re-parses selectors each call, but at ~50ns per parse this is negligible
 ///      compared to the saved DOM construction overhead)
 ///   - Genre map still cached as LazyLock static
+///
+/// FIX: tl does NOT support CSS descendant combinators (space between selectors).
+///   - All selectors like "div.infox h1" have been rewritten to a two-step approach:
+///     1. Find the container with a simple selector
+///     2. Query inside that container using another simple selector
+///   - For sub-selectors inside an already-found tag, we use the leaf selector
+///     directly since we're already scoped to the correct container.
 
 use crate::config::*;
 use regex::Regex;
@@ -88,9 +95,9 @@ pub fn strip_thumbnail_dimensions(s: &str) -> String {
 pub fn normalize_thumbnail(full_url: &str) -> Option<(i16, String)> {
     let (domain_id, mut path) = normalize_url(full_url)?;
 
-    // Strip wp-content/uploads/ prefix
-    if path.starts_with(THUMB_WP_PREFIX) {
-        path = path[THUMB_WP_PREFIX.len()..].to_string();
+    // Strip wp-content/uploads/ prefix (may appear after data/ or other path components)
+    if let Some(wp_pos) = path.find(THUMB_WP_PREFIX) {
+        path = path[wp_pos + THUMB_WP_PREFIX.len()..].to_string();
     }
 
     // Strip -NNNxNNN dimension suffix
@@ -132,6 +139,51 @@ fn get_classes<'a>(tag: &'a tl::HTMLTag<'a>) -> Vec<&'a str> {
         .class_iter()
         .map(|iter| iter.collect())
         .unwrap_or_default()
+}
+
+// ============================================================
+// HELPER: Two-step descendant query (tl does not support descendant combinators)
+// ============================================================
+
+/// Find first child tag matching `child_sel` inside the first container
+/// matching `container_sel` on the DOM. Returns the child tag's inner text
+/// as an owned String, or None if not found.
+fn find_descendant_text(
+    dom: &VDom,
+    parser: &tl::Parser,
+    container_sel: &str,
+    child_sel: &str,
+) -> Option<String> {
+    let mut container_iter = dom.query_selector(container_sel)?;
+    let container_handle = container_iter.next()?;
+    let container_node = container_handle.get(parser)?;
+    let container_tag = container_node.as_tag()?;
+    let mut child_iter = container_tag.query_selector(parser, child_sel)?;
+    let child_handle = child_iter.next()?;
+    let child_node = child_handle.get(parser)?;
+    let child_tag = child_node.as_tag()?;
+    Some(inner_text_owned(child_tag, parser))
+}
+
+/// Find first child tag matching `child_sel` inside the first container
+/// matching `container_sel` on the DOM. Returns the child tag's attribute
+/// value as an owned String, or None if not found.
+fn find_descendant_attr(
+    dom: &VDom,
+    parser: &tl::Parser,
+    container_sel: &str,
+    child_sel: &str,
+    attr: &str,
+) -> Option<String> {
+    let mut container_iter = dom.query_selector(container_sel)?;
+    let container_handle = container_iter.next()?;
+    let container_node = container_handle.get(parser)?;
+    let container_tag = container_node.as_tag()?;
+    let mut child_iter = container_tag.query_selector(parser, child_sel)?;
+    let child_handle = child_iter.next()?;
+    let child_node = child_handle.get(parser)?;
+    let child_tag = child_node.as_tag()?;
+    get_attr(child_tag, attr).map(|s| s.to_string())
 }
 
 // ============================================================
@@ -257,6 +309,11 @@ pub struct ChapterImageData {
 
 #[allow(dead_code)]
 pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
+    // tl::parse("") returns Ok not Err, so check for empty HTML first
+    if html.trim().is_empty() {
+        return None;
+    }
+
     let dom = parse(html, ParserOptions::default()).ok()?;
     let parser = dom.parser();
 
@@ -279,8 +336,9 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
     };
 
     // === TITLE (try multiple selectors) ===
-    let title_selectors = ["h1.titless", "h1.entry-title", "div.infox h1"];
-    for sel in &title_selectors {
+    // Simple selectors first (tl supports these)
+    let title_simple_sels = ["h1.titless", "h1.entry-title"];
+    for sel in &title_simple_sels {
         if let Some(mut iter) = dom.query_selector(sel) {
             if let Some(handle) = iter.next() {
                 if let Some(node) = handle.get(parser) {
@@ -303,6 +361,22 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
             }
         }
     }
+    // Fallback: two-step for "div.infox h1" (tl doesn't support descendant combinator)
+    if detail.judul.is_none() {
+        if let Some(title) = find_descendant_text(&dom, parser, "div.infox", "h1") {
+            if !title.is_empty() {
+                let cleaned = if title.to_lowercase().starts_with("komik") {
+                    RE_TITLE_KOMIK_PREFIX
+                        .replace(&title, "")
+                        .trim()
+                        .to_string()
+                } else {
+                    title
+                };
+                detail.judul = Some(cleaned);
+            }
+        }
+    }
 
     // === TYPE (span.typeflag — first non-"typeflag" class) ===
     if let Some(mut iter) = dom.query_selector("span.typeflag") {
@@ -320,26 +394,15 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
         }
     }
 
-    // === THUMBNAIL (try multiple selectors) ===
+    // === THUMBNAIL (try multiple selectors using two-step approach) ===
     let mut thumb_url = String::new();
-    let thumb_selectors = [
-        "div.infoanime img",
-        "div.thumb img",
-        "div.itemprop img",
-    ];
-    for sel in &thumb_selectors {
-        if let Some(mut iter) = dom.query_selector(sel) {
-            if let Some(handle) = iter.next() {
-                if let Some(node) = handle.get(parser) {
-                    if let Some(tag) = node.as_tag() {
-                        if let Some(src) = get_attr(tag, "src") {
-                            if !src.is_empty() {
-                                thumb_url = src.to_string();
-                                break;
-                            }
-                        }
-                    }
-                }
+    // Two-step: find container, then img inside (replaces "div.infoanime img", "div.thumb img", "div.itemprop img")
+    let thumb_container_sels = ["div.infoanime", "div.thumb", "div.itemprop"];
+    for container_sel in &thumb_container_sels {
+        if let Some(src) = find_descendant_attr(&dom, parser, container_sel, "img", "src") {
+            if !src.is_empty() {
+                thumb_url = src;
+                break;
             }
         }
     }
@@ -372,75 +435,98 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
     }
 
     // === INFO (status, author, artist, dll) ===
+    // Two-step: find div.spe container, then span inside (replaces "div.infox .spe span")
     let mut raw_genre_text: Option<String> = None;
 
-    if let Some(iter) = dom.query_selector("div.infox .spe span") {
-        for handle in iter {
-            let Some(node) = handle.get(parser) else { continue };
-            let Some(span_tag) = node.as_tag() else { continue };
+    if let Some(mut spe_iter) = dom.query_selector("div.spe") {
+        if let Some(spe_handle) = spe_iter.next() {
+            if let Some(spe_node) = spe_handle.get(parser) {
+                if let Some(spe_tag) = spe_node.as_tag() {
+                    if let Some(span_iter) = spe_tag.query_selector(parser, "span") {
+                        for span_handle in span_iter {
+                            let Some(node) = span_handle.get(parser) else { continue };
+                            let Some(span_tag) = node.as_tag() else { continue };
 
-            // Get bold child for label
-            let bold_text = if let Some(mut bold_iter) = span_tag.query_selector(parser, "b") {
-                bold_iter.next().and_then(|h| {
-                    h.get(parser).and_then(|n| n.as_tag().map(|t| inner_text_owned(t, parser)))
-                })
-            } else {
-                None
-            };
+                            // Get bold child for label
+                            let bold_text = if let Some(mut bold_iter) = span_tag.query_selector(parser, "b") {
+                                bold_iter.next().and_then(|h| {
+                                    h.get(parser).and_then(|n| n.as_tag().map(|t| inner_text_owned(t, parser)))
+                                })
+                            } else {
+                                None
+                            };
 
-            let Some(bold) = bold_text else { continue };
-            let full_text = inner_text_owned(span_tag, parser);
-            let value = full_text.replace(&bold, "").trim().to_string();
-            let label = bold.trim().trim_end_matches(':').to_lowercase();
+                            let Some(bold) = bold_text else { continue };
+                            let full_text = inner_text_owned(span_tag, parser);
+                            let value = full_text.replace(&bold, "").trim().to_string();
+                            let label = bold.trim().trim_end_matches(':').to_lowercase();
 
-            if label.contains("genre") {
-                raw_genre_text = Some(value.clone());
-            } else if label.contains("status") {
-                if let Some(id) = status_to_id(&value) {
-                    detail.status_id = Some(id);
+                            if label.contains("genre") {
+                                raw_genre_text = Some(value.clone());
+                            } else if label.contains("status") {
+                                if let Some(id) = status_to_id(&value) {
+                                    detail.status_id = Some(id);
+                                }
+                            } else if label.contains("pengarang") || label.contains("author") {
+                                detail.author = Some(value);
+                            } else if label.contains("ilustrator") || label.contains("artist") {
+                                detail.artist = Some(value);
+                            } else if label.contains("tipe") || label.contains("type") {
+                                if detail.tipe.is_none() {
+                                    detail.tipe = Some(value);
+                                }
+                            } else if label.contains("alternative") {
+                                detail.alternative_title = Some(value);
+                            }
+                        }
+                    }
                 }
-            } else if label.contains("pengarang") || label.contains("author") {
-                detail.author = Some(value);
-            } else if label.contains("ilustrator") || label.contains("artist") {
-                detail.artist = Some(value);
-            } else if label.contains("tipe") || label.contains("type") {
-                if detail.tipe.is_none() {
-                    detail.tipe = Some(value);
-                }
-            } else if label.contains("alternative") {
-                detail.alternative_title = Some(value);
             }
         }
     }
 
     // Genre dari tag links (lebih reliable)
-    let genre_links: Vec<String> = if let Some(iter) = dom.query_selector("div.genre-info a[rel='tag'], div.infox .spe a[rel='tag']") {
-        let found: Vec<String> = iter
-            .filter_map(|h| {
-                h.get(parser).and_then(|n| {
-                    n.as_tag().map(|t| inner_text_owned(t, parser))
-                })
-            })
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !found.is_empty() {
-            found
-        } else if let Some(ref text) = raw_genre_text {
-            text.split(',')
+    // Two-step approach: search in div.genre-info and div.spe containers
+    // (replaces "div.genre-info a[rel='tag'], div.infox .spe a[rel='tag']")
+    let mut genre_links: Vec<String> = Vec::new();
+
+    // Try div.genre-info container first
+    let genre_containers = ["div.genre-info", "div.spe"];
+    for container_sel in &genre_containers {
+        if let Some(mut container_iter) = dom.query_selector(container_sel) {
+            if let Some(container_handle) = container_iter.next() {
+                if let Some(container_node) = container_handle.get(parser) {
+                    if let Some(container_tag) = container_node.as_tag() {
+                        if let Some(link_iter) = container_tag.query_selector(parser, "a[rel='tag']") {
+                            for link_handle in link_iter {
+                                if let Some(link_node) = link_handle.get(parser) {
+                                    if let Some(link_tag) = link_node.as_tag() {
+                                        let text = inner_text_owned(link_tag, parser);
+                                        if !text.is_empty() {
+                                            genre_links.push(text);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !genre_links.is_empty() {
+            break;
+        }
+    }
+
+    // Fallback: use raw genre text from info spans
+    if genre_links.is_empty() {
+        if let Some(ref text) = raw_genre_text {
+            genre_links = text.split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .collect()
-        } else {
-            Vec::new()
+                .collect();
         }
-    } else if let Some(ref text) = raw_genre_text {
-        text.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    }
 
     // Genre ID lookup using CACHED genre_map
     detail.genre_ids = Vec::with_capacity(genre_links.len().min(8));
@@ -452,13 +538,21 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
     detail.genre_list = genre_links;
 
     // === RATING (try multiple selectors) ===
-    let rating_selectors = [
-        "div.infoanime-rating i",
-        "div.rating i",
-        "span.skor",
-    ];
-    for sel in &rating_selectors {
-        if let Some(mut iter) = dom.query_selector(sel) {
+    // Two-step: find container, then i inside (replaces "div.infoanime-rating i", "div.rating i")
+    let rating_container_sels = ["div.infoanime-rating", "div.rating"];
+    for container_sel in &rating_container_sels {
+        if let Some(r_text) = find_descendant_text(&dom, parser, container_sel, "i") {
+            if !r_text.is_empty() {
+                if let Ok(r) = r_text.parse::<f64>() {
+                    detail.rating = Some(r);
+                    break;
+                }
+            }
+        }
+    }
+    // Also try span.skor (simple selector, no descendant)
+    if detail.rating.is_none() {
+        if let Some(mut iter) = dom.query_selector("span.skor") {
             if let Some(handle) = iter.next() {
                 if let Some(node) = handle.get(parser) {
                     if let Some(tag) = node.as_tag() {
@@ -466,7 +560,6 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
                         if !r_text.is_empty() {
                             if let Ok(r) = r_text.parse::<f64>() {
                                 detail.rating = Some(r);
-                                break;
                             }
                         }
                     }
@@ -476,12 +569,12 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
     }
 
     // === SINOPSIS (try multiple selectors + regex cleanup) ===
-    let sinopsis_selectors = [
+    // "div.entry-content.entry-content-single" and "div.entry-content" are simple selectors (no space)
+    let sinopsis_simple_sels = [
         "div.entry-content.entry-content-single",
         "div.entry-content",
-        "div#sinopsis div.entry-content",
     ];
-    for sel in &sinopsis_selectors {
+    for sel in &sinopsis_simple_sels {
         if let Some(mut iter) = dom.query_selector(sel) {
             if let Some(handle) = iter.next() {
                 if let Some(node) = handle.get(parser) {
@@ -497,6 +590,18 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
                         }
                     }
                 }
+            }
+        }
+    }
+    // Fallback: two-step for "div#sinopsis div.entry-content" (tl doesn't support descendant)
+    if detail.sinopsis.is_none() {
+        if let Some(sinopsis_text) = find_descendant_text(&dom, parser, "div#sinopsis", "div.entry-content") {
+            let mut sinopsis = sinopsis_text;
+            sinopsis = RE_SINOPSIS_PREFIX.replace(&sinopsis, "").to_string();
+            sinopsis = RE_SINOPSIS_TYPE.replace(&sinopsis, "").to_string();
+            sinopsis = sinopsis.trim().to_string();
+            if !sinopsis.is_empty() {
+                detail.sinopsis = Some(sinopsis);
             }
         }
     }
@@ -517,8 +622,6 @@ fn extract_chapters(dom: &VDom, parser: &tl::Parser) -> Vec<ChapterInfo> {
 
     // Try from main container first
     let container_selectors = ["div.bxcl", "div#chapter_list"];
-    let link_in_container_sel = "span.lchx a, a[href*='-chapter-']";
-    let fallback_sel = "a[href*='-chapter-']";
 
     let mut found_chapters = false;
 
@@ -527,13 +630,33 @@ fn extract_chapters(dom: &VDom, parser: &tl::Parser) -> Vec<ChapterInfo> {
             if let Some(container_handle) = container_iter.next() {
                 if let Some(container_node) = container_handle.get(parser) {
                     if let Some(container_tag) = container_node.as_tag() {
-                        if let Some(link_iter) = container_tag.query_selector(parser, link_in_container_sel) {
+                        // Primary: direct a[href*='-chapter-'] (simple selector, works in tl)
+                        if let Some(link_iter) = container_tag.query_selector(parser, "a[href*='-chapter-']") {
                             for link_handle in link_iter {
                                 let Some(link_node) = link_handle.get(parser) else { continue };
                                 let Some(link_tag) = link_node.as_tag() else { continue };
 
                                 if try_add_chapter(link_tag, parser, &mut chapters, &mut seen_urls) {
                                     found_chapters = true;
+                                }
+                            }
+                        }
+                        // Fallback: two-step for span.lchx -> a (replaces "span.lchx a")
+                        if !found_chapters {
+                            if let Some(lchx_iter) = container_tag.query_selector(parser, "span.lchx") {
+                                for lchx_handle in lchx_iter {
+                                    let Some(lchx_node) = lchx_handle.get(parser) else { continue };
+                                    let Some(lchx_tag) = lchx_node.as_tag() else { continue };
+                                    if let Some(link_iter) = lchx_tag.query_selector(parser, "a") {
+                                        for link_handle in link_iter {
+                                            let Some(link_node) = link_handle.get(parser) else { continue };
+                                            let Some(link_tag) = link_node.as_tag() else { continue };
+
+                                            if try_add_chapter(link_tag, parser, &mut chapters, &mut seen_urls) {
+                                                found_chapters = true;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -548,7 +671,7 @@ fn extract_chapters(dom: &VDom, parser: &tl::Parser) -> Vec<ChapterInfo> {
 
     // Fallback: all chapter links in page
     if !found_chapters {
-        if let Some(iter) = dom.query_selector(fallback_sel) {
+        if let Some(iter) = dom.query_selector("a[href*='-chapter-']") {
             for link_handle in iter {
                 let Some(link_node) = link_handle.get(parser) else { continue };
                 let Some(link_tag) = link_node.as_tag() else { continue };
@@ -635,7 +758,7 @@ pub fn parse_chapter_images(html: &str) -> ChapterImageData {
     let parser = dom.parser();
     let mut raw_images = Vec::new();
 
-    // Primary: div#chimg-auh or div.chimg-auh
+    // Primary: div#chimg-auh or div.chimg-auh (already uses two-step approach — no descendant combinator)
     let container_selectors = ["div#chimg-auh", "div.chimg-auh"];
     for sel in &container_selectors {
         if let Some(mut iter) = dom.query_selector(sel) {
@@ -810,24 +933,35 @@ pub fn parse_homepage_updates(html: &str) -> Vec<HomepageUpdate> {
     let mut updates = Vec::with_capacity(30);
     let mut seen = HashSet::with_capacity(30);
 
-    // Primary: div.listupd div.animepost
-    let primary_sel = "div.listupd div.animepost";
-    let fallback_sel = "div.listupd div.bsx, div.listupd div.bs div.bsx";
+    // Two-step: find div.listupd, then div.animepost inside (replaces "div.listupd div.animepost")
+    let mut posts: Vec<&Node> = Vec::new();
 
-    let posts: Vec<_> = if let Some(iter) = dom.query_selector(primary_sel) {
-        let collected: Vec<_> = iter.filter_map(|h| h.get(parser)).collect();
-        if collected.is_empty() {
-            dom.query_selector(fallback_sel)
-                .map(|iter| iter.filter_map(|h| h.get(parser)).collect())
-                .unwrap_or_default()
-        } else {
-            collected
+    if let Some(mut listupd_iter) = dom.query_selector("div.listupd") {
+        if let Some(listupd_handle) = listupd_iter.next() {
+            if let Some(listupd_node) = listupd_handle.get(parser) {
+                if let Some(listupd_tag) = listupd_node.as_tag() {
+                    if let Some(animepost_iter) = listupd_tag.query_selector(parser, "div.animepost") {
+                        posts = animepost_iter.filter_map(|h| h.get(parser)).collect();
+                    }
+                }
+            }
         }
-    } else {
-        dom.query_selector(fallback_sel)
-            .map(|iter| iter.filter_map(|h| h.get(parser)).collect())
-            .unwrap_or_default()
-    };
+    }
+
+    // Fallback: find div.listupd, then div.bsx inside (replaces "div.listupd div.bsx, div.listupd div.bs div.bsx")
+    if posts.is_empty() {
+        if let Some(mut listupd_iter) = dom.query_selector("div.listupd") {
+            if let Some(listupd_handle) = listupd_iter.next() {
+                if let Some(listupd_node) = listupd_handle.get(parser) {
+                    if let Some(listupd_tag) = listupd_node.as_tag() {
+                        if let Some(bsx_iter) = listupd_tag.query_selector(parser, "div.bsx") {
+                            posts = bsx_iter.filter_map(|h| h.get(parser)).collect();
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     for post in &posts {
         let Some(post_tag) = post.as_tag() else { continue };
@@ -839,14 +973,40 @@ pub fn parse_homepage_updates(html: &str) -> Vec<HomepageUpdate> {
             thumbnail: None,
         };
 
-        // Title link
-        let title_link_sels = [
-            "div.bigors div.tt h3 a",
-            "h3 a",
-            "a[href*='/komik/']",
-        ];
-        for sel in &title_link_sels {
-            if let Some(mut iter) = post_tag.query_selector(parser, sel) {
+        // Title link — try two-step: find h3 then a inside, then fallback to a[href*='/komik/']
+        // (replaces "div.bigors div.tt h3 a", "h3 a", "a[href*='/komik/']")
+        let mut title_found = false;
+        if let Some(mut h3_iter) = post_tag.query_selector(parser, "h3") {
+            if let Some(h3_handle) = h3_iter.next() {
+                if let Some(h3_node) = h3_handle.get(parser) {
+                    if let Some(h3_tag) = h3_node.as_tag() {
+                        if let Some(mut a_iter) = h3_tag.query_selector(parser, "a") {
+                            if let Some(a_handle) = a_iter.next() {
+                                if let Some(a_node) = a_handle.get(parser) {
+                                    if let Some(a_tag) = a_node.as_tag() {
+                                        item.judul = Some(inner_text_owned(a_tag, parser));
+                                        if let Some(href) = get_attr(a_tag, "href") {
+                                            let full_href = if href.starts_with('/') {
+                                                format!("{BASE_URL}{href}")
+                                            } else {
+                                                href.to_string()
+                                            };
+                                            if let Some(caps) = RE_SLUG_FROM_KOMIK_URL.captures(&full_href) {
+                                                item.slug = caps[1].to_string();
+                                            }
+                                        }
+                                        title_found = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !title_found {
+            // Fallback: direct a[href*='/komik/'] (simple selector)
+            if let Some(mut iter) = post_tag.query_selector(parser, "a[href*='/komik/']") {
                 if let Some(handle) = iter.next() {
                     if let Some(node) = handle.get(parser) {
                         if let Some(tag) = node.as_tag() {
@@ -861,7 +1021,6 @@ pub fn parse_homepage_updates(html: &str) -> Vec<HomepageUpdate> {
                                     item.slug = caps[1].to_string();
                                 }
                             }
-                            break;
                         }
                     }
                 }
@@ -876,8 +1035,9 @@ pub fn parse_homepage_updates(html: &str) -> Vec<HomepageUpdate> {
             continue;
         }
 
-        // Chapter link
-        if let Some(mut iter) = post_tag.query_selector(parser, "div.bigors div.adds a[href*='chapter'], a[href*='-chapter-']") {
+        // Chapter link — use simple selector a[href*='-chapter-'] directly
+        // (replaces "div.bigors div.adds a[href*='chapter'], a[href*='-chapter-']")
+        if let Some(mut iter) = post_tag.query_selector(parser, "a[href*='-chapter-']") {
             if let Some(handle) = iter.next() {
                 if let Some(node) = handle.get(parser) {
                     if let Some(tag) = node.as_tag() {
@@ -914,12 +1074,35 @@ pub fn parse_homepage_updates(html: &str) -> Vec<HomepageUpdate> {
             }
         }
 
-        // Thumbnail
-        if let Some(mut iter) = post_tag.query_selector(parser, "div.limit img, img") {
-            if let Some(handle) = iter.next() {
-                if let Some(node) = handle.get(parser) {
-                    if let Some(tag) = node.as_tag() {
-                        item.thumbnail = get_attr(tag, "src").map(|s| s.to_string());
+        // Thumbnail — two-step: find div.limit then img inside, fallback to just img
+        // (replaces "div.limit img, img")
+        let mut thumb_found = false;
+        if let Some(mut limit_iter) = post_tag.query_selector(parser, "div.limit") {
+            if let Some(limit_handle) = limit_iter.next() {
+                if let Some(limit_node) = limit_handle.get(parser) {
+                    if let Some(limit_tag) = limit_node.as_tag() {
+                        if let Some(mut img_iter) = limit_tag.query_selector(parser, "img") {
+                            if let Some(img_handle) = img_iter.next() {
+                                if let Some(img_node) = img_handle.get(parser) {
+                                    if let Some(img_tag) = img_node.as_tag() {
+                                        item.thumbnail = get_attr(img_tag, "src").map(|s| s.to_string());
+                                        thumb_found = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !thumb_found {
+            // Fallback: any img inside post
+            if let Some(mut iter) = post_tag.query_selector(parser, "img") {
+                if let Some(handle) = iter.next() {
+                    if let Some(node) = handle.get(parser) {
+                        if let Some(tag) = node.as_tag() {
+                            item.thumbnail = get_attr(tag, "src").map(|s| s.to_string());
+                        }
                     }
                 }
             }
@@ -977,15 +1160,39 @@ pub fn parse_komik_terbaru(html: &str) -> Vec<TerbaruItem> {
             let Some(post_tag) = post_node.as_tag() else { continue };
 
             // --- Komik link & slug ---
-            let komik_link_sels = [
-                "h3 a[href*='/komik/']",
-                "a.animposx[href*='/komik/']",
-            ];
+            // Two-step: find h3 then a[href*='/komik/'] inside (replaces "h3 a[href*='/komik/']")
+            // Then fallback: a.animposx[href*='/komik/'] (simple selector, works in tl)
             let mut slug = String::new();
             let mut judul = String::new();
 
-            for sel in &komik_link_sels {
-                if let Some(mut iter) = post_tag.query_selector(parser, sel) {
+            // Try two-step: h3 -> a[href*='/komik/']
+            let mut komik_link_found = false;
+            if let Some(mut h3_iter) = post_tag.query_selector(parser, "h3") {
+                if let Some(h3_handle) = h3_iter.next() {
+                    if let Some(h3_node) = h3_handle.get(parser) {
+                        if let Some(h3_tag) = h3_node.as_tag() {
+                            if let Some(mut a_iter) = h3_tag.query_selector(parser, "a[href*='/komik/']") {
+                                if let Some(a_handle) = a_iter.next() {
+                                    if let Some(a_node) = a_handle.get(parser) {
+                                        if let Some(a_tag) = a_node.as_tag() {
+                                            judul = inner_text_owned(a_tag, parser);
+                                            if let Some(href) = get_attr(a_tag, "href") {
+                                                if let Some(caps) = RE_SLUG_FROM_KOMIK_URL.captures(href) {
+                                                    slug = caps[1].to_string();
+                                                }
+                                            }
+                                            komik_link_found = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Fallback: a.animposx[href*='/komik/'] (simple selector, no descendant)
+            if !komik_link_found {
+                if let Some(mut iter) = post_tag.query_selector(parser, "a.animposx[href*='/komik/']") {
                     if let Some(handle) = iter.next() {
                         if let Some(node) = handle.get(parser) {
                             if let Some(tag) = node.as_tag() {
@@ -995,7 +1202,6 @@ pub fn parse_komik_terbaru(html: &str) -> Vec<TerbaruItem> {
                                         slug = caps[1].to_string();
                                     }
                                 }
-                                break;
                             }
                         }
                     }
@@ -1007,13 +1213,18 @@ pub fn parse_komik_terbaru(html: &str) -> Vec<TerbaruItem> {
             }
 
             // --- Chapter link ---
-            let ch_link_sel = "div.lsch a[href*='-chapter-']";
-            let ch_result = if let Some(mut iter) = post_tag.query_selector(parser, ch_link_sel) {
-                iter.next().and_then(|handle| {
-                    handle.get(parser).and_then(|n| n.as_tag().map(|t| {
-                        let href = get_attr(t, "href").unwrap_or("");
-                        (normalize_url_full(href), inner_text_owned(t, parser))
-                    }))
+            // Two-step: find div.lsch then a[href*='-chapter-'] inside (replaces "div.lsch a[href*='-chapter-']")
+            let ch_result = if let Some(mut lsch_iter) = post_tag.query_selector(parser, "div.lsch") {
+                lsch_iter.next().and_then(|lsch_handle| {
+                    let lsch_node = lsch_handle.get(parser)?;
+                    let lsch_tag = lsch_node.as_tag()?;
+                    let mut a_iter = lsch_tag.query_selector(parser, "a[href*='-chapter-']")?;
+                    a_iter.next().and_then(|a_handle| {
+                        let a_node = a_handle.get(parser)?;
+                        let a_tag = a_node.as_tag()?;
+                        let href = get_attr(a_tag, "href").unwrap_or("");
+                        Some((normalize_url_full(href), inner_text_owned(a_tag, parser)))
+                    })
                 })
             } else {
                 None

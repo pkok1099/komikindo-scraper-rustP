@@ -29,12 +29,8 @@
 ///   - `--env /path/to/.env` global flag: explicit .env file location
 ///   - `debug` subcommand: env diagnostics, DB test, network test, binary info
 
-mod config;
-mod db;
-mod fetcher;
-mod jsonl;
-mod parsers;
-mod scraper;
+// All modules declared in lib.rs — re-import for convenience
+use komikindo_scraper::{config, db, fetcher, jsonl, parsers, scraper};
 
 // jemalloc: better allocation performance for allocation-heavy workloads (5-15% improvement).
 // Only linked on Linux/macOS (not Android/Termux or Windows).
@@ -54,10 +50,10 @@ use std::time::Instant;
 use sqlx::PgPool;
 use sqlx::Row;
 
-use crate::fetcher::Fetcher;
-use crate::scraper::{scrape_full_komik_list, scrape_komik_detail, scrape_komik_terbaru};
-use crate::config::BASE_URL;
-use crate::parsers::KomikDetail;
+use config::BASE_URL;
+use fetcher::Fetcher;
+use parsers::KomikDetail;
+use scraper::{scrape_full_komik_list, scrape_komik_detail, scrape_komik_terbaru};
 
 // ============================================================
 // CLI
