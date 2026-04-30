@@ -1,11 +1,11 @@
-# Build release binaries for amd64 (Linux) and Termux (Android)
+# Build release binaries — ALL STATIC, ZERO system dependencies
 #
-# All TLS: pure Rust (rustls) = ZERO system dependencies needed.
+# All TLS: pure Rust (rustls) = no OpenSSL needed.
 # curl → rustls-ffi (static-curl), sqlx → tls-rustls.
 #
 # Targets:
-#   - x86_64-unknown-linux-gnu    → Linux amd64 (Codespace/GitHub Actions)
-#   - aarch64-linux-android       → Termux (Android ARM64) — STATIC binary
+#   - x86_64-unknown-linux-musl     → Linux amd64 — FULLY STATIC (no glibc)
+#   - aarch64-linux-android         → Termux (Android ARM64) — STATIC binary
 
 name: Build Release
 
@@ -25,22 +25,18 @@ permissions:
 
 jobs:
   build:
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             artifact: komikindo-scraper-amd64
-            runner: ubuntu-22.04
-            apt_extra: ''
-            rustflags: ''
+            apt_extra: 'musl-tools'
           - target: aarch64-linux-android
             artifact: komikindo-scraper-termux
-            runner: ubuntu-latest
             apt_extra: ''
-            rustflags: '-C target-feature=+crt-static'
 
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +45,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install system dependencies
+        if: matrix.apt_extra != ''
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ${{ matrix.apt_extra }}
 
       - name: Setup Android NDK (Termux only)
         if: matrix.target == 'aarch64-linux-android'
@@ -65,13 +67,7 @@ jobs:
           echo "AR_aarch64_linux_android=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> $GITHUB_ENV
           echo "RANLIB_aarch64_linux_android=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib" >> $GITHUB_ENV
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang" >> $GITHUB_ENV
-          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=${{ matrix.rustflags }}" >> $GITHUB_ENV
-
-      - name: Install system dependencies
-        if: matrix.apt_extra != ''
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ${{ matrix.apt_extra }}
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=-C target-feature=+crt-static" >> $GITHUB_ENV
 
       - name: Cache cargo registry & git
         uses: actions/cache@v4
@@ -79,27 +75,25 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ matrix.runner }}-${{ matrix.target }}-cargo-registry-v7-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.target }}-cargo-registry-v8-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.runner }}-${{ matrix.target }}-cargo-registry-v7-
+            ${{ matrix.target }}-cargo-registry-v8-
 
       - name: Cache cargo target
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ matrix.runner }}-${{ matrix.target }}-cargo-target-v7-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.target }}-cargo-target-v8-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.runner }}-${{ matrix.target }}-cargo-target-v7-
+            ${{ matrix.target }}-cargo-target-v8-
 
       - name: Build ${{ matrix.target }}
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --target ${{ matrix.target }} --locked 2>&1
 
       - name: Strip binary
         run: |
           case "${{ matrix.target }}" in
-            x86_64-unknown-linux-gnu)
+            x86_64-unknown-linux-musl)
               strip target/${{ matrix.target }}/release/komikindo-scraper
               ;;
             aarch64-linux-android)
@@ -162,12 +156,14 @@ jobs:
 
             | File | Arch | Platform | Notes |
             |------|------|----------|-------|
-            | `komikindo-scraper-amd64` | x86_64 | Linux (Codespace/GitHub Actions) | glibc 2.35+ (built on Ubuntu 22.04) |
-            | `komikindo-scraper-termux` | aarch64 | **Termux (Android)** | **STATIC — no dependencies** |
+            | `komikindo-scraper-amd64` | x86_64 | **Linux** | **STATIC — zero dependencies (musl)** |
+            | `komikindo-scraper-termux` | aarch64 | **Termux (Android)** | **STATIC — zero dependencies** |
+
+            Both binaries are fully self-contained — no glibc, no OpenSSL, no system libraries needed.
 
             ### Which binary?
 
-            - **Linux PC/Server/Codespace**: `komikindo-scraper-amd64`
+            - **Linux PC/Server/Codespace/ANY distro**: `komikindo-scraper-amd64`
             - **Termux on Android**: `komikindo-scraper-termux`
 
             ### Quick Start (Termux)
