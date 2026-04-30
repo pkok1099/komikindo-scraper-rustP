@@ -366,9 +366,14 @@ pub async fn upsert_komik(pool: &PgPool, detail: &KomikDetail) -> Result<(i32, b
 /// Method 2: hanya menyimpan chapter_number dan url.
 /// image-related fields = NULL.
 ///
+/// OPTIMIZED: Uses UNNEST for a single query per komik instead of
+/// dynamic multi-row INSERT strings. This avoids:
+///   - Building a different SQL string for every chunk size (statement cache churn)
+///   - String allocation for parameter placeholders ($1,$2,$3,...)
+///   - sqlx prepared statement cache pollution from one-shot queries
+///
 /// IMPORTANT: Caller MUST call db::setup_schema() + db::ensure_schema() once
-/// before starting the pipeline. This function does NOT call ensure_schema
-/// anymore to avoid slow DDL (ALTER TABLE) inside high-concurrency scenarios.
+/// before starting the pipeline.
 pub async fn upsert_chapters(pool: &PgPool, komik_id: i32, chapters: &[ChapterInfo]) -> Result<usize> {
     if chapters.is_empty() {
         return Ok(0);
@@ -376,35 +381,34 @@ pub async fn upsert_chapters(pool: &PgPool, komik_id: i32, chapters: &[ChapterIn
 
     let upserted = chapters.len();
 
-    // Multi-row INSERT with chunks of 500 (same pattern as batch_write_komik).
-    // Much faster than per-row INSERT — reduces round-trips to the DB.
-    const MULTI_ROW_SIZE: usize = 500;
+    // UNNEST approach: single query with arrays, regardless of chapter count.
+    // Much cleaner than dynamic multi-row INSERT and plays nice with sqlx's
+    // prepared statement cache (same query shape every time).
+
+    // Process in chunks of 500 to avoid PostgreSQL parameter limit (65535)
+    // and keep memory usage reasonable.
+    const CHUNK_SIZE: usize = 500;
     let mut tx = pool.begin().await.context("Failed to begin transaction")?;
 
-    for chunk in chapters.chunks(MULTI_ROW_SIZE) {
-        let mut query_str = String::from(
-            "INSERT INTO chapters (komik_id, chapter_number, chapter_url) VALUES "
-        );
-        let mut param_idx = 1usize;
+    for chunk_chapters in chapters.chunks(CHUNK_SIZE) {
+        let chunk_numbers: Vec<f64> = chunk_chapters.iter().map(|c| c.number).collect();
+        let chunk_urls: Vec<&str> = chunk_chapters.iter().map(|c| c.url.as_str()).collect();
 
-        for (i, _) in chunk.iter().enumerate() {
-            if i > 0 {
-                query_str.push_str(", ");
-            }
-            query_str.push_str(&format!("(${},${},${})", param_idx, param_idx + 1, param_idx + 2));
-            param_idx += 3;
-        }
-        query_str.push_str(
-            " ON CONFLICT (komik_id, chapter_number) DO UPDATE SET chapter_url = EXCLUDED.chapter_url, updated_at = now()"
-        );
-
-        let mut query = sqlx::query(&query_str);
-        for ch in chunk {
-            query = query.bind(komik_id).bind(ch.number).bind(ch.url.as_str());
-        }
-        query.execute(&mut *tx)
-            .await
-            .with_context(|| format!("Failed to multi-row upsert chapters for komik_id={}", komik_id))?;
+        sqlx::query(
+            r#"
+            INSERT INTO chapters (komik_id, chapter_number, chapter_url)
+            SELECT $1, * FROM UNNEST($2::float8[], $3::text[])
+            ON CONFLICT (komik_id, chapter_number) DO UPDATE SET
+                chapter_url = EXCLUDED.chapter_url,
+                updated_at = now()
+            "#,
+        )
+        .bind(komik_id)
+        .bind(&chunk_numbers)
+        .bind(&chunk_urls)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("Failed to UNNEST upsert chapters for komik_id={}", komik_id))?;
     }
 
     tx.commit().await.context("Failed to commit transaction")?;
@@ -417,10 +421,28 @@ pub async fn upsert_chapters(pool: &PgPool, komik_id: i32, chapters: &[ChapterIn
 // ============================================================
 
 /// Sync genres untuk satu komik.
-/// Delete lama, insert baru.
-/// Wrapped in a transaction for atomicity — prevents a window where genre data
-/// is missing if the INSERT fails after the DELETE.
+/// OPTIMIZED: Only does DELETE+INSERT if genre_ids have actually changed.
+/// This avoids a pointless round-trip (DELETE + multi-row INSERT) when
+/// the genre list is identical — common case during re-scrape/upsert.
+/// For Supabase (~200ms RTT per query), this saves ~400ms per unchanged komik.
 pub async fn sync_genres(pool: &PgPool, komik_id: i32, genre_ids: &[i16]) -> Result<usize> {
+    // Check if genres have changed — skip DB work if identical
+    let existing: Vec<i16> = sqlx::query_scalar(
+        "SELECT genre_id FROM komik_genres WHERE komik_id = $1 ORDER BY genre_id"
+    )
+    .bind(komik_id)
+    .fetch_all(pool)
+    .await
+    .context("Failed to load existing genres")?;
+
+    let mut new_sorted: Vec<i16> = genre_ids.to_vec();
+    new_sorted.sort_unstable();
+
+    if existing == new_sorted {
+        return Ok(0); // No change needed — skip DELETE+INSERT entirely
+    }
+
+    // Genres differ — do the sync
     let mut tx = pool.begin().await.context("Failed to begin genre sync transaction")?;
 
     // Delete existing
@@ -437,8 +459,7 @@ pub async fn sync_genres(pool: &PgPool, komik_id: i32, genre_ids: &[i16]) -> Res
 
     let inserted = genre_ids.len();
 
-    // Multi-row INSERT with chunks of 200 (same pattern as batch_write_komik).
-    // Much faster than per-row INSERT — reduces round-trips to the DB.
+    // Multi-row INSERT with chunks of 200.
     const MULTI_GENRE_SIZE: usize = 200;
     for chunk in genre_ids.chunks(MULTI_GENRE_SIZE) {
         let mut query_str = String::from("INSERT INTO komik_genres (komik_id, genre_id) VALUES ");
@@ -1021,32 +1042,6 @@ pub async fn batch_update_latest_chapters(
     .context("Failed to batch update latest chapter numbers")?;
 
     Ok(result.rows_affected() as usize)
-}
-
-/// Update latest_chapter_number for existing komik (smart update optimization).
-/// Used when we detect a new chapter number from /komik-terbaru/ but don't
-/// need to re-scrape the full detail page.
-/// Returns true if the row was actually updated (i.e., the new number is higher).
-pub async fn update_latest_chapter(
-    pool: &PgPool,
-    komik_id: i32,
-    new_chapter_number: f64,
-) -> Result<bool> {
-    let result = sqlx::query(
-        r#"
-        UPDATE komik
-        SET latest_chapter_number = $1
-        WHERE id = $2
-          AND (latest_chapter_number IS NULL OR latest_chapter_number::float8 < $1)
-        "#,
-    )
-    .bind(new_chapter_number)
-    .bind(komik_id)
-    .execute(pool)
-    .await
-    .context("Failed to update latest chapter number")?;
-
-    Ok(result.rows_affected() > 0)
 }
 
 // ============================================================

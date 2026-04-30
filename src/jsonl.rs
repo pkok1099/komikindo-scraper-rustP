@@ -76,33 +76,6 @@ impl BufferedJsonlWriter {
     }
 }
 
-/// Append satu komik ke JSONL file.
-#[allow(dead_code)]
-pub fn append_jsonl(filepath: &Path, komik: &KomikDetail) -> std::io::Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(filepath)?;
-
-    let mut bytes = serde_json::to_vec(komik).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-    })?;
-    bytes.push(b'\n');
-    file.write_all(&bytes)?;
-    Ok(())
-}
-
-/// Append raw JSON string ke JSONL file.
-#[allow(dead_code)]
-pub fn append_jsonl_raw(filepath: &Path, json_str: &str) -> std::io::Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(filepath)?;
-    writeln!(file, "{}", json_str)?;
-    Ok(())
-}
-
 /// Hitung baris di JSONL file.
 pub fn count_jsonl(filepath: &Path) -> usize {
     if !filepath.exists() {

@@ -32,91 +32,9 @@ static SEL_KOMIK_LIST_FALLBACK: LazyLock<Selector> =
 
 /// Genre map: cached once, reused for all detail parses.
 /// Eliminates 82-entry HashMap allocation per komik (8677x savings).
+/// Now references config::build_genre_map() — single source of truth.
 static GENRE_MAP: LazyLock<HashMap<&'static str, i16>> = LazyLock::new(|| {
-    let mut m = HashMap::new();
-    m.insert("Action", 1);
-    m.insert("Adult", 2);
-    m.insert("Adventure", 3);
-    m.insert("Aliens", 4);
-    m.insert("Animals", 5);
-    m.insert("Arts", 6);
-    m.insert("Boys' Love", 7);
-    m.insert("Comedy", 8);
-    m.insert("Cooking", 9);
-    m.insert("Crime", 10);
-    m.insert("Crossdressing", 11);
-    m.insert("Delinquents", 12);
-    m.insert("Demons", 13);
-    m.insert("Drama", 14);
-    m.insert("Drama Supernatural", 15);
-    m.insert("Ecchi", 16);
-    m.insert("Fantasy", 17);
-    m.insert("Gender Bender", 18);
-    m.insert("Genderswap", 19);
-    m.insert("Ghosts", 20);
-    m.insert("Girls' Love", 21);
-    m.insert("Gore", 22);
-    m.insert("Gyaru", 23);
-    m.insert("Harem", 24);
-    m.insert("Historical", 25);
-    m.insert("Horror", 26);
-    m.insert("Incest", 27);
-    m.insert("Isekai", 28);
-    m.insert("Josei", 29);
-    m.insert("Life", 30);
-    m.insert("Loli", 31);
-    m.insert("Mafia", 32);
-    m.insert("Magic", 33);
-    m.insert("Magical Girls", 34);
-    m.insert("Martial", 35);
-    m.insert("Martial Arts", 36);
-    m.insert("Mature", 37);
-    m.insert("Mecha", 38);
-    m.insert("Medical", 39);
-    m.insert("Military", 40);
-    m.insert("Monster Girls", 41);
-    m.insert("Monsters", 42);
-    m.insert("Music", 43);
-    m.insert("Mystery", 44);
-    m.insert("Ninja", 45);
-    m.insert("Office Workers", 46);
-    m.insert("Philosophical", 47);
-    m.insert("Police", 48);
-    m.insert("Post-Apocalyptic", 49);
-    m.insert("Psychological", 50);
-    m.insert("Reincarnation", 51);
-    m.insert("Reverse Harem", 52);
-    m.insert("Romance", 53);
-    m.insert("Samurai", 54);
-    m.insert("School", 55);
-    m.insert("School Life", 56);
-    m.insert("Sci-Fi", 57);
-    m.insert("Seinen", 58);
-    m.insert("Sexual Violence", 59);
-    m.insert("Shota", 60);
-    m.insert("Shoujo", 61);
-    m.insert("Shoujo Ai", 62);
-    m.insert("Shounen", 63);
-    m.insert("Shounen Ai", 64);
-    m.insert("Slice of Life", 65);
-    m.insert("Smut", 66);
-    m.insert("Sports", 67);
-    m.insert("Superhero", 68);
-    m.insert("Supernatural", 69);
-    m.insert("Survival", 70);
-    m.insert("Thriller", 71);
-    m.insert("Time Travel", 72);
-    m.insert("Traditional Games", 73);
-    m.insert("Traged", 74);
-    m.insert("Tragedy", 75);
-    m.insert("Vampires", 76);
-    m.insert("Video Games", 77);
-    m.insert("Villainess", 78);
-    m.insert("Virtual Reality", 79);
-    m.insert("Wuxia", 80);
-    m.insert("Yuri", 81);
-    m.insert("Zombies", 82);
-    m
+    crate::config::build_genre_map()
 });
 
 // Title selectors (cached)
@@ -614,7 +532,11 @@ fn extract_chapters(document: &Html) -> Vec<ChapterInfo> {
         });
     }
 
-    chapters.sort_by(|a, b| b.number.total_cmp(&a.number));
+    // Sort descending by chapter number (most recent first).
+    // Skip sort if 0 or 1 chapters — no work needed.
+    if chapters.len() > 1 {
+        chapters.sort_by(|a, b| b.number.total_cmp(&a.number));
+    }
     chapters
 }
 

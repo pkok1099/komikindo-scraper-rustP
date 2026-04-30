@@ -335,6 +335,9 @@ pub fn id_to_ext(id: i16) -> &'static str {
 // GENRE MAP (82 hardcoded dari komikindo.ch/daftar-manga/)
 // ============================================================
 
+/// Genre map: 82 hardcoded dari komikindo.ch/daftar-manga/.
+/// This is the SINGLE SOURCE OF TRUTH — parsers.rs references this via `config::build_genre_map()`
+/// instead of maintaining a duplicate copy.
 pub fn build_genre_map() -> HashMap<&'static str, i16> {
     let mut m = HashMap::new();
     m.insert("Action", 1);
