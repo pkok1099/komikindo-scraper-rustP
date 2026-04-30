@@ -80,7 +80,6 @@ pub fn normalize_url(full_url: &str) -> Option<(i16, String)> {
 }
 
 /// Reconstruct full URL dari domain_id dan path.
-#[allow(dead_code)]
 pub fn reconstruct_url(domain_id: i16, path: &str) -> String {
     let base = cdn_id_to_base_url(domain_id);
     format!("{base}/{path}")
@@ -296,7 +295,6 @@ pub struct ChapterInfo {
 }
 
 impl ChapterInfo {
-    #[allow(dead_code)]
     pub fn set_image_data(&mut self, data: ChapterImageData) {
         self.cdn_domain_id = Some(data.cdn_domain_id);
         self.cdn_path_prefix = Some(data.cdn_path_prefix);
@@ -307,7 +305,6 @@ impl ChapterInfo {
 }
 
 /// Optimized image data dari chapter read page.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ChapterImageData {
     pub cdn_domain_id: i16,
@@ -842,7 +839,6 @@ fn extract_chapter_number(title: &str, url: &str) -> Option<f64> {
 // ============================================================
 
 /// Parse chapter read page HTML untuk CDN image URLs.
-#[allow(dead_code)]
 pub fn parse_chapter_images(html: &str) -> ChapterImageData {
     let dom = parse(html, ParserOptions::default()).unwrap_or_else(|_| {
         parse("", ParserOptions::default()).unwrap()
@@ -968,7 +964,6 @@ pub fn parse_chapter_images(html: &str) -> ChapterImageData {
 }
 
 /// Cek apakah URL adalah chapter image (bukan ads/logo).
-#[allow(dead_code)]
 fn is_chapter_image(url: &str) -> bool {
     let url_lower = url.to_lowercase();
 
@@ -1416,7 +1411,6 @@ fn normalize_url_full(raw: &str) -> String {
 // HELPERS
 // ============================================================
 
-#[allow(dead_code)]
 fn find_common_prefix<'a>(paths: &'a [&'a str]) -> &'a str {
     if paths.is_empty() {
         return "";

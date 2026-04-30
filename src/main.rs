@@ -53,7 +53,7 @@ use sqlx::Row;
 use config::BASE_URL;
 use fetcher::Fetcher;
 use parsers::KomikDetail;
-use scraper::{scrape_full_komik_list, scrape_komik_detail, scrape_komik_terbaru};
+use scraper::{scrape_chapter_images, scrape_full_komik_list, scrape_komik_detail, scrape_komik_terbaru};
 
 // ============================================================
 // CLI
@@ -114,7 +114,6 @@ struct Cli {
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
     /// Full fetch semua komik + detail (FULL SPEED)
-    /// Method 2: tanpa image scraping.
     /// Fetch semua data ke JSONL file, TANPA auto upload ke DB.
     /// Gunakan command 'upload-db' untuk upload ke database.
     FullFetch {
@@ -141,6 +140,12 @@ enum Commands {
         /// Automatically upload to DB after fetch completes
         #[arg(long)]
         auto_upload: bool,
+
+        /// Fetch chapter images (CDN URLs) untuk setiap chapter.
+        /// Ini akan fetch setiap halaman chapter, jadi total request = jumlah chapter.
+        /// Signifikan lebih lambat tapi data lengkap dengan image URLs.
+        #[arg(long)]
+        with_images: bool,
     },
 
     /// Smart incremental update dari /komik-terbaru/
@@ -335,6 +340,7 @@ fn main() -> Result<()> {
                 timeout,
                 proxy,
                 auto_upload,
+                with_images,
             } => {
                 run_full_fetch(FullFetchOpts {
                     limit,
@@ -345,6 +351,7 @@ fn main() -> Result<()> {
                     verbose,
                     max_in_flight,
                     auto_upload,
+                    with_images,
                 })
                 .await?;
             }
@@ -1083,7 +1090,7 @@ async fn maybe_connect_db(use_db: bool) -> Option<(PgPool, bool)> {
 }
 
 // ============================================================
-// FULL FETCH (Method 2: tanpa image, dengan optional DB)
+// FULL FETCH (dengan optional chapter image scraping)
 // ============================================================
 
 struct FullFetchOpts {
@@ -1095,6 +1102,7 @@ struct FullFetchOpts {
     verbose: bool,
     max_in_flight: usize,
     auto_upload: bool,
+    with_images: bool,
 }
 
 async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
@@ -1142,11 +1150,12 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
         String::new()
     };
 
+    let mode_label = if opts.with_images { "DENGAN image" } else { "tanpa image" };
     println!("{}", "=".repeat(70));
     println!("  KOMIKINDO FULL FETCH → JSONL (no DB)");
     println!("  Started at {}", dt_start.format("%Y-%m-%d %H:%M:%S"));
     println!("  Timeout: {}s", opts.timeout);
-    println!("  Mode: Method 2 (tanpa image)");
+    println!("  Mode: {mode_label}");
     println!("  Storage: JSONL file");
     println!("  In-flight requests: {}", opts.max_in_flight);
     println!("  NOTE: Gunakan 'upload-db' untuk upload ke database setelah selesai");
@@ -1203,8 +1212,10 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     let success = Arc::new(AtomicUsize::new(0));
     let failed = Arc::new(AtomicUsize::new(0));
     let total_chapters = Arc::new(AtomicUsize::new(0));
+    let total_images = Arc::new(AtomicUsize::new(0));
     let jsonl_path = Arc::new(jsonl_path);
     let writer_fetcher = Arc::clone(&fetcher);
+    let with_images = opts.with_images;
 
     // Sliding window with JoinSet — eliminates chunk barriers for continuous pipelining.
     // The Fetcher's internal semaphore already limits actual HTTP concurrency,
@@ -1220,6 +1231,7 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     let write_success = Arc::clone(&success);
     let write_failed = Arc::clone(&failed);
     let write_ch = Arc::clone(&total_chapters);
+    let write_img = Arc::clone(&total_images);
 
     let fetch_task = tokio::spawn(async move {
         let mut join_set = tokio::task::JoinSet::new();
@@ -1240,9 +1252,29 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
             match result {
                 Ok((slug, detail_result)) => {
                     match detail_result {
-                        Ok(detail) => {
+                        Ok(mut detail) => {
                             let ch_count = detail.chapters.len();
                             write_ch.fetch_add(ch_count, Ordering::Relaxed);
+
+                            // Fetch chapter images if --with-images is set
+                            if with_images && !detail.chapters.is_empty() {
+                                let mut img_count = 0usize;
+                                for chapter in &mut detail.chapters {
+                                    match scrape_chapter_images(&chapter.url, &writer_fetcher).await {
+                                        Ok(img_data) => {
+                                            img_count += img_data.total_images;
+                                            chapter.set_image_data(img_data);
+                                        }
+                                        Err(e) => {
+                                            log::debug!(
+                                                "[IMG] Failed ch.{} {}: {}",
+                                                chapter.number, chapter.url, e
+                                            );
+                                        }
+                                    }
+                                }
+                                write_img.fetch_add(img_count, Ordering::Relaxed);
+                            }
 
                             // Write to JSONL using buffered writer (fast)
                             if let Err(e) = bw.append(&detail) {
@@ -1279,13 +1311,15 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
         }
     });
 
-    // Progress reporter (Phase 1 only)
+    // Progress reporter
     let progress_total = total;
     let progress_start = start_time;
     let progress_fetcher = Arc::clone(&fetcher);
     let progress_success = Arc::clone(&success);
     let progress_failed = Arc::clone(&failed);
     let progress_ch = Arc::clone(&total_chapters);
+    let progress_img = Arc::clone(&total_images);
+    let progress_with_images = opts.with_images;
 
     let progress_handle = tokio::spawn(async move {
         loop {
@@ -1302,12 +1336,18 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
                 0.0
             };
             let stats = progress_fetcher.stats();
+            let img_info = if progress_with_images {
+                format!(" | Img: {}", progress_img.load(Ordering::Relaxed))
+            } else {
+                String::new()
+            };
             eprint!(
                 "  [FETCH {}/{} {:.1}%] {:.0} komik/min | ETA: {:.0}min | \
-                 OK: {} FAIL: {} | Ch: {} | DL: {:.1}MB | req: {}\r",
+                 OK: {} FAIL: {} | Ch: {}{} | DL: {:.1}MB | req: {}\r",
                 c, progress_total, c as f64 / progress_total as f64 * 100.0,
                 rate, eta, s, f,
                 progress_ch.load(Ordering::Relaxed),
+                img_info,
                 stats.mb_downloaded(), stats.requests,
             );
         }
@@ -1337,11 +1377,15 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     let s = success.load(Ordering::Relaxed);
     let f = failed.load(Ordering::Relaxed);
     let ch = total_chapters.load(Ordering::Relaxed);
+    let img = total_images.load(Ordering::Relaxed);
 
     println!();
     println!("  [FETCH DONE] {s} komik, {f} failed, {ch} chapters in {:.1}s ({:.1} min)",
         fetch_elapsed, fetch_elapsed / 60.0);
     println!("  [FETCH RATE] {:.1} komik/min", s as f64 / fetch_elapsed * 60.0);
+    if opts.with_images {
+        println!("  [FETCH IMGS] {img} images scraped");
+    }
 
     let jsonl_size_mb = std::fs::metadata(jsonl_path.as_ref())
         .map(|m| m.len() as f64 / 1024.0 / 1024.0)
@@ -1358,6 +1402,9 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     println!("  Success:        {s}");
     println!("  Failed:         {f}");
     println!("  Chapters:       {ch}");
+    if opts.with_images {
+        println!("  Images:         {img}");
+    }
     println!("  Fetch time:     {:.1}s ({:.1}min) | {:.1} komik/min",
         fetch_elapsed, fetch_elapsed / 60.0,
         s as f64 / fetch_elapsed * 60.0);

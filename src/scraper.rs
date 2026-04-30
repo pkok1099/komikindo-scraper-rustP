@@ -47,7 +47,6 @@ pub async fn scrape_komik_detail(slug: String, fetcher: &Fetcher) -> Result<pars
 ///
 /// **PERBAIKAN**: `chapter_url` sudah dikirim langsung dari hasil parse detail page.
 /// Tidak ada lagi build_chapter_url() yang bisa salah!
-#[allow(dead_code)]
 pub async fn scrape_chapter_images(
     chapter_url: &str,
     fetcher: &Fetcher,
