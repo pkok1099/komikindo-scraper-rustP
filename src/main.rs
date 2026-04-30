@@ -631,8 +631,10 @@ async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
     let fields: Vec<FieldType> = match field.as_str() {
         "title" => vec![FieldType::Title],
         "rating" => vec![FieldType::Rating],
-        "all" => vec![FieldType::Title, FieldType::Rating],
-        other => anyhow::bail!("Unknown field: '{}'. Use: title, rating, or all", other),
+        "genre" => vec![FieldType::Genre],
+        "synopsis" => vec![FieldType::Synopsis],
+        "all" => vec![FieldType::Title, FieldType::Rating, FieldType::Genre, FieldType::Synopsis],
+        other => anyhow::bail!("Unknown field: '{}'. Use: title, rating, genre, synopsis, or all", other),
     };
 
     println!("{}", "=".repeat(70));
@@ -733,6 +735,62 @@ async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
                                         stats.2 += 1;
                                         println!("  [? rating] {}: no detection, SELECTOR={}", slug,
                                             selector_val.map(|v| format!("{:.2}", v)).unwrap_or("(none)".to_string()));
+                                    }
+                                }
+                            }
+                            FieldType::Genre => {
+                                let lm_genres = detector.detect_genres(&html);
+                                let selector_genres = &detail.genre_list;
+                                if lm_genres.is_empty() && selector_genres.is_empty() {
+                                    // Both empty — skip (no genres)
+                                } else if lm_genres.is_empty() {
+                                    stats.2 += 1;
+                                    println!("  [? genre] {}: no LM detection, SELECTOR={:?}", slug, selector_genres);
+                                } else {
+                                    // Check overlap: how many LM genres match selector genres?
+                                    let selector_set: std::collections::HashSet<String> =
+                                        selector_genres.iter().map(|g| g.to_lowercase()).collect();
+                                    let lm_set: std::collections::HashSet<String> =
+                                        lm_genres.iter().map(|g| g.to_lowercase()).collect();
+                                    let overlap: usize = lm_set.intersection(&selector_set).count();
+
+                                    if overlap == selector_set.len() && lm_set.len() == selector_set.len() {
+                                        stats.0 += 1;
+                                        println!("  [✓ genre] {}: {:?} ({}/{} match)", slug, lm_genres, overlap, selector_set.len());
+                                    } else if overlap > 0 {
+                                        // Partial match
+                                        stats.1 += 1;
+                                        println!("  [~ genre] {}: LM={:?} vs SELECTOR={:?} ({}/{} overlap)",
+                                            slug, lm_genres, selector_genres, overlap, selector_set.len());
+                                    } else {
+                                        stats.1 += 1;
+                                        println!("  [✗ genre] {}: LM={:?} vs SELECTOR={:?}", slug, lm_genres, selector_genres);
+                                    }
+                                }
+                            }
+                            FieldType::Synopsis => {
+                                let lm_result = detector.detect_synopsis(&html);
+                                let selector_val = detail.sinopsis.as_deref().unwrap_or("");
+                                match lm_result {
+                                    Some(lm) => {
+                                        // Compare by checking if the LM text contains the key content
+                                        // (synopsis may have extra whitespace/labels)
+                                        let lm_clean = lm.replace(['\n', '\r', '\t'], " ").trim().to_lowercase();
+                                        let sel_clean = selector_val.replace(['\n', '\r', '\t'], " ").trim().to_lowercase();
+                                        // Check if the core content matches (skip "Sinopsis" prefix in LM)
+                                        let lm_core = lm_clean.trim_start_matches("sinopsis").trim();
+                                        let sel_core = sel_clean.trim_start_matches("sinopsis").trim();
+                                        if lm_core.contains(&sel_core[..sel_core.len().min(50)]) || sel_core.contains(&lm_core[..lm_core.len().min(50)]) {
+                                            stats.0 += 1;
+                                            println!("  [✓ synopsis] {}: {} chars (selector={})", slug, lm.len(), selector_val.len());
+                                        } else {
+                                            stats.1 += 1;
+                                            println!("  [✗ synopsis] {}: LM={} chars vs SELECTOR={} chars", slug, lm.len(), selector_val.len());
+                                        }
+                                    }
+                                    None => {
+                                        stats.2 += 1;
+                                        println!("  [? synopsis] {}: no detection, SELECTOR={} chars", slug, selector_val.len());
                                     }
                                 }
                             }

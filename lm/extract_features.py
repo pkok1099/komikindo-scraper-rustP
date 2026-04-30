@@ -202,3 +202,48 @@ def find_rating_node(soup):
         return span
 
     return None
+
+
+def find_genre_nodes(soup):
+    """Find all genre <a> nodes (multi-node field).
+
+    Genre links: a[rel=tag] inside div.genre-info or div.spe.
+    Returns a list of BeautifulSoup elements.
+    """
+    genres = []
+
+    # Primary: a[rel=tag] inside genre containers
+    genre_containers = ['div.genre-info', 'div.spe']
+    for container_sel in genre_containers:
+        container = soup.select_one(container_sel)
+        if container:
+            links = container.find_all('a', rel='tag')
+            if links:
+                genres.extend(links)
+                break
+
+    # Fallback: any a[rel=tag] on the page
+    if not genres:
+        genres = soup.find_all('a', rel='tag')
+
+    return genres
+
+
+def find_synopsis_node(soup):
+    """Find the synopsis/description node (single-node field).
+
+    Synopsis: div.desc inside section.whites
+    """
+    desc = soup.select_one('div.desc')
+    if desc and desc.get_text(strip=True):
+        return desc
+
+    # Fallback: any div with class containing "desc" or "synopsis"
+    for div in soup.find_all('div'):
+        classes = get_classes(div)
+        if any('desc' in c or 'synopsis' in c for c in classes):
+            text = div.get_text(strip=True)
+            if len(text) > 50:  # Synopsis should be substantial text
+                return div
+
+    return None

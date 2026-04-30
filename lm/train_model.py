@@ -243,7 +243,8 @@ def train_field(field_name, input_path, output_dir, hidden_sizes, epochs, cv):
 
 def main():
     parser = argparse.ArgumentParser(description='Train field detection models')
-    parser.add_argument('--field', type=str, default='all', choices=['title', 'rating', 'all'],
+    parser.add_argument('--field', type=str, default='all',
+                        choices=['title', 'rating', 'genre', 'synopsis', 'all'],
                         help='Which field to train')
     parser.add_argument('--output-dir', type=str, default='../models', help='Output directory for ONNX files')
     parser.add_argument('--hidden-sizes', type=str, default='64,32', help='Hidden layer sizes')
@@ -257,7 +258,7 @@ def main():
 
     hidden_sizes = tuple(int(s) for s in args.hidden_sizes.split(','))
 
-    fields = ['title', 'rating'] if args.field == 'all' else [args.field]
+    fields = ['title', 'rating', 'genre', 'synopsis'] if args.field == 'all' else [args.field]
 
     for field_name in fields:
         input_path = lm_dir / f'training_data_{field_name}.npz'

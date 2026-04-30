@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Collect training data using cached HTML from html_cache + fixtures.
 
-Supports multiple fields: title, rating (more can be added).
+Supports multiple fields: title, rating, genre, synopsis (more can be added).
+Multi-node fields (genre) label ALL matching nodes as positive.
 
 Usage:
   python3 collect_training_data.py --field title
   python3 collect_training_data.py --field rating
+  python3 collect_training_data.py --field genre
+  python3 collect_training_data.py --field synopsis
   python3 collect_training_data.py --field all
 """
 
@@ -21,19 +24,43 @@ sys.path.insert(0, str(Path(__file__).parent))
 from bs4 import BeautifulSoup
 from extract_features import (
     extract_features, find_title_node, find_rating_node,
+    find_genre_nodes, find_synopsis_node,
     FEATURE_NAMES, NUM_FEATURES
 )
 
 
 # Map field name → ground truth finder
+# Single-node finders return one element or None
+# Multi-node finders return a list of elements
 FIELD_FINDERS = {
     'title': find_title_node,
     'rating': find_rating_node,
+    'genre': find_genre_nodes,
+    'synopsis': find_synopsis_node,
 }
+
+# Which fields return multiple nodes
+MULTI_NODE_FIELDS = {'genre'}
+
+
+def _node_identity(element):
+    """Create a hashable identity tuple for a DOM element."""
+    return (
+        element.name,
+        tuple(sorted(element.get('class', []))),
+        element.get('id', ''),
+        element.get_text(strip=True)[:100],
+    )
 
 
 def collect_for_field(html_sources, field_name, finder_fn, limit=0):
-    """Collect training data for a specific field."""
+    """Collect training data for a specific field.
+
+    For single-node fields (title, rating, synopsis): one positive node per page.
+    For multi-node fields (genre): all matching nodes are positive.
+    """
+    is_multi = field_name in MULTI_NODE_FIELDS
+
     all_features = []
     all_labels = []
     total_positive = 0
@@ -54,17 +81,20 @@ def collect_for_field(html_sources, field_name, finder_fn, limit=0):
 
             soup = BeautifulSoup(html, 'html.parser')
 
-            # Find ground truth node
-            gt_node = finder_fn(soup)
+            # Find ground truth node(s)
+            gt_result = finder_fn(soup)
 
-            gt_identity = None
-            if gt_node:
-                gt_identity = (
-                    gt_node.name,
-                    tuple(sorted(gt_node.get('class', []))),
-                    gt_node.get('id', ''),
-                    gt_node.get_text(strip=True)[:100],
-                )
+            if is_multi:
+                # Multi-node: gt_result is a list of elements
+                gt_nodes = gt_result if gt_result else []
+                gt_identities = set()
+                for node in gt_nodes:
+                    gt_identities.add(_node_identity(node))
+            else:
+                # Single-node: gt_result is one element or None
+                gt_identities = set()
+                if gt_result is not None:
+                    gt_identities.add(_node_identity(gt_result))
 
             # Walk all elements and extract features
             features_list = []
@@ -84,21 +114,15 @@ def collect_for_field(html_sources, field_name, finder_fn, limit=0):
                 features_list.append(feat)
 
                 is_positive = 0
-                if gt_identity is not None:
-                    elem_identity = (
-                        element.name,
-                        tuple(sorted(element.get('class', []))),
-                        element.get('id', ''),
-                        element.get_text(strip=True)[:100],
-                    )
-                    if elem_identity == gt_identity:
-                        is_positive = 1
-                        if len(examples) < 10:
-                            examples.append({
-                                'text': element.get_text(strip=True)[:80],
-                                'classes': element.get('class', []),
-                                'tag': element.name,
-                            })
+                elem_id = _node_identity(element)
+                if elem_id in gt_identities:
+                    is_positive = 1
+                    if len(examples) < 10:
+                        examples.append({
+                            'text': element.get_text(strip=True)[:80],
+                            'classes': element.get('class', []),
+                            'tag': element.name,
+                        })
 
                 labels_list.append(is_positive)
 
@@ -138,9 +162,12 @@ def collect_for_field(html_sources, field_name, finder_fn, limit=0):
 
 
 def main():
+    all_fields = list(FIELD_FINDERS.keys())
+
     parser = argparse.ArgumentParser(description='Collect training data for LM field detection')
     parser.add_argument('--html-dir', type=str, default='html_cache', help='Directory with cached HTML files')
-    parser.add_argument('--field', type=str, default='all', choices=['title', 'rating', 'all'],
+    parser.add_argument('--field', type=str, default='all',
+                        choices=all_fields + ['all'],
                         help='Which field to collect data for')
     parser.add_argument('--limit', type=int, default=0, help='Max pages to process (0=all)')
     args = parser.parse_args()
@@ -168,11 +195,14 @@ def main():
         return
 
     # Determine which fields to process
-    fields = ['title', 'rating'] if args.field == 'all' else [args.field]
+    fields = all_fields if args.field == 'all' else [args.field]
 
     for field_name in fields:
         print(f"\n{'='*60}")
         print(f"  Collecting training data for: {field_name}")
+        is_multi = field_name in MULTI_NODE_FIELDS
+        if is_multi:
+            print(f"  (multi-node field)")
         print(f"{'='*60}")
 
         finder_fn = FIELD_FINDERS[field_name]

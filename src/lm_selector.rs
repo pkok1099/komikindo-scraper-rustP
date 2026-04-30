@@ -47,6 +47,8 @@ const CANDIDATE_TAGS: &[&str] = &[
 pub enum FieldType {
     Title,
     Rating,
+    Genre,
+    Synopsis,
 }
 
 impl FieldType {
@@ -55,6 +57,8 @@ impl FieldType {
         match self {
             FieldType::Title => "models/title_detector.onnx",
             FieldType::Rating => "models/rating_detector.onnx",
+            FieldType::Genre => "models/genre_detector.onnx",
+            FieldType::Synopsis => "models/synopsis_detector.onnx",
         }
     }
 
@@ -66,6 +70,11 @@ impl FieldType {
     /// Output name in the ONNX model
     pub fn output_name(&self) -> &'static str {
         "probability"
+    }
+
+    /// Whether this field has multiple nodes per page
+    pub fn is_multi(&self) -> bool {
+        matches!(self, FieldType::Genre)
     }
 }
 
@@ -129,10 +138,10 @@ impl LmDetector {
 
     /// Create a detector for all supported fields
     pub fn new_all_fields() -> Result<Self> {
-        Self::new(&[FieldType::Title, FieldType::Rating])
+        Self::new(&[FieldType::Title, FieldType::Rating, FieldType::Genre, FieldType::Synopsis])
     }
 
-    /// Detect a specific field in HTML
+    /// Detect a specific field in HTML (single best result)
     pub fn detect(&mut self, field: FieldType, html: &str) -> Option<DetectionResult> {
         let session = self.sessions.get_mut(&field)?;
 
@@ -208,8 +217,8 @@ impl LmDetector {
                         cleaned.to_string()
                     }
                 }
-                FieldType::Rating => {
-                    // Clean rating: just trim whitespace
+                FieldType::Rating | FieldType::Genre | FieldType::Synopsis => {
+                    // Clean: just trim whitespace
                     best_text.trim().to_string()
                 }
             };
@@ -233,6 +242,87 @@ impl LmDetector {
     pub fn detect_rating(&mut self, html: &str) -> Option<f64> {
         self.detect(FieldType::Rating, html)
             .and_then(|r| r.text.parse::<f64>().ok())
+    }
+
+    /// Detect all instances of a multi-node field in HTML.
+    /// Returns all nodes above threshold, sorted by confidence (highest first).
+    pub fn detect_all(&mut self, field: FieldType, html: &str, threshold: f32) -> Vec<DetectionResult> {
+        let session = match self.sessions.get_mut(&field) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+
+        let dom = match tl::parse(html, tl::ParserOptions::default()) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let parser = dom.parser();
+
+        // Step 1: Build node context map via DOM tree walking
+        let contexts = Self::build_node_contexts(&dom, parser);
+
+        // Step 2: Collect candidate nodes above threshold
+        let mut candidates: Vec<DetectionResult> = Vec::new();
+
+        for tag_name in CANDIDATE_TAGS {
+            if let Some(mut iter) = dom.query_selector(tag_name) {
+                while let Some(handle) = iter.next() {
+                    let node = match handle.get(parser) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    let tag = match node.as_tag() {
+                        Some(t) => t,
+                        None => continue,
+                    };
+
+                    let name = tag.name().as_utf8_str();
+                    if SKIP_TAGS.contains(&name.as_ref()) {
+                        continue;
+                    }
+
+                    // Skip empty-text nodes
+                    let text = tag.inner_text(parser).trim().to_string();
+                    if text.is_empty() {
+                        continue;
+                    }
+
+                    // Look up structural context
+                    let node_id = handle.get_inner() as usize;
+                    let ctx = contexts.get(&node_id);
+
+                    // Extract features and run inference
+                    let features = Self::extract_features(tag, parser, &name, ctx);
+                    let prob = Self::infer_session(session, &features).unwrap_or(0.0);
+
+                    if prob > threshold {
+                        let cleaned_text = text.trim().to_string();
+                        candidates.push(DetectionResult {
+                            text: cleaned_text,
+                            confidence: prob,
+                            tag_name: name.as_ref().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Sort by confidence (highest first)
+        candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        candidates
+    }
+
+    /// Convenience method: detect all genre tags
+    pub fn detect_genres(&mut self, html: &str) -> Vec<String> {
+        self.detect_all(FieldType::Genre, html, 0.5)
+            .into_iter()
+            .map(|r| r.text)
+            .collect()
+    }
+
+    /// Convenience method: detect synopsis text
+    pub fn detect_synopsis(&mut self, html: &str) -> Option<String> {
+        self.detect(FieldType::Synopsis, html).map(|r| r.text)
     }
 
     // ================================================================
