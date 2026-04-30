@@ -448,7 +448,7 @@ panic = "abort"        # Smaller binary, no unwind tables
 opt-level = 2          # Dependencies: good optimization, faster compile
 ```
 
-**Result:** Binary ~6MB stripped, optimal runtime performance.
+**Result:** Binary ~7-10MB self-contained (static-pie linked MUSL untuk amd64, statically linked untuk Termux), optimal runtime performance, zero glibc/OpenSSL dependency.
 
 ### 7.2 Static curl + rustls
 

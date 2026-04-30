@@ -117,7 +117,7 @@ sudo apt install ca-certificates
 sudo yum install ca-certificates
 ```
 
-> **Note:** Binary di-compile dengan `static-curl` dan `rustls`, jadi tidak perlu system libcurl atau OpenSSL.
+> **Note:** Binary di-compile dengan `static-curl` dan `rustls`, target MUSL (amd64) / static CRT (arm64). Tidak perlu system libcurl, OpenSSL, maupun glibc — binary berjalan langsung di distro Linux manapun.
 
 ### Konfigurasi
 
@@ -229,16 +229,16 @@ Membuat binary untuk 2 platform:
 
 | Target | Arch | Platform | Notes |
 |--------|------|----------|-------|
-| `x86_64-unknown-linux-gnu` | x86_64 | Linux (Server/PC) | glibc dynamically linked |
-| `aarch64-linux-android` | aarch64 | Termux (Android) | **STATIC** — zero dependencies |
+| `x86_64-unknown-linux-musl` | x86_64 | Linux (Server/PC) | **SELF-CONTAINED** — static-pie linked, zero glibc dependency |
+| `aarch64-linux-android` | aarch64 | Termux (Android) | **SELF-CONTAINED** — statically linked, zero dependency |
 
 **Trigger:**
 - Push tag `v*` (e.g., `git tag v1.2.0 && git push origin v1.2.0`)
 - Manual dispatch dari Actions tab
 
 **Output:**
-- `komikindo-scraper-amd64` — Linux binary
-- `komikindo-scraper-termux` — Termux binary (STATIC)
+- `komikindo-scraper-amd64` — Linux binary (self-contained, zero deps)
+- `komikindo-scraper-termux` — Termux binary (self-contained, zero deps)
 
 ---
 

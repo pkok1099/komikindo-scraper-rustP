@@ -15,7 +15,7 @@ Scraper performa tinggi untuk [KomikIndo](https://komikindo.ch), ditulis dalam R
 - **JSONL Backup** — Output crash-safe format JSONL sebagai fallback/backup, bisa di-resume
 - **Cloudflare Bypass** — Menggunakan `curl` crate dengan TLS fingerprint Chrome, cookie jar, dan header realistis
 - **Connection Reuse** — Thread-local curl handle cache dengan HTTP keep-alive, menghemat 100-200ms TCP+TLS handshake per request
-- **Termux Ready** — Build langsung di Android tanpa OpenSSL dependency (static curl + rustls)
+- **Self-Contained Binary** — Binary amd64 (MUSL) dan Termux (arm64) keduanya 100% static, zero glibc/OpenSSL dependency
 - **GitHub Actions** — Smart update cron setiap 6 jam + manual trigger, build release amd64 & arm64
 - **Diagnostics** — Built-in `debug` dan `check` command untuk troubleshooting connectivity, DB, dan proxy
 
@@ -239,7 +239,7 @@ Proyek ini telah dioptimasi secara ekstensif untuk performa scraping maksimal:
 | **Concurrency** | Semaphore bounded concurrency | Kontrol in-flight requests |
 | **Concurrency** | Chunked task spawning (200/chunk) | Hindari OOM dari spawning semua sekaligus |
 | **Concurrency** | parking_lot::Mutex | ~30-50ns less overhead vs std::sync::Mutex |
-| **Build** | LTO + codegen-units=1 + strip + panic=abort | Binary kecil (~6MB) dan optimal |
+| **Build** | LTO + codegen-units=1 + strip + panic=abort + MUSL | Binary self-contained (~7-10MB), zero dependency |
 
 > Lihat [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) untuk penjelasan detail setiap optimisasi.
 
@@ -268,12 +268,12 @@ Proyek ini telah dioptimasi secara ekstensif untuk performa scraping maksimal:
 
 | Metric | Python (aiohttp) | Rust (curl, optimized) |
 |--------|-----------------|------------------------|
-| Binary Size | N/A (interpreter) | ~6 MB (stripped) |
+| Binary Size | N/A (interpreter) | ~7-10 MB (self-contained static) |
 | RAM Usage | ~100-200 MB | ~10-20 MB |
 | Startup Time | ~1-2s | ~0.01s |
 | Max Concurrent Requests | ~50-100 | 512+ (configurable) |
 | Connection Reuse | Limited | Thread-local cache + keep-alive |
-| Dependencies | pip install 10+ packages | Single binary (static) |
+| Dependencies | pip install 10+ packages | Single binary (static, zero deps) |
 | Termux Compatible | Tidak stabil | Full support |
 | Cloudflare Bypass | Unreliable | Chrome TLS fingerprint |
 
@@ -330,8 +330,8 @@ Workflow `update.yml` berjalan otomatis setiap **6 jam** (07:00, 13:00, 19:00, 0
 ### Build Release
 
 Workflow `release.yml` membuat binary untuk:
-- **amd64** (`x86_64-unknown-linux-gnu`) — Linux PC/Server/Codespace
-- **arm64** (`aarch64-linux-android`) — **Termux (Android)** — STATIC binary
+- **amd64** (`x86_64-unknown-linux-musl`) — Linux PC/Server/Codespace — **self-contained** (static-pie linked, zero glibc dependency)
+- **arm64** (`aarch64-linux-android`) — **Termux (Android)** — **self-contained** (statically linked, zero dependency)
 
 Trigger: push tag `v*` atau manual dispatch.
 
