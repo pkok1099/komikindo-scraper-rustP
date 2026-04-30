@@ -11,8 +11,7 @@ name: Smart Update
 
 on:
   schedule:
-    # Every 6 hours (UTC) = 07:00, 13:00, 19:00, 01:00 WIB
-  #  - cron: '0 0,6,12,18 * * *'
+    - cron: '0 0,6,12,18 * * *'
   workflow_dispatch:
 
 permissions:
@@ -22,6 +21,8 @@ jobs:
   update:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Only run on default branch (main) for scheduled runs
+    if: github.event_name != 'schedule' || github.ref == 'refs/heads/main'
     env:
       RUST_LOG: warn
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -31,16 +32,23 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
+      - name: Cache cargo registry & git
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-rustls-v2-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-v6-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-rustls-v2-
+            ${{ runner.os }}-cargo-registry-v6-
+
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-v6-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-v6-
 
       # No system dependencies needed (all rustls, static-curl)
       - name: Build

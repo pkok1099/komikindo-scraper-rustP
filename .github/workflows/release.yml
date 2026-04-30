@@ -13,9 +13,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v1.1.1)'
+        description: 'Release tag (e.g. v1.2.0)'
         required: false
-        default: 'v1.1.1'
+        default: 'v1.2.0'
   push:
     tags:
       - 'v*'
@@ -71,16 +71,23 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ${{ matrix.apt_extra }}
 
-      - name: Cache cargo
+      - name: Cache cargo registry & git
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ matrix.target }}-rustls-v5-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.target }}-cargo-registry-v6-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.target }}-rustls-v5-
+            ${{ matrix.target }}-cargo-registry-v6-
+
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ matrix.target }}-cargo-target-v6-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.target }}-cargo-target-v6-
 
       - name: Build ${{ matrix.target }}
         env:
@@ -132,11 +139,17 @@ jobs:
           ls -lh release/komikindo-scraper-*
           file release/komikindo-scraper-*
 
+      - name: Determine release tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          name: "KomikIndo Scraper ${{ github.event.inputs.tag || github.ref_name }}"
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "KomikIndo Scraper ${{ steps.tag.outputs.tag }}"
           body: |
             ## KomikIndo Scraper - Rust Release
 
@@ -154,7 +167,7 @@ jobs:
 
             ```bash
             pkg install ca-certificates
-            wget -q https://github.com/pkok1099/komikindo-scraper-rust/releases/download/v1.1.1/komikindo-scraper-termux
+            wget -q https://github.com/pkok1099/komikindo-scraper-rust/releases/download/${{ steps.tag.outputs.tag }}/komikindo-scraper-termux
             chmod +x komikindo-scraper-termux
             echo "DATABASE_URL=postgresql://user:pass@host:5432/postgres" > .env
             ./komikindo-scraper-termux debug
@@ -163,7 +176,7 @@ jobs:
             ### Quick Start (Linux)
 
             ```bash
-            wget -q https://github.com/pkok1099/komikindo-scraper-rust/releases/download/v1.1.1/komikindo-scraper-amd64
+            wget -q https://github.com/pkok1099/komikindo-scraper-rust/releases/download/${{ steps.tag.outputs.tag }}/komikindo-scraper-amd64
             chmod +x komikindo-scraper-amd64
             echo "DATABASE_URL=postgresql://user:pass@host:5432/postgres" > .env
             ./komikindo-scraper-amd64 debug
