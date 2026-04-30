@@ -1,34 +1,75 @@
 # KomikIndo Scraper (Rust)
 
-Scraper untuk [KomikIndo](https://komikindo.ch) yang ditulis di Rust. Dirancang untuk berjalan di **Termux (Android)** dan **GitHub Actions**.
+Scraper performa tinggi untuk [KomikIndo](https://komikindo.ch), ditulis dalam Rust. Dirancang untuk scrape **8677+ komik** dari komikindo.id dan menyimpannya ke **Supabase PostgreSQL** dengan kecepatan target **300+ komik/menit**.
 
 > **Method 2: Tanpa image** — hanya menyimpan metadata komik, daftar chapter (nomor + URL), dan genre. Tidak ada image scraping.
 
-## Fitur
+---
 
-- **Configurable Speed** — concurrency bisa di-limit (lebih aman untuk CPU/RAM)
-- **Smart Update** — incremental update dari halaman `/komik-terbaru/`, deteksi komik baru & chapter baru
-- **Supabase DB** — upsert otomatis ke PostgreSQL (komik, chapters, genres, scrape log)
-- **JSONL Backup** — output crash-safe format JSONL sebagai fallback/backup
-- **Cloudflare Bypass** — menggunakan `curl` crate dengan TLS fingerprint Chrome
-- **Termux Ready** — build langsung di Android tanpa OpenSSL dependency
-- **GitHub Actions** — cron setiap 6 jam + manual trigger, build & deploy otomatis
+## Fitur Utama
+
+- **Full Fetch Paralel** — Scrape semua 8677+ komik secara paralel dengan concurrency terkontrol (default 512 in-flight requests)
+- **Smart Update** — Incremental update dari `/komik-terbaru/`, deteksi komik baru & chapter baru tanpa re-scrape seluruh detail
+- **Two-Phase Pipeline** — Phase 1: fetch ke JSONL (ringan, crash-safe), Phase 2: batch import ke database
+- **Supabase DB** — Upsert otomatis ke PostgreSQL (komik, chapters, genres, scrape log) dengan batch UNNEST
+- **JSONL Backup** — Output crash-safe format JSONL sebagai fallback/backup, bisa di-resume
+- **Cloudflare Bypass** — Menggunakan `curl` crate dengan TLS fingerprint Chrome, cookie jar, dan header realistis
+- **Connection Reuse** — Thread-local curl handle cache dengan HTTP keep-alive, menghemat 100-200ms TCP+TLS handshake per request
+- **Termux Ready** — Build langsung di Android tanpa OpenSSL dependency (static curl + rustls)
+- **GitHub Actions** — Smart update cron setiap 6 jam + manual trigger, build release amd64 & arm64
+- **Diagnostics** — Built-in `debug` dan `check` command untuk troubleshooting connectivity, DB, dan proxy
+
+---
+
+## Arsitektur
+
+```
+komikindo-scraper-rust/
+├── Cargo.toml                  # Dependencies & build config (jemalloc, LTO, static curl)
+├── .github/workflows/
+│   ├── update.yml              # Cron setiap 6 jam → smart update → Supabase DB
+│   └── release.yml             # Build release amd64 + arm64 (Termux)
+├── src/
+│   ├── main.rs                 # CLI entry point, full-fetch & update runner
+│   ├── config.rs               # Constants, genre maps, URL builders, env config
+│   ├── fetcher.rs              # Async HTTP client (curl + Cloudflare bypass + connection reuse)
+│   ├── parsers.rs              # HTML parsing (scraper crate, LazyLock cached selectors)
+│   ├── db.rs                   # Supabase PostgreSQL: upsert, batch UNNEST, schema ensure
+│   ├── scraper.rs              # High-level scrape logic, smart update pagination
+│   └── jsonl.rs                # JSONL read/write helpers (buffered, resume-friendly)
+├── docs/
+│   ├── ARCHITECTURE.md         # Arsitektur detail & data flow
+│   ├── OPTIMIZATION.md         # Semua optimisasi yang diterapkan
+│   ├── DATABASE.md             # Schema, migration, dan operasi database
+│   ├── CLI.md                  # Referensi CLI lengkap
+│   └── DEPLOYMENT.md           # Panduan deploy (Termux, Server, GitHub Actions)
+├── data/                       # Output JSONL (gitignored)
+└── .env                        # DATABASE_URL (gitignored)
+```
+
+> Lihat [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) untuk detail arsitektur dan data flow.
+
+---
 
 ## Database Schema (Supabase PostgreSQL)
 
 | Tabel | Deskripsi |
 |-------|-----------|
 | `komik` | Metadata: judul, slug, thumbnail, rating, sinopsis, author, chapter count |
-| `chapters` | Daftar chapter per komik (chapter_number only, tanpa image) |
-| `komik_genres` | Relasi many-to-many komik ↔ genre |
-| `scrape_log` | Log hasil scraping (operation, status, totals) |
+| `chapters` | Daftar chapter per komik (chapter_number + chapter_url, tanpa image data) |
+| `komik_genres` | Relasi many-to-many komik ↔ genre (82 genre hardcoded) |
+| `scrape_log` | Log hasil scraping (operation, status, totals, timestamp) |
 
-## Install
+> Lihat [docs/DATABASE.md](docs/DATABASE.md) untuk detail schema, migration, dan contoh query.
+
+---
+
+## Quick Start
 
 ### Termux (Android ARM64)
 
 ```bash
-pkg install rust git
+pkg install rust git ca-certificates
 git clone https://github.com/pkok1099/komikindo-scraper-rust.git
 cd komikindo-scraper-rust
 cargo build --release
@@ -37,7 +78,14 @@ cargo build --release
 
 ### Download Binary (Pre-built)
 
-Lihat [GitHub Releases](https://github.com/pkok1099/komikindo-scraper-rust/releases) untuk binary amd64 dan arm64.
+Lihat [GitHub Releases](https://github.com/pkok1099/komikindo-scraper-rust/releases) untuk binary amd64 dan arm64 (Termux).
+
+```bash
+# Termux
+pkg install ca-certificates
+wget -q https://github.com/pkok1099/komikindo-scraper-rust/releases/latest/download/komikindo-scraper-termux
+chmod +x komikindo-scraper-termux
+```
 
 ### Linux / Server
 
@@ -47,6 +95,8 @@ cd komikindo-scraper-rust
 cargo build --release
 ```
 
+---
+
 ## Usage
 
 ### Environment Variables
@@ -55,6 +105,10 @@ Buat file `.env` di root project:
 
 ```env
 DATABASE_URL=postgresql://postgres.xxx@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres
+PROXY_URL=socks5://127.0.0.1:1080
+PROXY_ENABLED=1
+SCRAPER_RETRIES=3
+SCRAPER_TIMEOUT=30
 ```
 
 > `DATABASE_URL` opsional. Tanpa DB, hasil scrape disimpan ke file JSONL.
@@ -62,118 +116,168 @@ DATABASE_URL=postgresql://postgres.xxx@aws-1-ap-southeast-1.pooler.supabase.com:
 ### Commands
 
 ```bash
-# Smart update (cek komik terbaru, upsert ke DB)
-./komikindo-scraper update
+# --- Connectivity ---
+komikindo-scraper check                              # Test koneksi ke komikindo.ch
+komikindo-scraper check --proxy socks5://...         # Test dengan proxy
+komikindo-scraper -v check                           # Verbose (curl protocol details)
 
-# Smart update dengan database
-./komikindo-scraper update --db
+# --- Diagnostics ---
+komikindo-scraper debug                              # Run semua diagnostic
+komikindo-scraper debug --db                         # Test DB connection saja
+komikindo-scraper debug --network                    # Test network saja
+komikindo-scraper debug --show-env                   # Lihat konfigurasi .env
 
-# Smart update - dry run (lihat apa yang akan berubah)
-./komikindo-scraper update --dry-run
+# --- Full Fetch (Phase 1: ke JSONL) ---
+komikindo-scraper full-fetch                         # Fetch semua komik ke JSONL
+komikindo-scraper full-fetch --limit 50              # Batasi 50 komik saja
+komikindo-scraper full-fetch --resume                # Resume dari JSONL terakhir
+komikindo-scraper full-fetch --start-from "slug"     # Resume dari slug tertentu
+komikindo-scraper full-fetch --auto-upload           # Auto upload ke DB setelah selesai
 
-# Smart update - 5 halaman, filter 12 jam terakhir
-./komikindo-scraper update --max-pages 5 --max-age-minutes 720
+# --- Upload JSONL ke DB (Phase 2) ---
+komikindo-scraper upload-db                          # Upload JSONL terbaru ke DB
+komikindo-scraper upload-db --file data/xxx.jsonl    # Upload file tertentu
+komikindo-scraper upload-db --batch-size 500         # Batch size (default: 1000)
 
-# Full fetch semua komik
-./komikindo-scraper full-fetch
+# --- Smart Update (incremental) ---
+komikindo-scraper update                             # Cek komik terbaru
+komikindo-scraper update --db                        # Update + write ke DB
+komikindo-scraper update --dry-run                   # Preview perubahan tanpa save
+komikindo-scraper update --max-pages 5               # Fetch 5 halaman /komik-terbaru/
+komikindo-scraper update --max-age-minutes 720       # Filter 12 jam terakhir
 
-# Full fetch - limit 50 komik
-./komikindo-scraper full-fetch --limit 50
+# --- DB Management ---
+komikindo-scraper db-setup                           # Buat schema (tables, indexes, triggers)
+komikindo-scraper db-show                            # Lihat data komik di DB
+komikindo-scraper db-show --slug "one-piece"         # Detail komik tertentu
+komikindo-scraper db-detail --slug "one-piece"       # Full detail (JSON)
+komikindo-scraper db-schema --table komik            # Lihat schema tabel
+komikindo-scraper db-reset                           # TRUNCATE semua data
+komikindo-scraper db-drop-all                        # DROP semua tabel (DANGER!)
 
-# Full fetch ke database
-./komikindo-scraper full-fetch --db
+# --- Homepage ---
+komikindo-scraper homepage                           # Cek update terbaru dari homepage
 
-# Full fetch - resume dari slug tertentu
-./komikindo-scraper full-fetch --start-from "nano-machine"
-
-# Homepage check
-./komikindo-scraper homepage
+# --- Benchmark ---
+komikindo-scraper bench-parse --kind list            # Benchmark parse komik list
+komikindo-scraper bench-parse --kind detail --slug "one-piece"  # Benchmark parse detail
 ```
 
-### Full CLI Reference
+### Performance Tuning
 
-```
-komikindo-scraper [COMMAND]
+```bash
+# Tingkatkan concurrency (default: 512)
+komikindo-scraper full-fetch --max-in-flight 1024 --max-blocking-threads 1024
 
-Commands:
-  full-fetch    Fetch semua komik + detail (FULL SPEED)
-  update        Smart incremental update dari /komik-terbaru/
-  homepage      Scrape homepage untuk cek update terbaru
+# Kurangi concurrency untuk RAM/CPU terbatas (Termux)
+komikindo-scraper full-fetch --max-in-flight 64 --max-blocking-threads 64
 
-Options:
-  --db              Write ke database (requires DATABASE_URL)
-  --limit <N>       Batasi jumlah komik (0 = semua)
-  --start-from <slug>  Resume dari slug tertentu
-  --resume          Resume dari JSONL terakhir
-  --max-pages <N>   Max halaman /komik-terbaru/ (default: 3)
-  --max-age-minutes <N>  Filter entry terbaru dalam N menit (default: 360)
-  --dry-run         Hanya tampilkan perubahan, tanpa save
-  --proxy <URL>     SOCKS5/HTTP proxy
-  --timeout <SEC>   Timeout per request (default: 30)
-  --worker-threads <N>        Limit CPU (Tokio worker threads)
-  --max-blocking-threads <N>  Limit thread pool untuk curl (default: 256)
-  --max-in-flight <N>         Limit request aktif bersamaan (default: 64)
+# Custom worker threads
+komikindo-scraper full-fetch --worker-threads 4
 ```
 
-## GitHub Actions
+> Lihat [docs/CLI.md](docs/CLI.md) untuk referensi lengkap semua command dan flag.
 
-### Smart Update (Cron)
+---
 
-Workflow `update.yml` berjalan otomatis setiap **6 jam** (07:00, 13:00, 19:00, 01:00 WIB).
+## Two-Phase Pipeline
 
-**Setup:**
-1. Tambahkan secret `DATABASE_URL` di repo Settings > Secrets and variables > Actions
-2. Workflow akan otomatis build, run update, dan push hasil ke branch `data`
+Proyek ini menggunakan arsitektur **two-phase pipeline** untuk memisahkan fetching data dari database write:
 
-**Manual trigger:** Actions tab > Smart Update > Run workflow
-
-### Build Release
-
-Workflow `release.yml` membuat binary untuk amd64 dan arm64. Trigger manual atau push tag `v*`.
-
-## Arsitektur
+### Phase 1: Fetch → JSONL
 
 ```
-komikindo-scraper-rust/
-├── Cargo.toml              # Dependencies & build config
-├── .github/workflows/
-│   ├── update.yml          # Cron setiap 6 jam → Supabase DB
-│   └── release.yml         # Build release amd64 + arm64
-├── src/
-│   ├── main.rs             # CLI entry point, full fetch & update runner
-│   ├── config.rs           # Constants, genre maps, URL builders, env config
-│   ├── db.rs               # Supabase PostgreSQL: upsert, sync, log
-│   ├── fetcher.rs          # Async HTTP client (curl crate + Cloudflare bypass)
-│   ├── parsers.rs          # HTML parsing (scraper crate)
-│   ├── scraper.rs          # High-level scrape logic, smart update
-│   └── jsonl.rs            # JSONL read/write helpers
-├── data/                   # Output JSONL (gitignored)
-└── .env                    # DATABASE_URL (gitignored)
+komikindo-scraper full-fetch
 ```
+
+- Fetch semua 8677+ komik secara paralel ke file JSONL
+- Tidak ada DB write — proses ringan dan cepat
+- Crash-safe: setiap komik ditulis langsung ke JSONL (append-only)
+- Resume: `--resume` atau `--start-from <slug>` untuk melanjutkan
+
+### Phase 2: JSONL → Database
+
+```
+komikindo-scraper upload-db
+```
+
+- Baca JSONL dan batch insert ke Supabase PostgreSQL
+- Menggunakan UNNEST untuk batch upsert (1 query untuk N komik)
+- Batch size configurable (default: 1000)
+
+### Alternative: Auto Upload
+
+```bash
+komikindo-scraper full-fetch --auto-upload
+```
+
+Otomatis upload ke DB setelah fetch selesai (single command).
+
+---
+
+## Optimisasi
+
+Proyek ini telah dioptimasi secara ekstensif untuk performa scraping maksimal:
+
+| Area | Optimisasi | Dampak |
+|------|-----------|--------|
+| **HTTP** | Thread-local curl handle cache (connection reuse) | Hemat 100-200ms TCP+TLS handshake per request |
+| **HTTP** | TCP_NODELAY (disable Nagle's algorithm) | Hemat ~6-29 menit across 8677 requests |
+| **HTTP** | HTTP/2 pipewait + keep-alive | Multiplexing pada koneksi yang sama |
+| **HTTP** | FORBID_REUSE pada 429 + reset | Fresh connection tanpa rebuild handle |
+| **HTTP** | DNS cache 3600s, maxage_conn 120s | Hindari repeated DNS + stale connection cleanup |
+| **Parsing** | LazyLock cached selectors & regex | Zero per-call regex/selector compilation |
+| **Parsing** | Pre-allocated Vec with capacity | Kurangi re-allocation |
+| **I/O** | BufWriter 1MB + thread-local serialize buf | Amortized disk I/O |
+| **I/O** | Tail-seek untuk last_slug_from_jsonl | Baca 64KB bukan 18MB |
+| **Memory** | jemalloc global allocator | 5-15% improvement untuk allocation-heavy workloads |
+| **Memory** | UnsafeCell zero-copy response | Vec<u8> → String tanpa clone |
+| **Memory** | Arc<str> shared config | Hindari clone per request |
+| **DB** | Batch UNNEST upsert | 1 query untuk N komik (bukan N query) |
+| **DB** | Multi-row INSERT (500 rows/chunk) | Kurangi round-trips ke DB |
+| **DB** | Direct port 5432 (bukan PgBouncer 6543) | Prepared statements support |
+| **Concurrency** | Semaphore bounded concurrency | Kontrol in-flight requests |
+| **Concurrency** | Chunked task spawning (200/chunk) | Hindari OOM dari spawning semua sekaligus |
+| **Concurrency** | parking_lot::Mutex | ~30-50ns less overhead vs std::sync::Mutex |
+| **Build** | LTO + codegen-units=1 + strip + panic=abort | Binary kecil (~6MB) dan optimal |
+
+> Lihat [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) untuk penjelasan detail setiap optimisasi.
+
+---
 
 ## Dependencies
 
 | Crate | Fungsi |
 |-------|--------|
-| `curl` | HTTP client, TLS fingerprint Chrome, Cloudflare bypass |
+| `curl` | HTTP client dengan TLS fingerprint Chrome, static-curl + rustls |
 | `scraper` | HTML parsing (CSS selector) |
-| `sqlx` | PostgreSQL async client (Supabase) |
+| `sqlx` | PostgreSQL async client (Supabase, rustls TLS) |
 | `tokio` | Async runtime (worker + blocking thread pool configurable) |
-| `clap` | CLI argument parser |
+| `clap` | CLI argument parser (derive macro) |
 | `serde` / `serde_json` | Serialization / JSONL |
+| `regex` | Regex dengan LazyLock caching |
 | `chrono` | Date/time |
-| `anyhow` | Error handling |
+| `anyhow` / `thiserror` | Error handling |
+| `parking_lot` | Lightweight Mutex (no poisoning, spin-then-park) |
+| `tikv-jemallocator` | jemalloc global allocator (Linux/macOS only) |
+| `dotenvy` | .env file loading |
 
-## Performance
+---
 
-| Metric | Python (aiohttp) | Rust (curl) |
-|--------|-----------------|-------------|
+## Performance Comparison
+
+| Metric | Python (aiohttp) | Rust (curl, optimized) |
+|--------|-----------------|------------------------|
 | Binary Size | N/A (interpreter) | ~6 MB (stripped) |
 | RAM Usage | ~100-200 MB | ~10-20 MB |
 | Startup Time | ~1-2s | ~0.01s |
-| Concurrent Requests | ~50-100 | 8192 |
-| Dependencies | pip install 10+ packages | Single binary |
+| Max Concurrent Requests | ~50-100 | 512+ (configurable) |
+| Connection Reuse | Limited | Thread-local cache + keep-alive |
+| Dependencies | pip install 10+ packages | Single binary (static) |
 | Termux Compatible | Tidak stabil | Full support |
+| Cloudflare Bypass | Unreliable | Chrome TLS fingerprint |
+
+---
 
 ## Fix dari Python Version
 
@@ -196,6 +300,54 @@ ChapterInfo {
     url: "https://komikindo.ch/nano-machine-chapter-309/",  // dari href
 }
 ```
+
+### Bug Fixes (optimize-beta)
+
+| Bug | Fix |
+|-----|-----|
+| CLI panic (`--env` conflict) | Rename arg ke `--env` dengan proper handling |
+| Error 25P02 (aborted transaction) | Remove try-fallback in transaction |
+| Error 42P10 (invalid column reference) | Add UNIQUE constraint migration |
+| Slow ALTER TABLE on hot path | Move `ensure_schema` to startup |
+| Process death/OOM | Chunked task spawning (200/chunk) |
+
+---
+
+## GitHub Actions
+
+### Smart Update (Cron)
+
+Workflow `update.yml` berjalan otomatis setiap **6 jam** (07:00, 13:00, 19:00, 01:00 WIB).
+
+**Setup:**
+1. Tambahkan secret `DATABASE_URL` di repo Settings > Secrets and variables > Actions
+2. Workflow otomatis build, run update, dan upsert ke DB
+
+**Manual trigger:** Actions tab > Smart Update > Run workflow
+
+> **Note:** Update bisa gagal jika komikindo.ch memblokir datacenter IPs (Cloudflare challenge).
+
+### Build Release
+
+Workflow `release.yml` membuat binary untuk:
+- **amd64** (`x86_64-unknown-linux-gnu`) — Linux PC/Server/Codespace
+- **arm64** (`aarch64-linux-android`) — **Termux (Android)** — STATIC binary
+
+Trigger: push tag `v*` atau manual dispatch.
+
+---
+
+## Documentation
+
+| File | Deskripsi |
+|------|-----------|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Arsitektur detail, data flow, module overview |
+| [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) | Semua optimisasi yang diterapkan beserta justifikasi |
+| [docs/DATABASE.md](docs/DATABASE.md) | Schema, migration, query examples, troubleshooting |
+| [docs/CLI.md](docs/CLI.md) | Referensi CLI lengkap (semua command dan flag) |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Panduan deploy ke Termux, Server, dan GitHub Actions |
+
+---
 
 ## License
 
