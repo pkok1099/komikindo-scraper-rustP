@@ -79,17 +79,17 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ matrix.target }}-cargo-registry-v6-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.runner }}-${{ matrix.target }}-cargo-registry-v7-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.target }}-cargo-registry-v6-
+            ${{ matrix.runner }}-${{ matrix.target }}-cargo-registry-v7-
 
       - name: Cache cargo target
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ matrix.target }}-cargo-target-v6-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.runner }}-${{ matrix.target }}-cargo-target-v7-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.target }}-cargo-target-v6-
+            ${{ matrix.runner }}-${{ matrix.target }}-cargo-target-v7-
 
       - name: Build ${{ matrix.target }}
         env:
