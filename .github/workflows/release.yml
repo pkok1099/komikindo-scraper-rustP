@@ -25,7 +25,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -33,10 +33,12 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             artifact: komikindo-scraper-amd64
+            runner: ubuntu-22.04
             apt_extra: ''
             rustflags: ''
           - target: aarch64-linux-android
             artifact: komikindo-scraper-termux
+            runner: ubuntu-latest
             apt_extra: ''
             rustflags: '-C target-feature=+crt-static'
 
@@ -160,7 +162,7 @@ jobs:
 
             | File | Arch | Platform | Notes |
             |------|------|----------|-------|
-            | `komikindo-scraper-amd64` | x86_64 | Linux (Codespace/GitHub Actions) | glibc |
+            | `komikindo-scraper-amd64` | x86_64 | Linux (Codespace/GitHub Actions) | glibc 2.35+ (built on Ubuntu 22.04) |
             | `komikindo-scraper-termux` | aarch64 | **Termux (Android)** | **STATIC — no dependencies** |
 
             ### Which binary?
