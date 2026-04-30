@@ -42,7 +42,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use clap::Parser;
 use std::collections::HashMap;
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -1150,7 +1150,7 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
         String::new()
     };
 
-    let mode_label = if opts.with_images { "DENGAN image" } else { "tanpa image" };
+    let mode_label = if opts.with_images { "DENGAN image (two-phase)" } else { "tanpa image" };
     println!("{}", "=".repeat(70));
     println!("  KOMIKINDO FULL FETCH → JSONL (no DB)");
     println!("  Started at {}", dt_start.format("%Y-%m-%d %H:%M:%S"));
@@ -1212,10 +1212,8 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     let success = Arc::new(AtomicUsize::new(0));
     let failed = Arc::new(AtomicUsize::new(0));
     let total_chapters = Arc::new(AtomicUsize::new(0));
-    let total_images = Arc::new(AtomicUsize::new(0));
     let jsonl_path = Arc::new(jsonl_path);
     let writer_fetcher = Arc::clone(&fetcher);
-    let with_images = opts.with_images;
 
     // Sliding window with JoinSet — eliminates chunk barriers for continuous pipelining.
     // The Fetcher's internal semaphore already limits actual HTTP concurrency,
@@ -1231,8 +1229,19 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     let write_success = Arc::clone(&success);
     let write_failed = Arc::clone(&failed);
     let write_ch = Arc::clone(&total_chapters);
-    let write_img = Arc::clone(&total_images);
 
+    // ===================================================================
+    // PHASE 1: Fetch semua komik detail → JSONL (TANPA image, super cepat)
+    //
+    // Two-phase pipeline untuk --with-images:
+    //   Phase 1: Detail saja → ~4500 komik/min (1 request per komik)
+    //   Phase 2: Chapter images paralel → menggunakan sliding window
+    //            penuh untuk chapter URLs (bukan per-komik sequential)
+    //
+    // Sebelumnya: sequential chapter fetch per komik → 79 komik/min
+    //   (setiap komik block sliding window slot sampai semua chapter
+    //    selesai di-fetch = 50+ request sequential per komik)
+    // ===================================================================
     let fetch_task = tokio::spawn(async move {
         let mut join_set = tokio::task::JoinSet::new();
         let mut slug_iter = komik_list.into_iter();
@@ -1252,31 +1261,12 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
             match result {
                 Ok((slug, detail_result)) => {
                     match detail_result {
-                        Ok(mut detail) => {
+                        Ok(detail) => {
                             let ch_count = detail.chapters.len();
                             write_ch.fetch_add(ch_count, Ordering::Relaxed);
 
-                            // Fetch chapter images if --with-images is set
-                            if with_images && !detail.chapters.is_empty() {
-                                let mut img_count = 0usize;
-                                for chapter in &mut detail.chapters {
-                                    match scrape_chapter_images(&chapter.url, &writer_fetcher).await {
-                                        Ok(img_data) => {
-                                            img_count += img_data.total_images;
-                                            chapter.set_image_data(img_data);
-                                        }
-                                        Err(e) => {
-                                            log::debug!(
-                                                "[IMG] Failed ch.{} {}: {}",
-                                                chapter.number, chapter.url, e
-                                            );
-                                        }
-                                    }
-                                }
-                                write_img.fetch_add(img_count, Ordering::Relaxed);
-                            }
-
-                            // Write to JSONL using buffered writer (fast)
+                            // Phase 1: tulis detail tanpa image data (cepat!)
+                            // Phase 2 akan enrich dengan image data nanti
                             if let Err(e) = bw.append(&detail) {
                                 eprintln!("  [WARN] JSONL write error: {e}");
                             }
@@ -1311,15 +1301,13 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
         }
     });
 
-    // Progress reporter
+    // Progress reporter (Phase 1 only — no image info during detail fetch)
     let progress_total = total;
     let progress_start = start_time;
     let progress_fetcher = Arc::clone(&fetcher);
     let progress_success = Arc::clone(&success);
     let progress_failed = Arc::clone(&failed);
     let progress_ch = Arc::clone(&total_chapters);
-    let progress_img = Arc::clone(&total_images);
-    let progress_with_images = opts.with_images;
 
     let progress_handle = tokio::spawn(async move {
         loop {
@@ -1336,18 +1324,12 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
                 0.0
             };
             let stats = progress_fetcher.stats();
-            let img_info = if progress_with_images {
-                format!(" | Img: {}", progress_img.load(Ordering::Relaxed))
-            } else {
-                String::new()
-            };
             eprint!(
-                "  [FETCH {}/{} {:.1}%] {:.0} komik/min | ETA: {:.0}min | \
-                 OK: {} FAIL: {} | Ch: {}{} | DL: {:.1}MB | req: {}\r",
+                "  [PHASE 1 {}/{} {:.1}%] {:.0} komik/min | ETA: {:.0}min | \
+                 OK: {} FAIL: {} | Ch: {} | DL: {:.1}MB | req: {}\r",
                 c, progress_total, c as f64 / progress_total as f64 * 100.0,
                 rate, eta, s, f,
                 progress_ch.load(Ordering::Relaxed),
-                img_info,
                 stats.mb_downloaded(), stats.requests,
             );
         }
@@ -1373,24 +1355,267 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     buffered_writer.flush()?;
 
     let fetch_elapsed = start_time.elapsed().as_secs_f64();
-    let stats = fetcher.stats();
+    let mut stats = fetcher.stats();
     let s = success.load(Ordering::Relaxed);
     let f = failed.load(Ordering::Relaxed);
     let ch = total_chapters.load(Ordering::Relaxed);
-    let img = total_images.load(Ordering::Relaxed);
+    let mut img = 0usize;
 
     println!();
-    println!("  [FETCH DONE] {s} komik, {f} failed, {ch} chapters in {:.1}s ({:.1} min)",
+    println!("  [PHASE 1 DONE] {s} komik, {f} failed, {ch} chapters in {:.1}s ({:.1} min)",
         fetch_elapsed, fetch_elapsed / 60.0);
-    println!("  [FETCH RATE] {:.1} komik/min", s as f64 / fetch_elapsed * 60.0);
-    if opts.with_images {
-        println!("  [FETCH IMGS] {img} images scraped");
+    println!("  [PHASE 1 RATE] {:.1} komik/min", s as f64 / fetch_elapsed * 60.0);
+
+    // ===================================================================
+    // PHASE 2: Fetch chapter images (jika --with-images)
+    //
+    // Baca JSONL, kumpulkan semua chapter URL, lalu fetch images secara
+    // paralel menggunakan sliding window (sama seperti Phase 1).
+    //
+    // Keuntungan dibanding sequential per-komik:
+    //   - Sliding window 200 request paralel di semua chapter dari semua komik
+    //   - Tidak ada blocking per-komik (sebelumnya 50+ request sequential per slot)
+    //   - Throughput: ~200 chapter images/detik vs ~5/detik (sequential)
+    // ===================================================================
+    // Track Phase 2 stats for summary (populated only if --with-images)
+    let mut phase2_elapsed = 0.0_f64;
+    let mut phase2_ch_ok = 0usize;
+    let mut phase2_ch_fail = 0usize;
+
+    if opts.with_images && s > 0 {
+        println!("\n{}", "=".repeat(70));
+        println!("  PHASE 2: Fetching chapter images (paralel sliding window)");
+        println!("{}", "=".repeat(70));
+
+        let phase2_start = Instant::now();
+
+        // Baca JSONL → Vec<(slug, Vec<ChapterInfo>)>
+        let jsonl_file = jsonl_path.as_ref();
+        let komik_chapters = {
+            let file = std::fs::File::open(jsonl_file)?;
+            let reader = std::io::BufReader::new(file);
+            let mut chapters_map: Vec<(String, Vec<parsers::ChapterInfo>)> = Vec::new();
+            for line in std::io::BufRead::lines(reader) {
+                let Ok(line) = line else { continue };
+                let trimmed = line.trim();
+                if trimmed.is_empty() { continue; }
+                if let Ok(detail) = serde_json::from_str::<KomikDetail>(trimmed) {
+                    if !detail.chapters.is_empty() {
+                        chapters_map.push((detail.slug.clone(), detail.chapters));
+                    }
+                }
+            }
+            chapters_map
+        };
+
+        // Kumpulkan semua chapter URL dengan index mapping
+        // (komik_idx, chapter_idx, chapter_url)
+        let mut all_chapter_urls: Vec<(usize, usize, String)> = Vec::new();
+        for (kidx, (_, chapters)) in komik_chapters.iter().enumerate() {
+            for (cidx, ch) in chapters.iter().enumerate() {
+                all_chapter_urls.push((kidx, cidx, ch.url.clone()));
+            }
+        }
+
+        let total_chapters_to_fetch = all_chapter_urls.len();
+        let total_komik_with_ch = komik_chapters.len();
+        println!("[PHASE 2] {total_chapters_to_fetch} chapters from {total_komik_with_ch} komik to fetch");
+
+        // Result storage: Vec<Option<ChapterImageData>>
+        let img_results: Arc<std::sync::Mutex<Vec<Option<parsers::ChapterImageData>>>> =
+            Arc::new(std::sync::Mutex::new(vec![None; total_chapters_to_fetch]));
+
+        let img_success = Arc::new(AtomicUsize::new(0));
+        let img_failed = Arc::new(AtomicUsize::new(0));
+        let img_total_images = Arc::new(AtomicUsize::new(0));
+
+        // Sliding window untuk chapter image fetching
+        // Gunakan setengah dari max_in_flight untuk mengurangi rate limiting
+        // (chapter pages lebih banyak → lebih mudah trigger 429)
+        let img_window_size = (opts.max_in_flight / 2).max(50).min(total_chapters_to_fetch);
+        println!("[PHASE 2] Sliding window: {} in-flight chapter requests", img_window_size);
+
+        let phase2_fetcher = Arc::clone(&fetcher);
+        let phase2_urls = Arc::new(all_chapter_urls);
+        let phase2_results = Arc::clone(&img_results);
+        let phase2_img_success = Arc::clone(&img_success);
+        let phase2_img_failed = Arc::clone(&img_failed);
+        let phase2_img_total = Arc::clone(&img_total_images);
+
+        let phase2_task = tokio::spawn(async move {
+            let mut join_set = tokio::task::JoinSet::new();
+            let mut url_iter = (0..total_chapters_to_fetch).into_iter();
+
+            // Fill initial window
+            for idx in url_iter.by_ref().take(img_window_size) {
+                let fetcher = Arc::clone(&phase2_fetcher);
+                let (_, _, url) = &phase2_urls[idx];
+                let url = url.clone();
+                join_set.spawn(async move {
+                    let result = scrape_chapter_images(&url, &fetcher).await;
+                    (idx, result)
+                });
+            }
+
+            // Process results and spawn new tasks as slots free up
+            while let Some(result) = join_set.join_next().await {
+                match result {
+                    Ok((idx, img_result)) => {
+                        match img_result {
+                            Ok(data) => {
+                                let count = data.total_images;
+                                phase2_img_total.fetch_add(count, Ordering::Relaxed);
+                                phase2_img_success.fetch_add(1, Ordering::Relaxed);
+                                // Store result
+                                if let Ok(mut results) = phase2_results.lock() {
+                                    results[idx] = Some(data);
+                                }
+                            }
+                            Err(_) => {
+                                phase2_img_failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        phase2_img_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                // Spawn next task if there are more URLs
+                if let Some(idx) = url_iter.next() {
+                    let fetcher = Arc::clone(&phase2_fetcher);
+                    let (_, _, url) = &phase2_urls[idx];
+                    let url = url.clone();
+                    join_set.spawn(async move {
+                        let result = scrape_chapter_images(&url, &fetcher).await;
+                        (idx, result)
+                    });
+                }
+            }
+        });
+
+        // Progress reporter for Phase 2
+        let p2_total = total_chapters_to_fetch;
+        let p2_start = phase2_start;
+        let p2_fetcher = Arc::clone(&fetcher);
+        let p2_success = Arc::clone(&img_success);
+        let p2_failed = Arc::clone(&img_failed);
+        let p2_img_total = Arc::clone(&img_total_images);
+
+        let p2_progress = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let s2 = p2_success.load(Ordering::Relaxed);
+                let f2 = p2_failed.load(Ordering::Relaxed);
+                let c2 = s2 + f2;
+                if c2 == 0 { continue; }
+                let elapsed = p2_start.elapsed().as_secs_f64();
+                let rate = c2 as f64 / elapsed;
+                let eta = if rate > 0.0 {
+                    (p2_total - c2) as f64 / rate / 60.0
+                } else {
+                    0.0
+                };
+                let stats2 = p2_fetcher.stats();
+                eprint!(
+                    "  [PHASE 2 {}/{} {:.1}%] {:.0} ch/min | ETA: {:.0}min | \
+                     OK: {} FAIL: {} | Img: {} | DL: {:.1}MB | req: {}\r",
+                    c2, p2_total, c2 as f64 / p2_total as f64 * 100.0,
+                    rate * 60.0, eta, s2, f2,
+                    p2_img_total.load(Ordering::Relaxed),
+                    stats2.mb_downloaded(), stats2.requests,
+                );
+            }
+        });
+
+        // Wait for Phase 2 to complete
+        let _ = phase2_task.await;
+        p2_progress.abort();
+
+        phase2_elapsed = phase2_start.elapsed().as_secs_f64();
+        phase2_ch_ok = img_success.load(Ordering::Relaxed);
+        phase2_ch_fail = img_failed.load(Ordering::Relaxed);
+        img = img_total_images.load(Ordering::Relaxed);
+        stats = fetcher.stats();
+
+        println!();
+        println!("  [PHASE 2 DONE] {phase2_ch_ok} chapters OK, {phase2_ch_fail} failed in {:.1}s ({:.1} min)",
+            phase2_elapsed, phase2_elapsed / 60.0);
+        println!("  [PHASE 2 RATE] {:.0} chapters/min, {img} total images",
+            phase2_ch_ok as f64 / phase2_elapsed * 60.0);
+
+        // === Rewrite JSONL with image data ===
+        println!("\n  [MERGE] Rewriting JSONL with image data...");
+        let merge_start = Instant::now();
+
+        let results_guard = img_results.lock().unwrap();
+
+        // Baca ulang JSONL dan enrich dengan image data
+        let jsonl_file = jsonl_path.as_ref();
+        let file = std::fs::File::open(jsonl_file)?;
+        let reader = std::io::BufReader::new(file);
+
+        let mut updated_details: Vec<KomikDetail> = Vec::with_capacity(s);
+        let mut chapter_result_idx = 0usize;
+
+        for line in std::io::BufRead::lines(reader) {
+            let Ok(line) = line else { continue };
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+
+            // Skip error entries
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if val.get("_status").is_some() {
+                    continue;
+                }
+            }
+
+            if let Ok(mut detail) = serde_json::from_str::<KomikDetail>(trimmed) {
+                // Temukan chapter results untuk komik ini
+                // Karena kita iterasi dalam urutan yang sama, chapter_result_idx
+                // akan sesuai dengan all_chapter_urls yang kita buat di atas
+                for chapter in &mut detail.chapters {
+                    if chapter_result_idx < results_guard.len() {
+                        if let Some(ref data) = results_guard[chapter_result_idx] {
+                            chapter.set_image_data(data.clone());
+                        }
+                        chapter_result_idx += 1;
+                    }
+                }
+                updated_details.push(detail);
+            }
+        }
+
+        drop(results_guard);
+
+        // Tulis ulang JSONL ke temporary file, lalu replace file asli
+        // (BufferedJsonlWriter buka dalam append mode, jadi harus pakai file baru)
+        let tmp_jsonl_path = jsonl_file.with_extension("jsonl.tmp");
+        let tmp_file = std::fs::File::create(&tmp_jsonl_path)?;
+        let mut tmp_writer = std::io::BufWriter::with_capacity(1024 * 1024, tmp_file);
+
+        for detail in &updated_details {
+            let json = serde_json::to_string(detail).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+            })?;
+            writeln!(tmp_writer, "{}", json)?;
+        }
+        tmp_writer.flush()?;
+
+        // Atomic rename: replace original file with enriched version
+        std::fs::rename(&tmp_jsonl_path, jsonl_file)?;
+
+        let merge_elapsed = merge_start.elapsed().as_secs_f64();
+        let jsonl_size_mb = std::fs::metadata(jsonl_file)
+            .map(|m| m.len() as f64 / 1024.0 / 1024.0)
+            .unwrap_or(0.0);
+        println!("  [MERGE DONE] {} komik enriched in {:.1}s → {:.1} MB",
+            updated_details.len(), merge_elapsed, jsonl_size_mb);
     }
 
     let jsonl_size_mb = std::fs::metadata(jsonl_path.as_ref())
         .map(|m| m.len() as f64 / 1024.0 / 1024.0)
         .unwrap_or(0.0);
-    println!("  [JSONL] {} ({:.1} MB)", jsonl_path.display(), jsonl_size_mb);
 
     // === Summary ===
     let total_elapsed = start_time.elapsed().as_secs_f64();
@@ -1405,9 +1630,14 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     if opts.with_images {
         println!("  Images:         {img}");
     }
-    println!("  Fetch time:     {:.1}s ({:.1}min) | {:.1} komik/min",
+    println!("  Phase 1 time:   {:.1}s ({:.1}min) | {:.1} komik/min",
         fetch_elapsed, fetch_elapsed / 60.0,
         s as f64 / fetch_elapsed * 60.0);
+    if opts.with_images && phase2_elapsed > 0.0 {
+        println!("  Phase 2 time:   {:.1}s ({:.1}min) | {:.0} ch/min | {phase2_ch_ok} OK {phase2_ch_fail} FAIL",
+            phase2_elapsed, phase2_elapsed / 60.0,
+            phase2_ch_ok as f64 / phase2_elapsed * 60.0);
+    }
     println!("  Total time:     {:.1}s ({:.1}min)",
         total_elapsed, total_elapsed / 60.0);
     println!("  Requests:       {}", stats.requests);
