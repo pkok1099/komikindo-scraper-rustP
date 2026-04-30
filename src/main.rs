@@ -146,6 +146,12 @@ enum Commands {
         /// Signifikan lebih lambat tapi data lengkap dengan image URLs.
         #[arg(long)]
         with_images: bool,
+
+        /// Use LM (ONNX) detector instead of hardcoded CSS selectors for
+        /// title, rating, genre, and synopsis detection.
+        /// Falls back to hardcoded selectors if LM fails.
+        #[arg(long)]
+        lm: bool,
     },
 
     /// Smart incremental update dari /komik-terbaru/
@@ -353,6 +359,7 @@ fn main() -> Result<()> {
                 proxy,
                 auto_upload,
                 with_images,
+                lm,
             } => {
                 run_full_fetch(FullFetchOpts {
                     limit,
@@ -364,6 +371,7 @@ fn main() -> Result<()> {
                     max_in_flight,
                     auto_upload,
                     with_images,
+                    lm,
                 })
                 .await?;
             }
@@ -1324,6 +1332,7 @@ struct FullFetchOpts {
     max_in_flight: usize,
     auto_upload: bool,
     with_images: bool,
+    lm: bool,
 }
 
 async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
@@ -1372,11 +1381,13 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     };
 
     let mode_label = if opts.with_images { "DENGAN image (two-phase)" } else { "tanpa image" };
+    let lm_label = if opts.lm { "LM (ONNX)" } else { "CSS selectors" };
     println!("{}", "=".repeat(70));
     println!("  KOMIKINDO FULL FETCH → JSONL (no DB)");
     println!("  Started at {}", dt_start.format("%Y-%m-%d %H:%M:%S"));
     println!("  Timeout: {}s", opts.timeout);
     println!("  Mode: {mode_label}");
+    println!("  Detection: {lm_label}");
     println!("  Storage: JSONL file");
     println!("  In-flight requests: {}", opts.max_in_flight);
     println!("  NOTE: Gunakan 'upload-db' untuk upload ke database setelah selesai");
@@ -1450,6 +1461,7 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
     let write_success = Arc::clone(&success);
     let write_failed = Arc::clone(&failed);
     let write_ch = Arc::clone(&total_chapters);
+    let opts_lm = opts.lm;
 
     // ===================================================================
     // PHASE 1: Fetch semua komik detail → JSONL (TANPA image, super cepat)
@@ -1467,12 +1479,34 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
         let mut join_set = tokio::task::JoinSet::new();
         let mut slug_iter = komik_list.into_iter();
 
+        // Initialize LM detector if --lm flag is set
+        let lm_detector: Option<Arc<tokio::sync::Mutex<komikindo_scraper::lm_selector::LmDetector>>> = if opts_lm {
+            match komikindo_scraper::lm_selector::LmDetector::new_all_fields() {
+                Ok(detector) => {
+                    println!("[LM] Loaded ONNX models for title, rating, genre, synopsis");
+                    Some(Arc::new(tokio::sync::Mutex::new(detector)))
+                }
+                Err(e) => {
+                    eprintln!("[LM] Failed to load ONNX models: {e}. Falling back to CSS selectors.");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Fill initial window
         for slug in slug_iter.by_ref().take(window_size) {
             let fetcher = Arc::clone(&writer_fetcher);
+            let lm_det = lm_detector.clone();
             join_set.spawn(async move {
                 let slug_clone = slug.clone();
-                let result = scrape_komik_detail(slug, &fetcher).await;
+                let result = if let Some(det) = lm_det {
+                    let mut det_guard = det.lock().await;
+                    scraper::scrape_komik_detail_lm(slug, &fetcher, &mut det_guard).await
+                } else {
+                    scrape_komik_detail(slug, &fetcher).await
+                };
                 (slug_clone, result)
             });
         }
@@ -1513,9 +1547,15 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
             // Spawn next task if there are more slugs
             if let Some(slug) = slug_iter.next() {
                 let fetcher = Arc::clone(&writer_fetcher);
+                let lm_det = lm_detector.clone();
                 join_set.spawn(async move {
                     let slug_clone = slug.clone();
-                    let result = scrape_komik_detail(slug, &fetcher).await;
+                    let result = if let Some(det) = lm_det {
+                        let mut det_guard = det.lock().await;
+                        scraper::scrape_komik_detail_lm(slug, &fetcher, &mut det_guard).await
+                    } else {
+                        scrape_komik_detail(slug, &fetcher).await
+                    };
                     (slug_clone, result)
                 });
             }

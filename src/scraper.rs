@@ -10,6 +10,7 @@ use anyhow::Result;
 use crate::fetcher::Fetcher;
 use crate::parsers;
 use crate::config::{build_komik_url, BASE_URL};
+use crate::lm_selector::LmDetector;
 
 /// Scrape full komik slug list dari daftar-manga page.
 pub async fn scrape_full_komik_list(fetcher: &Fetcher) -> Result<Vec<String>> {
@@ -41,6 +42,21 @@ pub async fn scrape_komik_detail(slug: String, fetcher: &Fetcher) -> Result<pars
     // Parse directly — no spawn_blocking needed (cached selectors make this fast)
     parsers::parse_komik_detail(&slug, &html)
         .ok_or_else(|| anyhow::anyhow!("Gagal parse detail untuk slug: {}", slug))
+}
+
+/// Scrape detail komik using LM detector for title/rating/genre/synopsis.
+/// Falls back to hardcoded selectors if LM detection fails.
+pub async fn scrape_komik_detail_lm(
+    slug: String,
+    fetcher: &Fetcher,
+    detector: &mut LmDetector,
+) -> Result<parsers::KomikDetail> {
+    let komik_url = build_komik_url(&slug);
+    let html = fetcher.fetch_page(&komik_url).await
+        .map_err(|e| anyhow::anyhow!("Gagal fetch detail {}: {e}", komik_url))?;
+
+    parsers::parse_komik_detail_lm(&slug, &html, detector)
+        .ok_or_else(|| anyhow::anyhow!("Gagal parse detail (LM) untuk slug: {}", slug))
 }
 
 /// Scrape chapter image URLs dari chapter read page.

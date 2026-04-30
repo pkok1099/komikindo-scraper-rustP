@@ -1444,3 +1444,307 @@ fn find_common_prefix<'a>(paths: &'a [&'a str]) -> &'a str {
 pub fn build_genre_map() -> HashMap<&'static str, i16> {
     GENRE_MAP.clone()
 }
+
+// ============================================================
+// LM-BASED PARSER (experimental)
+// ============================================================
+
+/// Parse komik detail using LM detector for title/rating/genre/synopsis,
+/// with hardcoded selectors as fallback and for remaining fields.
+///
+/// This replaces the CSS selector "find the node" step with ONNX inference
+/// for the 4 supported fields, while keeping the same post-processing logic
+/// (genre ID lookup, sinopsis cleanup, etc.)
+pub fn parse_komik_detail_lm(
+    slug: &str,
+    html: &str,
+    detector: &mut crate::lm_selector::LmDetector,
+) -> Option<KomikDetail> {
+    use crate::lm_selector::FieldType;
+
+    if html.trim().is_empty() {
+        return None;
+    }
+
+    let dom = parse(html, ParserOptions::default()).ok()?;
+    let parser = dom.parser();
+
+    let mut detail = KomikDetail {
+        slug: slug.to_string(),
+        judul: None,
+        tipe: None,
+        thumb_domain_id: None,
+        thumb_path: None,
+        status_id: None,
+        author: None,
+        artist: None,
+        alternative_title: None,
+        sinopsis: None,
+        rating: None,
+        genre_list: Vec::new(),
+        genre_ids: Vec::new(),
+        chapters: Vec::new(),
+        latest_chapter_number: None,
+        similar: Vec::new(),
+    };
+
+    // === TITLE: LM first, hardcoded fallback ===
+    let lm_title = detector.detect_title(html);
+    match lm_title {
+        Some(title) => {
+            detail.judul = Some(title);
+        }
+        None => {
+            // Fallback to hardcoded selectors
+            let title_simple_sels = ["h1.titless", "h1.entry-title"];
+            for sel in &title_simple_sels {
+                if let Some(mut iter) = dom.query_selector(sel) {
+                    if let Some(handle) = iter.next() {
+                        if let Some(node) = handle.get(parser) {
+                            if let Some(tag) = node.as_tag() {
+                                let title = inner_text_owned(tag, parser);
+                                if !title.is_empty() {
+                                    let cleaned = if title.to_lowercase().starts_with("komik") {
+                                        RE_TITLE_KOMIK_PREFIX.replace(&title, "").trim().to_string()
+                                    } else {
+                                        title
+                                    };
+                                    detail.judul = Some(cleaned);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // === THUMBNAIL ===
+    // Keep hardcoded — thumb detection is not an LM field
+    extract_thumbnail(&dom, parser, &mut detail);
+
+    // === INFO (status, author, alt title) ===
+    // Keep hardcoded — these require bold-label matching, not node detection
+    extract_spe_info(&dom, parser, &mut detail);
+
+    // === GENRE: LM first, hardcoded fallback ===
+    let lm_genres = detector.detect_genres(html);
+    if !lm_genres.is_empty() {
+        detail.genre_list = lm_genres;
+    } else {
+        // Fallback: hardcoded selector
+        let mut genre_links: Vec<String> = Vec::new();
+        let genre_containers = ["div.genre-info", "div.spe"];
+        for container_sel in &genre_containers {
+            if let Some(mut container_iter) = dom.query_selector(container_sel) {
+                if let Some(container_handle) = container_iter.next() {
+                    if let Some(container_node) = container_handle.get(parser) {
+                        if let Some(container_tag) = container_node.as_tag() {
+                            if let Some(link_iter) = container_tag.query_selector(parser, "a[rel='tag']") {
+                                for link_handle in link_iter {
+                                    if let Some(link_node) = link_handle.get(parser) {
+                                        if let Some(link_tag) = link_node.as_tag() {
+                                            let text = inner_text_owned(link_tag, parser);
+                                            if !text.is_empty() {
+                                                genre_links.push(text);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !genre_links.is_empty() {
+                break;
+            }
+        }
+        detail.genre_list = genre_links;
+    }
+
+    // Genre ID lookup (same logic regardless of detection method)
+    detail.genre_ids = Vec::with_capacity(detail.genre_list.len().min(8));
+    for g in &detail.genre_list {
+        if let Some(&gid) = GENRE_MAP.get(g.as_str()) {
+            detail.genre_ids.push(gid);
+        }
+    }
+
+    // === RATING: LM first, hardcoded fallback ===
+    let lm_rating = detector.detect_rating(html);
+    match lm_rating {
+        Some(r) => {
+            detail.rating = Some(r);
+        }
+        None => {
+            // Fallback: hardcoded selector
+            let rating_container_sels = ["div.archiveanime-rating", "div.infoanime-rating", "div.rating"];
+            for container_sel in &rating_container_sels {
+                if let Some(r_text) = find_descendant_text(&dom, parser, container_sel, "i") {
+                    if !r_text.is_empty() {
+                        if let Ok(r) = r_text.parse::<f64>() {
+                            detail.rating = Some(r);
+                            break;
+                        }
+                    }
+                }
+            }
+            if detail.rating.is_none() {
+                if let Some(mut iter) = dom.query_selector("span.skor") {
+                    if let Some(handle) = iter.next() {
+                        if let Some(node) = handle.get(parser) {
+                            if let Some(tag) = node.as_tag() {
+                                let r_text = inner_text_owned(tag, parser);
+                                if !r_text.is_empty() {
+                                    if let Ok(r) = r_text.parse::<f64>() {
+                                        detail.rating = Some(r);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // === SINOPSIS: LM first, hardcoded fallback ===
+    let lm_synopsis = detector.detect_synopsis(html);
+    match lm_synopsis {
+        Some(raw_text) => {
+            // Apply same cleanup as hardcoded parser
+            let mut sinopsis = raw_text;
+            sinopsis = RE_SINOPSIS_PREFIX.replace(&sinopsis, "").to_string();
+            sinopsis = RE_SINOPSIS_TYPE.replace(&sinopsis, "").to_string();
+            sinopsis = sinopsis.trim().to_string();
+            if !sinopsis.is_empty() {
+                detail.sinopsis = Some(sinopsis);
+            }
+        }
+        None => {
+            // Fallback: hardcoded selector
+            let sinopsis_simple_sels = [
+                "div.entry-content.entry-content-single",
+                "div.entry-content",
+            ];
+            for sel in &sinopsis_simple_sels {
+                if let Some(mut iter) = dom.query_selector(sel) {
+                    if let Some(handle) = iter.next() {
+                        if let Some(node) = handle.get(parser) {
+                            if let Some(tag) = node.as_tag() {
+                                let mut sinopsis = inner_text_owned(tag, parser);
+                                sinopsis = RE_SINOPSIS_PREFIX.replace(&sinopsis, "").to_string();
+                                sinopsis = RE_SINOPSIS_TYPE.replace(&sinopsis, "").to_string();
+                                sinopsis = sinopsis.trim().to_string();
+                                if !sinopsis.is_empty() {
+                                    detail.sinopsis = Some(sinopsis);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if detail.sinopsis.is_none() {
+                if let Some(sinopsis_text) = find_descendant_text(&dom, parser, "div#sinopsis", "div.entry-content") {
+                    let mut sinopsis = sinopsis_text;
+                    sinopsis = RE_SINOPSIS_PREFIX.replace(&sinopsis, "").to_string();
+                    sinopsis = RE_SINOPSIS_TYPE.replace(&sinopsis, "").to_string();
+                    sinopsis = sinopsis.trim().to_string();
+                    if !sinopsis.is_empty() {
+                        detail.sinopsis = Some(sinopsis);
+                    }
+                }
+            }
+        }
+    }
+
+    // === CHAPTERS === (hardcoded — container-level, not LM-detected)
+    detail.chapters = extract_chapters(&dom, parser);
+    if let Some(first) = detail.chapters.first() {
+        detail.latest_chapter_number = Some(first.number);
+    }
+
+    // === SIMILAR/MIRIP === (hardcoded — container-level, not LM-detected)
+    detail.similar = extract_similar(&dom, parser);
+
+    Some(detail)
+}
+
+/// Extract thumbnail info (extracted from parse_komik_detail for reuse)
+fn extract_thumbnail(dom: &VDom, parser: &tl::Parser, detail: &mut KomikDetail) {
+    // Try multiple selectors for the thumbnail image
+    let thumb_sels = ["div.thumb img", "div.imgdesc img", "img.wp-post-image"];
+    for sel in &thumb_sels {
+        if let Some(mut iter) = dom.query_selector(sel) {
+            if let Some(handle) = iter.next() {
+                if let Some(node) = handle.get(parser) {
+                    if let Some(tag) = node.as_tag() {
+                        if let Some(src) = get_attr(tag, "src") {
+                            if !src.is_empty() {
+                                if let Some((domain_id, path)) = normalize_thumbnail(src) {
+                                    detail.thumb_domain_id = Some(domain_id);
+                                    detail.thumb_path = Some(path);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Extract info from div.spe (status, author, alt title, type)
+fn extract_spe_info(dom: &VDom, parser: &tl::Parser, detail: &mut KomikDetail) {
+    let mut raw_genre_text: Option<String> = None;
+
+    if let Some(mut spe_iter) = dom.query_selector("div.spe") {
+        if let Some(spe_handle) = spe_iter.next() {
+            if let Some(spe_node) = spe_handle.get(parser) {
+                if let Some(spe_tag) = spe_node.as_tag() {
+                    if let Some(span_iter) = spe_tag.query_selector(parser, "span") {
+                        for span_handle in span_iter {
+                            let Some(node) = span_handle.get(parser) else { continue };
+                            let Some(span_tag) = node.as_tag() else { continue };
+
+                            let bold_text = if let Some(mut bold_iter) = span_tag.query_selector(parser, "b") {
+                                bold_iter.next().and_then(|h| {
+                                    h.get(parser).and_then(|n| n.as_tag().map(|t| inner_text_owned(t, parser)))
+                                })
+                            } else {
+                                None
+                            };
+
+                            let Some(bold) = bold_text else { continue };
+                            let full_text = inner_text_owned(span_tag, parser);
+                            let value = full_text.replace(&bold, "").trim().to_string();
+                            let label = bold.trim().trim_end_matches(':').to_lowercase();
+
+                            if label.contains("genre") {
+                                raw_genre_text = Some(value.clone());
+                            } else if label.contains("status") {
+                                if let Some(id) = status_to_id(&value) {
+                                    detail.status_id = Some(id);
+                                }
+                            } else if label.contains("pengarang") || label.contains("author") {
+                                detail.author = Some(value);
+                            } else if label.contains("ilustrator") || label.contains("artist") {
+                                detail.artist = Some(value);
+                            } else if label.contains("tipe") || label.contains("type") {
+                                if detail.tipe.is_none() {
+                                    detail.tipe = Some(value);
+                                }
+                            } else if label.contains("alternative") || label.contains("alternatif") {
+                                detail.alternative_title = Some(value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
