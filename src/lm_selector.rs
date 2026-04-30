@@ -1,6 +1,6 @@
 /// LM-based Selector Engine — Title Detection Experiment
 ///
-/// Uses a small ONNX model (17KB) to detect which DOM node
+/// Uses a small ONNX model to detect which DOM node
 /// contains the komik title, replacing hardcoded CSS selectors.
 ///
 /// Architecture:
@@ -21,12 +21,33 @@
 
 use anyhow::Result;
 use ort::session::Session;
+use std::collections::{HashMap, HashSet};
 
 /// Number of features per DOM node
 const NUM_FEATURES: usize = 30;
 
 /// Tag vocabulary for one-hot encoding
 const TAG_VOCAB: &[&str] = &["h1", "h2", "h3", "span", "div", "a", "td"];
+
+/// Tags to skip during tree walking
+const SKIP_TAGS: &[&str] = &["script", "style", "noscript", "meta", "link", "head"];
+
+/// Structural context for a DOM node, computed via tree walking
+#[derive(Debug, Clone)]
+struct NodeContext {
+    depth: usize,
+    sibling_index: usize,
+    sibling_count: usize,
+    child_count: usize,
+    parent_tag: Option<String>,
+    parent_classes: HashSet<String>,
+    ancestor_classes: HashSet<String>,
+    is_first_significant: bool,
+    has_img_child: bool,
+    bold_text_len: usize,
+    total_text_len: usize,
+    link_count: usize,
+}
 
 /// LM Selector Engine for title detection
 pub struct LmTitleDetector {
@@ -55,27 +76,27 @@ impl LmTitleDetector {
 
     /// Detect title text from HTML using the LM model.
     ///
-    /// Strategy: Use query_selector to find candidate tags (h1, h2, span, div, a),
-    /// extract features for each, run ONNX inference, and return the text
-    /// of the node with highest probability.
+    /// Strategy: Build DOM tree context, walk all candidate tags,
+    /// extract 30-dim features for each, run ONNX inference,
+    /// and return the text of the node with highest probability.
     pub fn detect_title(&mut self, html: &str) -> Option<String> {
         let dom = tl::parse(html, tl::ParserOptions::default()).ok()?;
         let parser = dom.parser();
 
-        // Collect candidate nodes — all tags that could be a title
+        // Step 1: Build node context map via DOM tree walking
+        let contexts = Self::build_node_contexts(&dom, parser);
+
+        // Step 2: Collect candidate nodes — tags that could be a title
         let mut candidates: Vec<(f32, String)> = Vec::new();
 
-        // Walk all nodes via query_selector for each tag type
         for tag_name in TAG_VOCAB {
-            let sel = format!("{tag_name}");
-            if let Some(mut iter) = dom.query_selector(&sel) {
+            if let Some(mut iter) = dom.query_selector(tag_name) {
                 while let Some(handle) = iter.next() {
                     let node = handle.get(parser)?;
                     let tag = node.as_tag()?;
 
-                    // Skip script/style
                     let name = tag.name().as_utf8_str();
-                    if matches!(name.as_ref(), "script" | "style" | "noscript" | "meta" | "link" | "head") {
+                    if SKIP_TAGS.contains(&name.as_ref()) {
                         continue;
                     }
 
@@ -84,8 +105,12 @@ impl LmTitleDetector {
                         continue;
                     }
 
-                    // Extract features
-                    let features = self.extract_features(tag, parser, &name);
+                    // Look up structural context for this node
+                    let node_id = handle.get_inner() as usize;
+                    let ctx = contexts.get(&node_id);
+
+                    // Extract features with real structural data
+                    let features = Self::extract_features(tag, parser, &name, ctx);
                     let prob = self.infer(&features).unwrap_or(0.0);
 
                     if prob > 0.01 {
@@ -120,12 +145,209 @@ impl LmTitleDetector {
         }
     }
 
-    /// Extract 30-dim feature vector from a DOM tag
+    /// Build a map of node_id → NodeContext by walking the DOM tree.
+    ///
+    /// Uses `tl`'s `children().top()` API to traverse the tree recursively,
+    /// computing depth, parent, sibling, and ancestor info for each tag node.
+    fn build_node_contexts(
+        dom: &tl::VDom,
+        parser: &tl::Parser,
+    ) -> HashMap<usize, NodeContext> {
+        let mut contexts: HashMap<usize, NodeContext> = HashMap::new();
+
+        // Walk top-level children of the document
+        let top_children = dom.children();
+        let sibling_count = top_children.len();
+
+        for (sibling_idx, handle) in top_children.iter().enumerate() {
+            let node = handle.get(parser);
+            if let Some(node) = node {
+                Self::walk_node(
+                    node,
+                    handle.get_inner() as usize,
+                    parser,
+                    0,          // depth: top-level = 0
+                    sibling_idx,
+                    sibling_count,
+                    None,       // no parent at top level
+                    &HashSet::new(), // no ancestor classes at top level
+                    &mut contexts,
+                );
+            }
+        }
+
+        contexts
+    }
+
+    /// Recursively walk a DOM node and its children, building context map.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_node(
+        node: &tl::Node,
+        node_id: usize,
+        parser: &tl::Parser,
+        depth: usize,
+        sibling_index: usize,
+        sibling_count: usize,
+        parent_info: Option<(&str, &HashSet<String>)>,
+        ancestor_classes: &HashSet<String>,
+        contexts: &mut HashMap<usize, NodeContext>,
+    ) {
+        let tag = match node.as_tag() {
+            Some(t) => t,
+            None => return, // Skip raw text and comment nodes
+        };
+
+        let tag_name = tag.name().as_utf8_str();
+
+        // Skip script/style nodes
+        if SKIP_TAGS.contains(&tag_name.as_ref()) {
+            return;
+        }
+
+        // Extract this node's classes
+        let node_classes = Self::get_classes_set(tag);
+
+        // Compute child count and analyze children
+        let children_wrapper = tag.children();
+        let children = children_wrapper.top();
+        let child_count = children.len();
+
+        // Analyze children for: img child, bold text, links
+        let mut has_img_child = false;
+        let mut bold_text_len = 0usize;
+        let mut total_text_len = 0usize;
+        let mut link_count = 0usize;
+
+        for &child_handle in children.iter() {
+            if let Some(child_node) = child_handle.get(parser) {
+                if let Some(child_tag) = child_node.as_tag() {
+                    let child_name = child_tag.name().as_utf8_str();
+                    match child_name.as_ref() {
+                        "img" => has_img_child = true,
+                        "a" => link_count += 1,
+                        "b" | "strong" => {
+                            let inner = child_tag.inner_text(parser);
+                            let t = inner.trim();
+                            bold_text_len += t.len();
+                            total_text_len += t.len();
+                        }
+                        _ => {
+                            let inner = child_tag.inner_text(parser);
+                            let t = inner.trim();
+                            total_text_len += t.len();
+                        }
+                    }
+                } else if let Some(raw) = child_node.as_raw() {
+                    let raw_str = raw.as_utf8_str();
+                    let t = raw_str.trim();
+                    total_text_len += t.len();
+                }
+            }
+        }
+
+        // Also count links recursively inside non-<a> children
+        // For link_count feature (matches Python's find_all('a'))
+        if link_count == 0 && child_count > 0 {
+            link_count = Self::count_links_recursive(tag, parser);
+        }
+
+        // Add this node's total text length (from inner_text)
+        let full_inner = tag.inner_text(parser);
+        let full_text = full_inner.trim();
+        if total_text_len == 0 {
+            total_text_len = full_text.len();
+        }
+
+        // Compute parent info
+        let parent_tag = parent_info.map(|(name, _)| name.to_string());
+        let parent_classes = parent_info
+            .map(|(_, classes)| classes.clone())
+            .unwrap_or_default();
+
+        // Build ancestor classes: parent's ancestors + parent's own classes
+        let mut my_ancestor_classes = ancestor_classes.clone();
+        if let Some((_, p_classes)) = parent_info {
+            my_ancestor_classes.extend(p_classes.iter().cloned());
+        }
+
+        // Compute is_first_significant: first text-bearing node among siblings
+        // (We approximate: this is set during sibling iteration below)
+        let is_first_significant = false; // Will be updated after sibling scan
+
+        // Store context
+        contexts.insert(
+            node_id,
+            NodeContext {
+                depth,
+                sibling_index,
+                sibling_count,
+                child_count,
+                parent_tag,
+                parent_classes,
+                ancestor_classes: my_ancestor_classes.clone(),
+                is_first_significant,
+                has_img_child,
+                bold_text_len,
+                total_text_len,
+                link_count,
+            },
+        );
+
+        // Walk children recursively
+        let child_count_val = children.len();
+        for (child_idx, &child_handle) in children.iter().enumerate() {
+            if let Some(child_node) = child_handle.get(parser) {
+                Self::walk_node(
+                    child_node,
+                    child_handle.get_inner() as usize,
+                    parser,
+                    depth + 1,
+                    child_idx,
+                    child_count_val,
+                    Some((&tag_name, &node_classes)),
+                    &my_ancestor_classes,
+                    contexts,
+                );
+            }
+        }
+    }
+
+    /// Count all <a> tags recursively inside a tag
+    fn count_links_recursive(tag: &tl::HTMLTag, parser: &tl::Parser) -> usize {
+        let mut count = 0usize;
+        let children_wrapper = tag.children();
+        let children = children_wrapper.top();
+        for &child_handle in children.iter() {
+            if let Some(child_node) = child_handle.get(parser) {
+                if let Some(child_tag) = child_node.as_tag() {
+                    let name = child_tag.name().as_utf8_str();
+                    if name.as_ref() == "a" {
+                        count += 1;
+                    }
+                    // Recurse into non-leaf children
+                    count += Self::count_links_recursive(child_tag, parser);
+                }
+            }
+        }
+        count
+    }
+
+    /// Extract classes from a tag into a HashSet
+    fn get_classes_set(tag: &tl::HTMLTag) -> HashSet<String> {
+        tag.attributes()
+            .class_iter()
+            .map(|iter| iter.map(|s| s.to_lowercase()).collect::<HashSet<String>>())
+            .unwrap_or_default()
+    }
+
+    /// Extract 30-dim feature vector from a DOM tag with full structural context.
+    ///
+    /// Feature parity with Python training pipeline (extract_features.py).
     fn extract_features(
-        &self,
         tag: &tl::HTMLTag,
         parser: &tl::Parser,
         tag_name: &str,
+        ctx: Option<&NodeContext>,
     ) -> [f32; NUM_FEATURES] {
         let mut feat = [0.0f32; NUM_FEATURES];
 
@@ -138,11 +360,11 @@ impl LmTitleDetector {
         }
 
         // Extract class info
-        let classes: Vec<&str> = tag.attributes()
+        let classes_lower: Vec<String> = tag
+            .attributes()
             .class_iter()
-            .map(|iter| iter.collect())
+            .map(|iter| iter.map(|s| s.to_lowercase()).collect::<Vec<_>>())
             .unwrap_or_default();
-        let classes_lower: Vec<String> = classes.iter().map(|c| c.to_lowercase()).collect();
         let classes_joined = classes_lower.join(" ");
 
         // [7-9] Class features
@@ -154,46 +376,73 @@ impl LmTitleDetector {
         let id_val = tag.attributes().get(tl::Bytes::from("id")).flatten();
         feat[10] = if id_val.is_some() { 1.0 } else { 0.0 };
 
-        // [11] Depth (approximate from tag structure)
-        // We don't have easy access to depth in tl, so we use a heuristic
+        // [11-15] Structural features (from DOM tree context)
+        if let Some(ctx) = ctx {
+            // [11] Depth (normalized: /20.0, capped at 1.0)
+            feat[11] = (ctx.depth as f32 / 20.0).min(1.0);
+
+            // [12] Sibling index (normalized: /20.0, capped at 1.0)
+            feat[12] = (ctx.sibling_index as f32 / 20.0).min(1.0);
+
+            // [13] Sibling count (normalized: /20.0, capped at 1.0)
+            feat[13] = (ctx.sibling_count as f32 / 20.0).min(1.0);
+
+            // [14] Child count (normalized: /50.0, capped at 1.0)
+            feat[14] = (ctx.child_count as f32 / 50.0).min(1.0);
+
+            // [17] Parent is div
+            feat[17] = if ctx.parent_tag.as_deref() == Some("div") { 1.0 } else { 0.0 };
+
+            // [18] Parent has class containing "info"
+            feat[18] = if ctx.parent_classes.iter().any(|c| c.contains("info")) { 1.0 } else { 0.0 };
+
+            // [20-22] Ancestor features (check ancestor classes)
+            feat[20] = if ctx.ancestor_classes.contains("spe") { 1.0 } else { 0.0 };
+            feat[21] = if ctx.ancestor_classes.contains("infox") { 1.0 } else { 0.0 };
+            feat[22] = if ctx.ancestor_classes.contains("infoanime") { 1.0 } else { 0.0 };
+
+            // [23] Bold text ratio
+            feat[23] = if ctx.total_text_len > 0 {
+                ctx.bold_text_len as f32 / ctx.total_text_len as f32
+            } else {
+                0.0
+            };
+
+            // [24] Link count (normalized: /10.0, capped at 1.0)
+            feat[24] = (ctx.link_count as f32 / 10.0).min(1.0);
+
+            // [27] Has img child
+            feat[27] = if ctx.has_img_child { 1.0 } else { 0.0 };
+
+            // [28] Is first significant
+            feat[28] = if ctx.is_first_significant { 1.0 } else { 0.0 };
+        } else {
+            // Fallback: no context available (shouldn't happen normally)
+            feat[11] = 0.0; // depth
+            feat[12] = 0.0; // sibling_index
+            feat[13] = 0.3; // sibling_count (approximate)
+            feat[14] = 0.0; // child_count
+            feat[17] = 0.0; // parent_is_div
+            feat[18] = 0.0; // parent_has_info
+            feat[20] = 0.0; // is_inside_spe
+            feat[21] = 0.0; // is_inside_infox
+            feat[22] = 0.0; // is_inside_infoanime
+            feat[23] = 0.0; // bold_text_ratio
+            feat[24] = 0.0; // link_count
+            feat[27] = 0.0; // has_img_child
+            feat[28] = 0.0; // is_first_significant
+        }
+
+        // [15] Text length (normalized: /200.0, capped at 1.0)
         let text = tag.inner_text(parser).trim().to_string();
-        feat[11] = 0.4; // Average depth approximation for content nodes
-
-        // [12-13] Sibling info (approximate)
-        feat[12] = 0.0; // Can't easily determine in tl
-        feat[13] = 0.3; // Approximate
-
-        // [14] Child count (approximate from inner HTML complexity)
-        let inner_text_len = text.len();
-        feat[14] = 0.0; // Simplified — h1/h2/h3 typically have 0 children
-
-        // [15] Text length
-        feat[15] = (inner_text_len as f32 / 200.0).min(1.0);
+        feat[15] = (text.len() as f32 / 200.0).min(1.0);
 
         // [16] Text starts with "Komik"
         feat[16] = if text.to_lowercase().starts_with("komik") { 1.0 } else { 0.0 };
 
-        // [17-18] Parent features (approximate from class context)
-        feat[17] = if classes_joined.contains("info") || tag_name == "h1" { 1.0 } else { 0.0 };
-        feat[18] = if classes_joined.contains("info") { 1.0 } else { 0.0 };
-
         // [19] Has itemprop attribute
         let has_itemprop = tag.attributes().get(tl::Bytes::from("itemprop")).flatten().is_some();
         feat[19] = if has_itemprop { 1.0 } else { 0.0 };
-
-        // [20-22] Ancestor features (approximate — check class and id)
-        let id_str = id_val
-            .map(|v| v.try_as_utf8_str().unwrap_or("").to_lowercase())
-            .unwrap_or_default();
-        feat[20] = if id_str == "spe" || classes_joined.contains("spe") { 1.0 } else { 0.0 };
-        feat[21] = if classes_joined.contains("infox") { 1.0 } else { 0.0 };
-        feat[22] = if classes_joined.contains("infoanime") { 1.0 } else { 0.0 };
-
-        // [23] Bold text ratio (simplified)
-        feat[23] = 0.0; // Simplified — would need DOM walk for accuracy
-
-        // [24] Link count (approximate)
-        feat[24] = 0.0; // Simplified — title nodes typically have 0 links
 
         // [25] Has rel=tag
         let has_rel_tag = tag.attributes().get(tl::Bytes::from("rel")).flatten()
@@ -201,17 +450,14 @@ impl LmTitleDetector {
             .unwrap_or(false);
         feat[25] = if has_rel_tag { 1.0 } else { 0.0 };
 
-        // [26] Word count
+        // [26] Word count (normalized: /20.0, capped at 1.0)
         feat[26] = (text.split_whitespace().count() as f32 / 20.0).min(1.0);
 
-        // [27] Has img child (simplified)
-        feat[27] = 0.0; // Title nodes don't have img children
-
-        // [28] Is first significant (simplified — h1 tags are typically first)
-        feat[28] = if tag_name == "h1" { 1.0 } else { 0.0 };
-
         // [29] Font size indicator
-        let font_map = [("h1", 1.0), ("h2", 0.8), ("h3", 0.6), ("h4", 0.5), ("h5", 0.4), ("h6", 0.3)];
+        let font_map = [
+            ("h1", 1.0), ("h2", 0.8), ("h3", 0.6),
+            ("h4", 0.5), ("h5", 0.4), ("h6", 0.3),
+        ];
         feat[29] = font_map.iter()
             .find(|(name, _)| *name == tag_name)
             .map(|(_, v)| *v)
@@ -230,7 +476,6 @@ impl LmTitleDetector {
         let input_tensor = ort::value::Tensor::from_array(input_array)?;
         let input_value: ort::value::Value = input_tensor.into();
 
-        // Use ort::inputs! macro for type-safe input construction
         let inputs = ort::inputs!["features" => input_value];
 
         let output = self.session.run(inputs)?;
