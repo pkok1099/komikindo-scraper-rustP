@@ -262,6 +262,16 @@ pub struct KomikDetail {
     /// Chapter list - SUDAH TERMASUK URL langsung dari detail page
     pub chapters: Vec<ChapterInfo>,
     pub latest_chapter_number: Option<f64>,
+    /// Similar/recommended komik from "Mirip" section
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub similar: Vec<SimilarKomik>,
+}
+
+/// Similar/recommended komik from the "Mirip" section.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SimilarKomik {
+    pub slug: String,
+    pub judul: Option<String>,
 }
 
 /// Chapter info dari detail page.
@@ -333,6 +343,7 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
         genre_ids: Vec::new(),
         chapters: Vec::new(),
         latest_chapter_number: None,
+        similar: Vec::new(),
     };
 
     // === TITLE (try multiple selectors) ===
@@ -475,7 +486,7 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
                                 if detail.tipe.is_none() {
                                     detail.tipe = Some(value);
                                 }
-                            } else if label.contains("alternative") {
+                            } else if label.contains("alternative") || label.contains("alternatif") {
                                 detail.alternative_title = Some(value);
                             }
                         }
@@ -538,8 +549,9 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
     detail.genre_list = genre_links;
 
     // === RATING (try multiple selectors) ===
-    // Two-step: find container, then i inside (replaces "div.infoanime-rating i", "div.rating i")
-    let rating_container_sels = ["div.infoanime-rating", "div.rating"];
+    // Real HTML uses: div.archiveanime-rating i[itemprop="ratingValue"]
+    // Also try legacy selectors for older page layouts
+    let rating_container_sels = ["div.archiveanime-rating", "div.infoanime-rating", "div.rating"];
     for container_sel in &rating_container_sels {
         if let Some(r_text) = find_descendant_text(&dom, parser, container_sel, "i") {
             if !r_text.is_empty() {
@@ -612,7 +624,87 @@ pub fn parse_komik_detail(slug: &str, html: &str) -> Option<KomikDetail> {
         detail.latest_chapter_number = Some(first.number);
     }
 
+    // === SIMILAR/MIRIP (recommended komik) ===
+    // HTML: div#mirip > div.widget-post.miripmanga > div.serieslist > ul > li
+    //   Each li has: a.series[href*="/komik/"] with title + h3 > a.series with title
+    detail.similar = extract_similar(&dom, parser);
+
     Some(detail)
+}
+
+/// Extract similar/recommended komik from the "Mirip" section.
+/// HTML structure: div#mirip > div.miripmanga > div.serieslist > ul > li
+///   Each li contains:
+///     - div.imgseries > a.series[href*="/komik/"] for thumbnail (title text is dirty)
+///     - div.leftseries > h3 > a.series for clean title
+///   We extract slug from any a.series[href*="/komik/"], and title from h3 > a.series
+fn extract_similar(dom: &VDom, parser: &tl::Parser) -> Vec<SimilarKomik> {
+    let mut similar = Vec::new();
+
+    // Find the mirip container
+    let Some(mut mirip_iter) = dom.query_selector("div#mirip") else { return similar };
+    let Some(mirip_handle) = mirip_iter.next() else { return similar };
+    let Some(mirip_node) = mirip_handle.get(parser) else { return similar };
+    let Some(mirip_tag) = mirip_node.as_tag() else { return similar };
+
+    // Find all li items inside mirip
+    if let Some(li_iter) = mirip_tag.query_selector(parser, "li") {
+        for li_handle in li_iter {
+            let Some(li_node) = li_handle.get(parser) else { continue };
+            let Some(li_tag) = li_node.as_tag() else { continue };
+
+            // Get slug from any a.series[href] inside this li
+            let mut slug = String::new();
+            if let Some(mut a_iter) = li_tag.query_selector(parser, "a.series") {
+                if let Some(a_handle) = a_iter.next() {
+                    if let Some(a_node) = a_handle.get(parser) {
+                        if let Some(a_tag) = a_node.as_tag() {
+                            if let Some(href) = get_attr(a_tag, "href") {
+                                if let Some(caps) = RE_SLUG_FROM_KOMIK_URL.captures(href) {
+                                    slug = caps[1].to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if slug.is_empty() {
+                continue;
+            }
+
+            // Avoid duplicates by slug
+            if similar.iter().any(|s| s.slug == slug) {
+                continue;
+            }
+
+            // Get clean title from h3 > a.series inside div.leftseries
+            let mut judul: Option<String> = None;
+            if let Some(mut h3_iter) = li_tag.query_selector(parser, "h3") {
+                if let Some(h3_handle) = h3_iter.next() {
+                    if let Some(h3_node) = h3_handle.get(parser) {
+                        if let Some(h3_tag) = h3_node.as_tag() {
+                            if let Some(mut a_iter) = h3_tag.query_selector(parser, "a") {
+                                if let Some(a_handle) = a_iter.next() {
+                                    if let Some(a_node) = a_handle.get(parser) {
+                                        if let Some(a_tag) = a_node.as_tag() {
+                                            let text = inner_text_owned(a_tag, parser);
+                                            if !text.is_empty() {
+                                                judul = Some(text);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            similar.push(SimilarKomik { slug, judul });
+        }
+    }
+
+    similar
 }
 
 /// Extract chapter list dari detail page.
