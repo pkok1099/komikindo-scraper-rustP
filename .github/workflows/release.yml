@@ -129,9 +129,14 @@ jobs:
 
       - name: Flatten and rename binaries
         run: |
-          mv release/komikindo-scraper-amd64/komikindo-scraper release/komikindo-scraper-amd64
-          mv release/komikindo-scraper-termux/komikindo-scraper release/komikindo-scraper-termux
-          rmdir release/komikindo-scraper-amd64 release/komikindo-scraper-termux 2>/dev/null || true
+          # download-artifact@v4 creates: release/<artifact-name>/<binary>
+          # We want: release/<artifact-name> (the binary itself, no subdirectory)
+          # Cannot mv into same-named dir — must copy out, remove dir, then rename.
+          cp release/komikindo-scraper-amd64/komikindo-scraper release/_amd64
+          cp release/komikindo-scraper-termux/komikindo-scraper release/_termux
+          rm -rf release/komikindo-scraper-amd64 release/komikindo-scraper-termux
+          mv release/_amd64 release/komikindo-scraper-amd64
+          mv release/_termux release/komikindo-scraper-termux
 
       - name: List binaries
         run: |
