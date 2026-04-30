@@ -6,39 +6,56 @@ Dokumen ini menjelaskan arsitektur detail, data flow, dan desain setiap module d
 
 ## High-Level Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     komikindo-scraper (CLI)                      │
-│                                                                  │
-│  ┌──────────┐  ┌──────────┐  ┌───────────┐  ┌──────────────┐  │
-│  │ full-fetch│  │  update  │  │ upload-db │  │ debug/check  │  │
-│  └─────┬────┘  └─────┬────┘  └─────┬─────┘  └──────┬───────┘  │
-│        │              │             │                │           │
-│  ┌─────▼──────────────▼─────────────▼────────────────▼───────┐ │
-│  │                    scraper.rs                               │ │
-│  │  scrape_full_komik_list / scrape_komik_detail /            │ │
-│  │  scrape_komik_terbaru / scrape_homepage_updates            │ │
-│  └───────────────┬──────────────────┬────────────────────────┘ │
-│                  │                  │                           │
-│  ┌───────────────▼──────┐  ┌───────▼──────────┐               │
-│  │     fetcher.rs       │  │    parsers.rs     │               │
-│  │  HTTP client (curl)  │  │  HTML parsing     │               │
-│  │  Connection reuse    │  │  Selector cache   │               │
-│  │  Semaphore bounded   │  │  Regex cache      │               │
-│  └───────────┬──────────┘  └──────────────────┘               │
-│              │                                                  │
-│  ┌───────────▼──────────┐  ┌───────────────────────┐          │
-│  │      config.rs       │  │      jsonl.rs          │          │
-│  │  Env config, URLs    │  │  Buffered JSONL write  │          │
-│  │  Genre map, CDN IDs  │  │  Resume, tail-seek     │          │
-│  └──────────────────────┘  └───────────┬───────────┘          │
-│                                        │                       │
-│  ┌─────────────────────────────────────▼─────────────────────┐ │
-│  │                      db.rs                                 │ │
-│  │  Supabase PostgreSQL: connect, upsert, batch UNNEST,      │ │
-│  │  schema ensure, scrape_log, readback verification         │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph CLI["komikindo-scraper (CLI)"]
+        full-fetch
+        update
+        upload-db
+        debug-check["debug / check"]
+    end
+
+    subgraph scraper["scraper.rs"]
+        scrape_full["scrape_full_komik_list"]
+        scrape_detail["scrape_komik_detail"]
+        scrape_terbaru["scrape_komik_terbaru"]
+        scrape_homepage["scrape_homepage_updates"]
+    end
+
+    subgraph fetcher["fetcher.rs"]
+        http["HTTP client (curl)"]
+        reuse["Connection reuse"]
+        semaphore["Semaphore bounded"]
+    end
+
+    subgraph parsers["parsers.rs"]
+        parse_html["HTML parsing"]
+        sel_cache["Selector cache"]
+        regex_cache["Regex cache"]
+    end
+
+    subgraph config["config.rs"]
+        env_cfg["Env config, URLs"]
+        genre_map["Genre map, CDN IDs"]
+    end
+
+    subgraph jsonl["jsonl.rs"]
+        buf_write["Buffered JSONL write"]
+        resume["Resume, tail-seek"]
+    end
+
+    subgraph db["db.rs"]
+        pg["Supabase PostgreSQL"]
+        upsert["upsert, batch UNNEST"]
+        schema["schema ensure, scrape_log"]
+        readback["readback verification"]
+    end
+
+    CLI --> scraper
+    scraper --> fetcher
+    scraper --> parsers
+    fetcher --> config
+    jsonl --> db
 ```
 
 ---
@@ -54,34 +71,29 @@ Proyek ini menggunakan **two-phase pipeline** untuk memisahkan data fetching dar
 
 ### Phase 1: Fetch → JSONL
 
-```
-full-fetch command
-    │
-    ├── Fetch /daftar-manga/?list → 8677+ slug list
-    │
-    ├── For each slug (paralel, semaphore bounded):
-    │   ├── Fetch /komik/{slug}/ → HTML detail page
-    │   ├── Parse HTML → KomikDetail struct
-    │   └── Write KomikDetail as JSONL line (append)
-    │
-    └── Done → JSONL file di data/
+```mermaid
+flowchart TD
+    A["full-fetch command"] --> B["Fetch /daftar-manga/?list → 8677+ slug list"]
+    B --> C["For each slug (paralel, semaphore bounded)"]
+    C --> D["Fetch /komik/{slug}/ → HTML detail page"]
+    D --> E["Parse HTML → KomikDetail struct"]
+    E --> F["Write KomikDetail as JSONL line (append)"]
+    F --> G["Done → JSONL file di data/"]
 ```
 
 ### Phase 2: JSONL → Database
 
-```
-upload-db command
-    │
-    ├── Read JSONL file (streaming, line by line)
-    │
-    ├── Batch komik into groups of N (default: 1000)
-    │
-    ├── For each batch:
-    │   ├── Batch upsert komik via UNNEST (1 query)
-    │   ├── Multi-row INSERT chapters (500 rows/chunk)
-    │   └── Multi-row INSERT genres (200 rows/chunk)
-    │
-    └── Done → semua data di Supabase PostgreSQL
+```mermaid
+flowchart TD
+    A["upload-db command"] --> B["Read JSONL file (streaming, line by line)"]
+    B --> C["Batch komik into groups of N (default: 1000)"]
+    C --> D["For each batch"]
+    D --> E["Batch upsert komik via UNNEST (1 query)"]
+    D --> F["Multi-row INSERT chapters (500 rows/chunk)"]
+    D --> G["Multi-row INSERT genres (200 rows/chunk)"]
+    E --> H["Done → semua data di Supabase PostgreSQL"]
+    F --> H
+    G --> H
 ```
 
 ---
@@ -125,12 +137,13 @@ Menyimpan semua konstanta dan konfigurasi yang digunakan seluruh aplikasi:
 Module inti untuk HTTP fetching. Menggunakan `curl` crate (libcurl binding) dengan optimisasi ekstensif:
 
 **Thread-Local Handle Cache:**
-```
-Thread 1 (blocking pool)  ─→ CACHED_CURL_HANDLE (Easy2<Collector>)
-Thread 2 (blocking pool)  ─→ CACHED_CURL_HANDLE (Easy2<Collector>)
-Thread 3 (blocking pool)  ─→ CACHED_CURL_HANDLE (Easy2<Collector>)
-...
-Thread N (blocking pool)  ─→ CACHED_CURL_HANDLE (Easy2<Collector>)
+
+```mermaid
+graph LR
+    T1["Thread 1 (blocking pool)"] --> H1["CACHED_CURL_HANDLE (Easy2&lt;Collector&gt;)"]
+    T2["Thread 2 (blocking pool)"] --> H2["CACHED_CURL_HANDLE (Easy2&lt;Collector&gt;)"]
+    T3["Thread 3 (blocking pool)"] --> H3["CACHED_CURL_HANDLE (Easy2&lt;Collector&gt;)"]
+    TN["Thread N (blocking pool)"] --> HN["CACHED_CURL_HANDLE (Easy2&lt;Collector&gt;)"]
 ```
 
 Setiap thread di blocking pool mempertahankan curl handle-nya sendiri. Request pertama membuat handle baru (TCP+TLS handshake ~100-200ms), request berikutnya reuse koneksi yang sama (~0ms overhead).
@@ -240,84 +253,67 @@ File-based data storage yang crash-safe dan resume-friendly:
 
 ### Full Fetch Flow
 
-```
-1. Fetch /daftar-manga/?list
-   └→ parse_komik_list() → 8677+ slugs
-
-2. Filter slugs (limit, start_from, resume)
-   └→ skip already-done slugs
-
-3. For each chunk of 200 slugs:
-   └→ spawn tokio tasks (bounded by semaphore)
-
-4. Each task:
-   ├── fetcher.fetch_page(/komik/{slug}/) → HTML
-   ├── parsers.parse_komik_detail(slug, html) → KomikDetail
-   ├── jsonl_writer.append(komik) → JSONL line
-   └── (optional) db.write_komik() → upsert ke DB
-
-5. Progress tracking:
-   ├── total_done / total_failed counter
-   ├── Rate calculation (komik/min)
-   └── ETA estimation
+```mermaid
+flowchart TD
+    A["1. Fetch /daftar-manga/?list"] --> B["parse_komik_list() → 8677+ slugs"]
+    B --> C["2. Filter slugs (limit, start_from, resume)"]
+    C --> D["3. For each chunk of 200 slugs"]
+    D --> E["spawn tokio tasks (bounded by semaphore)"]
+    E --> F["4. Each task"]
+    F --> G["fetcher.fetch_page(/komik/{slug}/) → HTML"]
+    G --> H["parsers.parse_komik_detail(slug, html) → KomikDetail"]
+    H --> I["jsonl_writer.append(komik) → JSONL line"]
+    I --> J["5. Progress tracking"]
+    J --> K["total_done / total_failed counter"]
+    J --> L["Rate calculation (komik/min)"]
+    J --> M["ETA estimation"]
 ```
 
 ### Smart Update Flow
 
-```
-1. Fetch /komik-terbaru/ (page 1..N)
-   └→ parse_komik_terbaru() → TerbaruItem[]
-
-2. Load chapter_map from DB:
-   └→ db.load_chapter_map() → HashMap<slug, (komik_id, latest_ch)>
-
-3. Compare:
-   ├── Slug not in DB → NEW komik → scrape full detail
-   ├── Slug in DB, chapter_number > DB → UPDATE → update latest_chapter_number
-   └── Slug in DB, no change → SKIP
-
-4. For NEW komik:
-   ├── scrape_komik_detail(slug) → KomikDetail
-   └── db.write_komik(detail) → upsert komik + chapters + genres
-
-5. For UPDATE komik:
-   └── db.update_latest_chapter(komik_id, new_number) → single UPDATE query
-
-6. Batch update latest chapters:
-   └── db.batch_update_latest_chapters(updates) → UNNEST batch UPDATE
-
-7. Log result to scrape_log table
+```mermaid
+flowchart TD
+    A["1. Fetch /komik-terbaru/ (page 1..N)"] --> B["parse_komik_terbaru() → TerbaruItem[]"]
+    B --> C["2. Load chapter_map from DB"]
+    C --> D["db.load_chapter_map() → HashMap&lt;slug, (komik_id, latest_ch)&gt;"]
+    D --> E{"3. Compare"}
+    E -->|"Slug not in DB"| F["NEW komik → scrape full detail"]
+    E -->|"Slug in DB, ch > DB"| G["UPDATE → update latest_chapter_number"]
+    E -->|"Slug in DB, no change"| H["SKIP"]
+    F --> I["4. scrape_komik_detail(slug) → KomikDetail"]
+    I --> J["db.write_komik(detail) → upsert komik + chapters + genres"]
+    G --> K["5. db.update_latest_chapter(komik_id, new_number)"]
+    K --> L["6. Batch update: db.batch_update_latest_chapters(updates) → UNNEST"]
+    J --> M["7. Log result to scrape_log table"]
+    L --> M
 ```
 
 ---
 
 ## Concurrency Model
 
-```
-                    ┌─────────────────────────┐
-                    │   Tokio Runtime          │
-                    │                          │
-                    │  ┌──────────────────┐   │
-                    │  │ Worker Threads    │   │  (default: N cores)
-                    │  │ (async tasks)     │   │
-                    │  └──────┬───────────┘   │
-                    │         │                │
-                    │  ┌──────▼───────────┐   │
-                    │  │ Blocking Pool     │   │  (default: 512 threads)
-                    │  │ (curl requests)   │   │
-                    │  │                   │   │
-                    │  │ Thread 1 → curl   │   │  ← Each thread has
-                    │  │ Thread 2 → curl   │   │    its own cached
-                    │  │ Thread 3 → curl   │   │    curl handle
-                    │  │ ...               │   │    (connection reuse)
-                    │  │ Thread N → curl   │   │
-                    │  └───────────────────┘   │
-                    └─────────────────────────┘
-                              │
-                    ┌─────────▼───────────┐
-                    │ Semaphore (512)      │  ← Bounded concurrency
-                    │ (in-flight limit)    │
-                    └─────────────────────┘
+```mermaid
+graph TD
+    subgraph runtime["Tokio Runtime"]
+        subgraph workers["Worker Threads (default: N cores)"]
+            W1["async task 1"]
+            W2["async task 2"]
+            W3["async task ..."]
+        end
+        subgraph blocking["Blocking Pool (default: 512 threads)"]
+            B1["Thread 1 → curl"]
+            B2["Thread 2 → curl"]
+            B3["Thread 3 → curl"]
+            BN["Thread N → curl"]
+        end
+        workers --> blocking
+    end
+    blocking --> semaphore["Semaphore (512) — Bounded concurrency"]
+
+    style B1 fill:#e8f5e9
+    style B2 fill:#e8f5e9
+    style B3 fill:#e8f5e9
+    style BN fill:#e8f5e9
 ```
 
 **Key design decisions:**
