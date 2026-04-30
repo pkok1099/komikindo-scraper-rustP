@@ -1460,8 +1460,6 @@ pub fn parse_komik_detail_lm(
     html: &str,
     detector: &mut crate::lm_selector::LmDetector,
 ) -> Option<KomikDetail> {
-    use crate::lm_selector::FieldType;
-
     if html.trim().is_empty() {
         return None;
     }
@@ -1488,11 +1486,13 @@ pub fn parse_komik_detail_lm(
         similar: Vec::new(),
     };
 
+    // === ONE unified detection pass — 1 DOM walk, 1 batch inference ===
+    let lm_results = detector.detect_all_fields(html);
+
     // === TITLE: LM first, hardcoded fallback ===
-    let lm_title = detector.detect_title(html);
-    match lm_title {
-        Some(title) => {
-            detail.judul = Some(title);
+    match &lm_results.title {
+        Some(result) => {
+            detail.judul = Some(result.text.clone());
         }
         None => {
             // Fallback to hardcoded selectors
@@ -1529,7 +1529,7 @@ pub fn parse_komik_detail_lm(
     extract_spe_info(&dom, parser, &mut detail);
 
     // === GENRE: LM first, hardcoded fallback ===
-    let lm_genres = detector.detect_genres(html);
+    let lm_genres: Vec<String> = lm_results.genres.iter().map(|r| r.text.clone()).collect();
     if !lm_genres.is_empty() {
         detail.genre_list = lm_genres;
     } else {
@@ -1573,7 +1573,8 @@ pub fn parse_komik_detail_lm(
     }
 
     // === RATING: LM first, hardcoded fallback ===
-    let lm_rating = detector.detect_rating(html);
+    let lm_rating = lm_results.rating.as_ref()
+        .and_then(|r| r.text.parse::<f64>().ok());
     match lm_rating {
         Some(r) => {
             detail.rating = Some(r);
@@ -1611,11 +1612,10 @@ pub fn parse_komik_detail_lm(
     }
 
     // === SINOPSIS: LM first, hardcoded fallback ===
-    let lm_synopsis = detector.detect_synopsis(html);
-    match lm_synopsis {
-        Some(raw_text) => {
+    match &lm_results.synopsis {
+        Some(result) => {
             // Apply same cleanup as hardcoded parser
-            let mut sinopsis = raw_text;
+            let mut sinopsis = result.text.clone();
             sinopsis = RE_SINOPSIS_PREFIX.replace(&sinopsis, "").to_string();
             sinopsis = RE_SINOPSIS_TYPE.replace(&sinopsis, "").to_string();
             sinopsis = sinopsis.trim().to_string();

@@ -633,9 +633,9 @@ async fn run_db_drop_all() -> Result<()> {
 // ============================================================
 
 async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
-    use komikindo_scraper::lm_selector::{LmDetector, FieldType};
+    use komikindo_scraper::lm_selector::{LmDetector, FieldType, AllFieldsResult};
 
-    // Parse which fields to test
+    // Parse which fields to test (unified model always detects all, but we filter reporting)
     let fields: Vec<FieldType> = match field.as_str() {
         "title" => vec![FieldType::Title],
         "rating" => vec![FieldType::Rating],
@@ -646,14 +646,14 @@ async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
     };
 
     println!("{}", "=".repeat(70));
-    println!("  LM FIELD DETECTION (EXPERIMENTAL)");
+    println!("  LM FIELD DETECTION — UNIFIED MODEL (1 AI)");
     println!("  Fields: {}", fields.iter().map(|f| format!("{:?}", f).to_lowercase()).collect::<Vec<_>>().join(", "));
     println!("{}", "=".repeat(70));
 
-    // Load ONNX models
-    println!("[LM] Loading ONNX models...");
-    let mut detector = LmDetector::new(&fields)?;
-    println!("[LM] Models loaded successfully");
+    // Load unified ONNX model
+    println!("[LM] Loading unified ONNX model...");
+    let mut detector = LmDetector::new()?;
+    println!("[LM] Model loaded successfully (models/field_detector.onnx)");
 
     // Find latest JSONL
     let data_dir = std::path::Path::new("data");
@@ -695,13 +695,16 @@ async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
             
             match fetcher.fetch_page(&url).await {
                 Ok(html) => {
+                    // ONE inference call → all fields at once
+                    let results: AllFieldsResult = detector.detect_all_fields(&html);
+
                     for ft in &fields {
                         let field_name = format!("{:?}", ft).to_lowercase();
                         let stats = field_stats.get_mut(&field_name).unwrap();
 
                         match ft {
                             FieldType::Title => {
-                                let lm_result = detector.detect_title(&html);
+                                let lm_result = results.title.as_ref().map(|r| r.text.clone());
                                 let selector_val = detail.judul.as_deref().unwrap_or("(none)");
                                 match lm_result {
                                     Some(lm) => {
@@ -709,20 +712,21 @@ async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
                                         let sel_clean = selector_val.trim().to_lowercase();
                                         if lm_clean == sel_clean {
                                             stats.0 += 1;
-                                            println!("  [✓ title] {}: \"{}\"", slug, selector_val);
+                                            println!("  [OK title] {}: \"{}\"", slug, selector_val);
                                         } else {
                                             stats.1 += 1;
-                                            println!("  [✗ title] {}: LM=\"{}\" vs SELECTOR=\"{}\"", slug, lm, selector_val);
+                                            println!("  [XX title] {}: LM=\"{}\" vs SELECTOR=\"{}\"", slug, lm, selector_val);
                                         }
                                     }
                                     None => {
                                         stats.2 += 1;
-                                        println!("  [? title] {}: no detection, SELECTOR=\"{}\"", slug, selector_val);
+                                        println!("  [?? title] {}: no detection, SELECTOR=\"{}\"", slug, selector_val);
                                     }
                                 }
                             }
                             FieldType::Rating => {
-                                let lm_result = detector.detect_rating(&html);
+                                let lm_result = results.rating.as_ref()
+                                    .and_then(|r| r.text.parse::<f64>().ok());
                                 let selector_val = detail.rating;
                                 match lm_result {
                                     Some(lm) => {
@@ -732,30 +736,29 @@ async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
                                         };
                                         if match_ok {
                                             stats.0 += 1;
-                                            println!("  [✓ rating] {}: {:.2} (selector={:.2})", slug, lm, selector_val.unwrap_or(0.0));
+                                            println!("  [OK rating] {}: {:.2} (selector={:.2})", slug, lm, selector_val.unwrap_or(0.0));
                                         } else {
                                             stats.1 += 1;
-                                            println!("  [✗ rating] {}: LM={:.2} vs SELECTOR={}", slug, lm,
+                                            println!("  [XX rating] {}: LM={:.2} vs SELECTOR={}", slug, lm,
                                                 selector_val.map(|v| format!("{:.2}", v)).unwrap_or("(none)".to_string()));
                                         }
                                     }
                                     None => {
                                         stats.2 += 1;
-                                        println!("  [? rating] {}: no detection, SELECTOR={}", slug,
+                                        println!("  [?? rating] {}: no detection, SELECTOR={}", slug,
                                             selector_val.map(|v| format!("{:.2}", v)).unwrap_or("(none)".to_string()));
                                     }
                                 }
                             }
                             FieldType::Genre => {
-                                let lm_genres = detector.detect_genres(&html);
+                                let lm_genres: Vec<String> = results.genres.iter().map(|r| r.text.clone()).collect();
                                 let selector_genres = &detail.genre_list;
                                 if lm_genres.is_empty() && selector_genres.is_empty() {
                                     // Both empty — skip (no genres)
                                 } else if lm_genres.is_empty() {
                                     stats.2 += 1;
-                                    println!("  [? genre] {}: no LM detection, SELECTOR={:?}", slug, selector_genres);
+                                    println!("  [?? genre] {}: no LM detection, SELECTOR={:?}", slug, selector_genres);
                                 } else {
-                                    // Check overlap: how many LM genres match selector genres?
                                     let selector_set: std::collections::HashSet<String> =
                                         selector_genres.iter().map(|g| g.to_lowercase()).collect();
                                     let lm_set: std::collections::HashSet<String> =
@@ -764,41 +767,37 @@ async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
 
                                     if overlap == selector_set.len() && lm_set.len() == selector_set.len() {
                                         stats.0 += 1;
-                                        println!("  [✓ genre] {}: {:?} ({}/{} match)", slug, lm_genres, overlap, selector_set.len());
+                                        println!("  [OK genre] {}: {:?} ({}/{} match)", slug, lm_genres, overlap, selector_set.len());
                                     } else if overlap > 0 {
-                                        // Partial match
                                         stats.1 += 1;
-                                        println!("  [~ genre] {}: LM={:?} vs SELECTOR={:?} ({}/{} overlap)",
+                                        println!("  [~~ genre] {}: LM={:?} vs SELECTOR={:?} ({}/{} overlap)",
                                             slug, lm_genres, selector_genres, overlap, selector_set.len());
                                     } else {
                                         stats.1 += 1;
-                                        println!("  [✗ genre] {}: LM={:?} vs SELECTOR={:?}", slug, lm_genres, selector_genres);
+                                        println!("  [XX genre] {}: LM={:?} vs SELECTOR={:?}", slug, lm_genres, selector_genres);
                                     }
                                 }
                             }
                             FieldType::Synopsis => {
-                                let lm_result = detector.detect_synopsis(&html);
+                                let lm_result = results.synopsis.as_ref().map(|r| r.text.clone());
                                 let selector_val = detail.sinopsis.as_deref().unwrap_or("");
                                 match lm_result {
                                     Some(lm) => {
-                                        // Compare by checking if the LM text contains the key content
-                                        // (synopsis may have extra whitespace/labels)
                                         let lm_clean = lm.replace(['\n', '\r', '\t'], " ").trim().to_lowercase();
                                         let sel_clean = selector_val.replace(['\n', '\r', '\t'], " ").trim().to_lowercase();
-                                        // Check if the core content matches (skip "Sinopsis" prefix in LM)
                                         let lm_core = lm_clean.trim_start_matches("sinopsis").trim();
                                         let sel_core = sel_clean.trim_start_matches("sinopsis").trim();
                                         if lm_core.contains(&sel_core[..sel_core.len().min(50)]) || sel_core.contains(&lm_core[..lm_core.len().min(50)]) {
                                             stats.0 += 1;
-                                            println!("  [✓ synopsis] {}: {} chars (selector={})", slug, lm.len(), selector_val.len());
+                                            println!("  [OK synopsis] {}: {} chars (selector={})", slug, lm.len(), selector_val.len());
                                         } else {
                                             stats.1 += 1;
-                                            println!("  [✗ synopsis] {}: LM={} chars vs SELECTOR={} chars", slug, lm.len(), selector_val.len());
+                                            println!("  [XX synopsis] {}: LM={} chars vs SELECTOR={} chars", slug, lm.len(), selector_val.len());
                                         }
                                     }
                                     None => {
                                         stats.2 += 1;
-                                        println!("  [? synopsis] {}: no detection, SELECTOR={} chars", slug, selector_val.len());
+                                        println!("  [?? synopsis] {}: no detection, SELECTOR={} chars", slug, selector_val.len());
                                     }
                                 }
                             }
@@ -807,7 +806,7 @@ async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
                 }
                 Err(e) => {
                     fetch_fail += 1;
-                    println!("  [!] {}: fetch failed: {}", slug, e);
+                    println!("  [!!] {}: fetch failed: {}", slug, e);
                 }
             }
         }
@@ -815,7 +814,7 @@ async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
 
     println!();
     println!("{}", "=".repeat(70));
-    println!("  LM DETECT RESULTS");
+    println!("  LM DETECT RESULTS — UNIFIED MODEL (1 AI)");
     println!("  Total tested:    {total}");
     println!("  Fetch failures:  {fetch_fail}");
     for ft in &fields {
@@ -1481,13 +1480,13 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
 
         // Initialize LM detector if --lm flag is set
         let lm_detector: Option<Arc<tokio::sync::Mutex<komikindo_scraper::lm_selector::LmDetector>>> = if opts_lm {
-            match komikindo_scraper::lm_selector::LmDetector::new_all_fields() {
+            match komikindo_scraper::lm_selector::LmDetector::new() {
                 Ok(detector) => {
-                    println!("[LM] Loaded ONNX models for title, rating, genre, synopsis");
+                    println!("[LM] Loaded unified ONNX model (title, rating, genre, synopsis)");
                     Some(Arc::new(tokio::sync::Mutex::new(detector)))
                 }
                 Err(e) => {
-                    eprintln!("[LM] Failed to load ONNX models: {e}. Falling back to CSS selectors.");
+                    eprintln!("[LM] Failed to load ONNX model: {e}. Falling back to CSS selectors.");
                     None
                 }
             }

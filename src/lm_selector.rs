@@ -1,14 +1,11 @@
-/// LM-based Selector Engine — Multi-Field Detection
+/// LM-based Selector Engine — Unified Multi-Field Detection (1 AI)
 ///
-/// Uses small ONNX models to detect which DOM nodes contain
-/// specific fields (title, rating, etc.), replacing hardcoded CSS selectors.
+/// Uses a single ONNX model to detect ALL fields simultaneously.
+/// Instead of 4 separate models, one model outputs 4 probabilities:
+///   [title_prob, rating_prob, genre_prob, synopsis_prob]
 ///
 /// Architecture:
-///   HTML → DOM Walk → Feature Vector (per node) → ONNX Inference → Field Node
-///
-/// The DOM tree walking and feature extraction is shared across all fields.
-/// Each field has its own trained ONNX model (~17KB) that takes the same
-/// feature vector and outputs a probability that the node contains that field.
+///   HTML → DOM Walk (1 pass) → Feature Vectors → ONNX (1 inference per node) → All Fields
 ///
 /// Feature vector (32 dims):
 ///   [0-8]   Tag one-hot: h1, h2, h3, span, div, a, td, i, meta
@@ -25,10 +22,13 @@
 
 use anyhow::Result;
 use ort::session::Session;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Number of features per DOM node
 pub const NUM_FEATURES: usize = 32;
+
+/// Number of output fields
+pub const NUM_FIELDS: usize = 4;
 
 /// Tag vocabulary for one-hot encoding
 const TAG_VOCAB: &[&str] = &["h1", "h2", "h3", "span", "div", "a", "td", "i", "meta"];
@@ -42,7 +42,7 @@ const CANDIDATE_TAGS: &[&str] = &[
     "p", "b", "strong", "label", "section", "article",
 ];
 
-/// Which fields we can detect with LM
+/// Which fields we can detect with LM — order must match Python FIELD_NAMES
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldType {
     Title,
@@ -52,29 +52,24 @@ pub enum FieldType {
 }
 
 impl FieldType {
-    /// Default model path for this field type
-    pub fn model_path(&self) -> &'static str {
+    /// Column index in the multi-label output (must match Python FIELD_NAMES order)
+    pub fn output_index(&self) -> usize {
         match self {
-            FieldType::Title => "models/title_detector.onnx",
-            FieldType::Rating => "models/rating_detector.onnx",
-            FieldType::Genre => "models/genre_detector.onnx",
-            FieldType::Synopsis => "models/synopsis_detector.onnx",
+            FieldType::Title => 0,
+            FieldType::Rating => 1,
+            FieldType::Genre => 2,
+            FieldType::Synopsis => 3,
         }
-    }
-
-    /// Input name in the ONNX model
-    pub fn input_name(&self) -> &'static str {
-        "features"
-    }
-
-    /// Output name in the ONNX model
-    pub fn output_name(&self) -> &'static str {
-        "probability"
     }
 
     /// Whether this field has multiple nodes per page
     pub fn is_multi(&self) -> bool {
         matches!(self, FieldType::Genre)
+    }
+
+    /// All field types in output order
+    pub fn all() -> &'static [FieldType] {
+        &[FieldType::Title, FieldType::Rating, FieldType::Genre, FieldType::Synopsis]
     }
 }
 
@@ -106,59 +101,76 @@ pub struct DetectionResult {
     pub tag_name: String,
 }
 
-/// LM Detector Engine — supports multiple field types
+/// Results for ALL fields from a single detection pass
+#[derive(Debug, Clone, Default)]
+pub struct AllFieldsResult {
+    pub title: Option<DetectionResult>,
+    pub rating: Option<DetectionResult>,
+    pub genres: Vec<DetectionResult>,
+    pub synopsis: Option<DetectionResult>,
+}
+
+/// LM Detector Engine — single unified model for all fields
 pub struct LmDetector {
-    sessions: HashMap<FieldType, Session>,
+    session: Session,
 }
 
 impl LmDetector {
-    /// Create a new detector loading models for the specified field types
-    pub fn new(field_types: &[FieldType]) -> Result<Self> {
-        let mut sessions = HashMap::new();
-        for ft in field_types {
-            let path = ft.model_path();
-            let model_path = std::path::Path::new(path);
-            if !model_path.exists() {
-                anyhow::bail!(
-                    "ONNX model not found at {}. Run lm/train_model.py first.",
-                    path
-                );
-            }
-            let session = Session::builder()?
-                .commit_from_file(model_path)?;
-            sessions.insert(*ft, session);
+    /// Create a new detector loading the unified multi-label model
+    pub fn new() -> Result<Self> {
+        let model_path = std::path::Path::new("models/field_detector.onnx");
+        if !model_path.exists() {
+            anyhow::bail!(
+                "ONNX model not found at {}. Run lm/train_model.py --mode multilabel first.",
+                model_path.display()
+            );
         }
-        Ok(Self { sessions })
+        let session = Session::builder()?
+            .commit_from_file(model_path)?;
+        Ok(Self { session })
     }
 
-    /// Create a detector for title field only (backward compatible)
-    pub fn new_title_only() -> Result<Self> {
-        Self::new(&[FieldType::Title])
+    /// Create a detector with a custom model path
+    pub fn from_path(model_path: &std::path::Path) -> Result<Self> {
+        if !model_path.exists() {
+            anyhow::bail!(
+                "ONNX model not found at {}",
+                model_path.display()
+            );
+        }
+        let session = Session::builder()?
+            .commit_from_file(model_path)?;
+        Ok(Self { session })
     }
 
-    /// Create a detector for all supported fields
-    pub fn new_all_fields() -> Result<Self> {
-        Self::new(&[FieldType::Title, FieldType::Rating, FieldType::Genre, FieldType::Synopsis])
-    }
-
-    /// Detect a specific field in HTML (single best result)
-    pub fn detect(&mut self, field: FieldType, html: &str) -> Option<DetectionResult> {
-        let session = self.sessions.get_mut(&field)?;
-
-        let dom = tl::parse(html, tl::ParserOptions::default()).ok()?;
+    /// Detect ALL fields in HTML in a single pass (most efficient).
+    ///
+    /// DOM walk + feature extraction happens once, ONNX inference runs once
+    /// per candidate node, and results are organized by field type.
+    pub fn detect_all_fields(&mut self, html: &str) -> AllFieldsResult {
+        let dom = match tl::parse(html, tl::ParserOptions::default()) {
+            Ok(d) => d,
+            Err(_) => return AllFieldsResult::default(),
+        };
         let parser = dom.parser();
 
-        // Step 1: Build node context map via DOM tree walking
+        // Step 1: Build node context map via DOM tree walking (1 pass)
         let contexts = Self::build_node_contexts(&dom, parser);
 
-        // Step 2: Collect candidate nodes
-        let mut candidates: Vec<(f32, String, String)> = Vec::new(); // (prob, text, tag_name)
+        // Step 2: Collect ALL candidate nodes with their features
+        let mut candidates: Vec<(CandidateInfo, [f32; NUM_FEATURES])> = Vec::new();
 
         for tag_name in CANDIDATE_TAGS {
             if let Some(mut iter) = dom.query_selector(tag_name) {
                 while let Some(handle) = iter.next() {
-                    let node = handle.get(parser)?;
-                    let tag = node.as_tag()?;
+                    let node = match handle.get(parser) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    let tag = match node.as_tag() {
+                        Some(t) => t,
+                        None => continue,
+                    };
 
                     let name = tag.name().as_utf8_str();
                     if SKIP_TAGS.contains(&name.as_ref()) {
@@ -184,145 +196,211 @@ impl LmDetector {
                     let node_id = handle.get_inner() as usize;
                     let ctx = contexts.get(&node_id);
 
-                    // Extract features with real structural data
+                    // Extract features
                     let features = Self::extract_features(tag, parser, &name, ctx);
-                    let prob = Self::infer_session(session, &features).unwrap_or(0.0);
 
-                    if prob > 0.01 {
-                        candidates.push((prob, text, name.as_ref().to_string()));
-                    }
+                    let info = CandidateInfo {
+                        text,
+                        tag_name: name.as_ref().to_string(),
+                    };
+
+                    candidates.push((info, features));
                 }
             }
         }
 
         if candidates.is_empty() {
-            return None;
+            return AllFieldsResult::default();
         }
 
-        // Find node with highest probability
-        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let (best_prob, best_text, best_tag) = &candidates[0];
-
-        // Threshold: only return if confidence > 0.5
-        if *best_prob > 0.5 {
-            let cleaned_text = match field {
-                FieldType::Title => {
-                    // Clean title: strip "Komik" prefix if present
-                    let cleaned = best_text.trim();
-                    if cleaned.to_lowercase().starts_with("komik") {
-                        let re = regex::Regex::new(r"(?i)^komik\s*").ok();
-                        re.map(|r| r.replace(cleaned, "").trim().to_string())
-                            .unwrap_or_else(|| cleaned.to_string())
-                    } else {
-                        cleaned.to_string()
-                    }
-                }
-                FieldType::Rating | FieldType::Genre | FieldType::Synopsis => {
-                    // Clean: just trim whitespace
-                    best_text.trim().to_string()
-                }
-            };
-
-            Some(DetectionResult {
-                text: cleaned_text,
-                confidence: *best_prob,
-                tag_name: best_tag.clone(),
-            })
-        } else {
-            None
+        // Step 3: Batch inference — run all candidates through the model at once
+        let batch_size = candidates.len();
+        let mut input_data = Vec::with_capacity(batch_size * NUM_FEATURES);
+        for (_, features) in &candidates {
+            input_data.extend_from_slice(features);
         }
-    }
 
-    /// Convenience method: detect title
-    pub fn detect_title(&mut self, html: &str) -> Option<String> {
-        self.detect(FieldType::Title, html).map(|r| r.text)
-    }
+        let input_array = ndarray::Array2::from_shape_vec(
+            (batch_size, NUM_FEATURES),
+            input_data,
+        ).unwrap_or_else(|_| ndarray::Array2::zeros((1, NUM_FEATURES)));
 
-    /// Convenience method: detect rating (returns f64)
-    pub fn detect_rating(&mut self, html: &str) -> Option<f64> {
-        self.detect(FieldType::Rating, html)
-            .and_then(|r| r.text.parse::<f64>().ok())
-    }
+        let input_tensor = ort::value::Tensor::from_array(input_array)
+            .unwrap_or_else(|_| {
+                ort::value::Tensor::from_array(ndarray::Array2::<f32>::zeros((1, NUM_FEATURES)))
+                    .unwrap()
+            });
+        let input_value: ort::value::Value = input_tensor.into();
 
-    /// Detect all instances of a multi-node field in HTML.
-    /// Returns all nodes above threshold, sorted by confidence (highest first).
-    pub fn detect_all(&mut self, field: FieldType, html: &str, threshold: f32) -> Vec<DetectionResult> {
-        let session = match self.sessions.get_mut(&field) {
-            Some(s) => s,
-            None => return Vec::new(),
+        let inputs = ort::inputs!["features" => input_value];
+
+        let output = match self.session.run(inputs) {
+            Ok(o) => o,
+            Err(_) => return AllFieldsResult::default(),
         };
 
-        let dom = match tl::parse(html, tl::ParserOptions::default()) {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
+        // Extract probabilities: shape [batch_size, 4]
+        let probs: Vec<f32> = match output["probabilities"]
+            .try_extract_tensor::<f32>()
+        {
+            Ok((_, arr)) => arr.to_vec(),
+            Err(_) => return AllFieldsResult::default(),
         };
-        let parser = dom.parser();
 
-        // Step 1: Build node context map via DOM tree walking
-        let contexts = Self::build_node_contexts(&dom, parser);
+        // Step 4: Organize results by field type
+        let mut result = AllFieldsResult::default();
 
-        // Step 2: Collect candidate nodes above threshold
-        let mut candidates: Vec<DetectionResult> = Vec::new();
+        // Track best for single-node fields
+        let mut best_title: Option<(f32, String, String)> = None;
+        let mut best_rating: Option<(f32, String, String)> = None;
+        let mut best_synopsis: Option<(f32, String, String)> = None;
 
-        for tag_name in CANDIDATE_TAGS {
-            if let Some(mut iter) = dom.query_selector(tag_name) {
-                while let Some(handle) = iter.next() {
-                    let node = match handle.get(parser) {
-                        Some(n) => n,
-                        None => continue,
-                    };
-                    let tag = match node.as_tag() {
-                        Some(t) => t,
-                        None => continue,
-                    };
+        // Track all above-threshold for multi-node fields
+        let mut genre_candidates: Vec<DetectionResult> = Vec::new();
 
-                    let name = tag.name().as_utf8_str();
-                    if SKIP_TAGS.contains(&name.as_ref()) {
-                        continue;
+        for (i, (info, _)) in candidates.iter().enumerate() {
+            let base = i * NUM_FIELDS;
+
+            // Title (index 0)
+            let title_prob = probs[base + 0];
+            if title_prob > 0.5 {
+                match &best_title {
+                    Some((best, _, _)) if title_prob <= *best => {}
+                    _ => {
+                        best_title = Some((title_prob, info.text.clone(), info.tag_name.clone()));
                     }
+                }
+            }
 
-                    // Skip empty-text nodes
-                    let text = tag.inner_text(parser).trim().to_string();
-                    if text.is_empty() {
-                        continue;
+            // Rating (index 1)
+            let rating_prob = probs[base + 1];
+            if rating_prob > 0.5 {
+                match &best_rating {
+                    Some((best, _, _)) if rating_prob <= *best => {}
+                    _ => {
+                        best_rating = Some((rating_prob, info.text.clone(), info.tag_name.clone()));
                     }
+                }
+            }
 
-                    // Look up structural context
-                    let node_id = handle.get_inner() as usize;
-                    let ctx = contexts.get(&node_id);
+            // Genre (index 2) — multi-node
+            let genre_prob = probs[base + 2];
+            if genre_prob > 0.5 {
+                genre_candidates.push(DetectionResult {
+                    text: info.text.clone(),
+                    confidence: genre_prob,
+                    tag_name: info.tag_name.clone(),
+                });
+            }
 
-                    // Extract features and run inference
-                    let features = Self::extract_features(tag, parser, &name, ctx);
-                    let prob = Self::infer_session(session, &features).unwrap_or(0.0);
-
-                    if prob > threshold {
-                        let cleaned_text = text.trim().to_string();
-                        candidates.push(DetectionResult {
-                            text: cleaned_text,
-                            confidence: prob,
-                            tag_name: name.as_ref().to_string(),
-                        });
+            // Synopsis (index 3)
+            let synopsis_prob = probs[base + 3];
+            if synopsis_prob > 0.4 {
+                match &best_synopsis {
+                    Some((best, _, _)) if synopsis_prob <= *best => {}
+                    _ => {
+                        best_synopsis = Some((synopsis_prob, info.text.clone(), info.tag_name.clone()));
                     }
                 }
             }
         }
 
-        // Sort by confidence (highest first)
-        candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
-        candidates
+        // Build final results
+        if let Some((prob, text, tag)) = best_title {
+            // Clean title: strip "Komik" prefix if present
+            let cleaned = if text.to_lowercase().starts_with("komik") {
+                let re = regex::Regex::new(r"(?i)^komik\s*").ok();
+                re.map(|r| r.replace(&text, "").trim().to_string())
+                    .unwrap_or_else(|| text.clone())
+            } else {
+                text.clone()
+            };
+            result.title = Some(DetectionResult {
+                text: cleaned,
+                confidence: prob,
+                tag_name: tag,
+            });
+        }
+
+        if let Some((prob, text, tag)) = best_rating {
+            result.rating = Some(DetectionResult {
+                text: text.trim().to_string(),
+                confidence: prob,
+                tag_name: tag,
+            });
+        }
+
+        if let Some((prob, text, tag)) = best_synopsis {
+            result.synopsis = Some(DetectionResult {
+                text: text.trim().to_string(),
+                confidence: prob,
+                tag_name: tag,
+            });
+        }
+
+        // Sort genre candidates by confidence (highest first)
+        genre_candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        result.genres = genre_candidates;
+
+        result
     }
 
-    /// Convenience method: detect all genre tags
+    // ================================================================
+    // Convenience methods (single-field, compatible with old API)
+    // ================================================================
+
+    /// Detect title in HTML
+    pub fn detect_title(&mut self, html: &str) -> Option<String> {
+        self.detect_all_fields(html).title.map(|r| r.text)
+    }
+
+    /// Detect rating in HTML (returns f64)
+    pub fn detect_rating(&mut self, html: &str) -> Option<f64> {
+        self.detect_all_fields(html).rating
+            .and_then(|r| r.text.parse::<f64>().ok())
+    }
+
+    /// Detect all genre tags in HTML
     pub fn detect_genres(&mut self, html: &str) -> Vec<String> {
-        self.detect_all(FieldType::Genre, html, 0.5)
+        self.detect_all_fields(html).genres
             .into_iter()
             .map(|r| r.text)
             .collect()
     }
 
-    /// Convenience method: detect synopsis text
+    /// Detect synopsis text in HTML
     pub fn detect_synopsis(&mut self, html: &str) -> Option<String> {
-        self.detect(FieldType::Synopsis, html).map(|r| r.text)
+        self.detect_all_fields(html).synopsis.map(|r| r.text)
+    }
+
+    /// Detect a specific field (for compatibility with per-field testing)
+    pub fn detect(&mut self, field: FieldType, html: &str) -> Option<DetectionResult> {
+        let results = self.detect_all_fields(html);
+        match field {
+            FieldType::Title => results.title,
+            FieldType::Rating => results.rating,
+            FieldType::Genre => results.genres.into_iter().next(),
+            FieldType::Synopsis => results.synopsis,
+        }
+    }
+
+    /// Detect all instances of a multi-node field (for genre)
+    pub fn detect_all(&mut self, field: FieldType, html: &str, threshold: f32) -> Vec<DetectionResult> {
+        let results = self.detect_all_fields(html);
+        match field {
+            FieldType::Genre => results.genres.into_iter()
+                .filter(|r| r.confidence >= threshold)
+                .collect(),
+            FieldType::Title => results.title.into_iter()
+                .filter(|r| r.confidence >= threshold)
+                .collect(),
+            FieldType::Rating => results.rating.into_iter()
+                .filter(|r| r.confidence >= threshold)
+                .collect(),
+            FieldType::Synopsis => results.synopsis.into_iter()
+                .filter(|r| r.confidence >= threshold)
+                .collect(),
+        }
     }
 
     // ================================================================
@@ -333,8 +411,8 @@ impl LmDetector {
     fn build_node_contexts(
         dom: &tl::VDom,
         parser: &tl::Parser,
-    ) -> HashMap<usize, NodeContext> {
-        let mut contexts: HashMap<usize, NodeContext> = HashMap::new();
+    ) -> std::collections::HashMap<usize, NodeContext> {
+        let mut contexts: std::collections::HashMap<usize, NodeContext> = std::collections::HashMap::new();
 
         let top_children = dom.children();
         let sibling_count = top_children.len();
@@ -370,7 +448,7 @@ impl LmDetector {
         sibling_count: usize,
         parent_info: Option<(&str, &HashSet<String>)>,
         ancestor_classes: &HashSet<String>,
-        contexts: &mut HashMap<usize, NodeContext>,
+        contexts: &mut std::collections::HashMap<usize, NodeContext>,
     ) {
         let tag = match node.as_tag() {
             Some(t) => t,
@@ -619,64 +697,10 @@ impl LmDetector {
 
         feat
     }
-
-    /// Run ONNX inference on a single feature vector using a specific session
-    fn infer_session(session: &mut Session, features: &[f32; NUM_FEATURES]) -> Result<f32> {
-        let input_array = ndarray::Array2::from_shape_vec(
-            (1, NUM_FEATURES),
-            features.to_vec(),
-        )?;
-
-        let input_tensor = ort::value::Tensor::from_array(input_array)?;
-        let input_value: ort::value::Value = input_tensor.into();
-
-        let inputs = ort::inputs!["features" => input_value];
-
-        let output = session.run(inputs)?;
-        let prob: f32 = output["probability"]
-            .try_extract_tensor::<f32>()?
-            .1
-            .first()
-            .copied()
-            .unwrap_or(0.0);
-
-        Ok(prob)
-    }
 }
 
-// ================================================================
-// Backward-compatible LmTitleDetector wrapper
-// ================================================================
-
-/// Legacy wrapper for title-only detection (backward compatible)
-pub struct LmTitleDetector {
-    inner: LmDetector,
-}
-
-impl LmTitleDetector {
-    pub fn new(model_path: &std::path::Path) -> Result<Self> {
-        // Load the model from the specified path
-        let session = Session::builder()?
-            .commit_from_file(model_path)?;
-        let mut sessions = HashMap::new();
-        sessions.insert(FieldType::Title, session);
-        Ok(Self {
-            inner: LmDetector { sessions },
-        })
-    }
-
-    pub fn new_default() -> Result<Self> {
-        let model_path = std::path::Path::new("models/title_detector.onnx");
-        if !model_path.exists() {
-            anyhow::bail!(
-                "ONNX model not found at {}. Run lm/train_model.py first.",
-                model_path.display()
-            );
-        }
-        Self::new(model_path)
-    }
-
-    pub fn detect_title(&mut self, html: &str) -> Option<String> {
-        self.inner.detect_title(html)
-    }
+/// Internal struct for candidate node info during detection
+struct CandidateInfo {
+    text: String,
+    tag_name: String,
 }
