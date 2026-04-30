@@ -249,7 +249,8 @@ fn create_configured_handle(
     // TCP_NODELAY: disable Nagle's algorithm — send HTTP request headers immediately
     // instead of buffering up to 200ms. Saves ~6-29 minutes across 8677 requests.
     handle.tcp_nodelay(true).ok();
-    handle.accept_encoding("gzip, deflate, br").ok();
+    // Only request gzip/deflate — static curl lacks brotli decoder (causes error 61)
+    handle.accept_encoding("gzip, deflate").ok();
     // pipewait: wait for HTTP/2 multiplexing before opening new connection
     handle.pipewait(true).ok();
 
