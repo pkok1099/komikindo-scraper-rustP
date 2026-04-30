@@ -311,9 +311,9 @@ enum Commands {
         #[arg(long, default_value_t = 10)]
         limit: usize,
 
-        /// Path ke ONNX model (default: models/title_detector.onnx)
-        #[arg(long)]
-        model: Option<String>,
+        /// Field yang dideteksi: title, rating, atau all
+        #[arg(long, default_value = "all")]
+        field: String,
     },
 }
 
@@ -441,8 +441,8 @@ fn main() -> Result<()> {
             Commands::UploadDb { file, batch_size } => {
                 run_upload_db(file, batch_size).await?;
             }
-            Commands::LmDetect { limit, model } => {
-                run_lm_detect(limit, model.clone()).await?;
+            Commands::LmDetect { limit, field } => {
+                run_lm_detect(limit, field.clone()).await?;
             }
         }
         Ok(())
@@ -624,20 +624,26 @@ async fn run_db_drop_all() -> Result<()> {
 // LM DETECT (experimental)
 // ============================================================
 
-async fn run_lm_detect(limit: usize, model_path: Option<String>) -> Result<()> {
-    use komikindo_scraper::lm_selector::LmTitleDetector;
+async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
+    use komikindo_scraper::lm_selector::{LmDetector, FieldType};
+
+    // Parse which fields to test
+    let fields: Vec<FieldType> = match field.as_str() {
+        "title" => vec![FieldType::Title],
+        "rating" => vec![FieldType::Rating],
+        "all" => vec![FieldType::Title, FieldType::Rating],
+        other => anyhow::bail!("Unknown field: '{}'. Use: title, rating, or all", other),
+    };
 
     println!("{}", "=".repeat(70));
-    println!("  LM TITLE DETECTION (EXPERIMENTAL)");
+    println!("  LM FIELD DETECTION (EXPERIMENTAL)");
+    println!("  Fields: {}", fields.iter().map(|f| format!("{:?}", f).to_lowercase()).collect::<Vec<_>>().join(", "));
     println!("{}", "=".repeat(70));
 
-    // Load ONNX model
-    let model = model_path.as_deref().unwrap_or("models/title_detector.onnx");
-    let model_path = std::path::Path::new(model);
-    println!("[LM] Loading ONNX model: {}", model_path.display());
-
-    let mut detector = LmTitleDetector::new(model_path)?;
-    println!("[LM] Model loaded successfully");
+    // Load ONNX models
+    println!("[LM] Loading ONNX models...");
+    let mut detector = LmDetector::new(&fields)?;
+    println!("[LM] Models loaded successfully");
 
     // Find latest JSONL
     let data_dir = std::path::Path::new("data");
@@ -649,13 +655,14 @@ async fn run_lm_detect(limit: usize, model_path: Option<String>) -> Result<()> {
     let jsonl_file = jsonl_file.unwrap();
     println!("[LM] Using JSONL: {}", jsonl_file.display());
 
-    // Read JSONL and get slugs
     let fetcher = Fetcher::new(30, None, false, 10)?;
     
-    let mut match_count = 0usize;
-    let mut mismatch_count = 0usize;
-    let mut miss_count = 0usize;
+    let mut field_stats: HashMap<String, (usize, usize, usize)> = HashMap::new();
+    for ft in &fields {
+        field_stats.insert(format!("{:?}", ft).to_lowercase(), (0, 0, 0)); // (match, mismatch, miss)
+    }
     let mut total = 0usize;
+    let mut fetch_fail = 0usize;
 
     let file = std::fs::File::open(&jsonl_file)?;
     let reader = std::io::BufReader::new(file);
@@ -665,7 +672,6 @@ async fn run_lm_detect(limit: usize, model_path: Option<String>) -> Result<()> {
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
 
-        // Skip error entries
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
             if val.get("_status").is_some() { continue; }
         }
@@ -674,38 +680,67 @@ async fn run_lm_detect(limit: usize, model_path: Option<String>) -> Result<()> {
             if total >= limit { break; }
             total += 1;
 
-            // Fetch the HTML page
             let slug = &detail.slug;
             let url = format!("{BASE_URL}/komik/{slug}/");
             
             match fetcher.fetch_page(&url).await {
                 Ok(html) => {
-                    // LM detection
-                    let lm_title = detector.detect_title(&html);
-                    
-                    // Hardcoded selector result
-                    let selector_title = detail.judul.as_deref().unwrap_or("(none)");
+                    for ft in &fields {
+                        let field_name = format!("{:?}", ft).to_lowercase();
+                        let stats = field_stats.get_mut(&field_name).unwrap();
 
-                    match lm_title {
-                        Some(lm) => {
-                            // Compare (case-insensitive, trimmed)
-                            let lm_clean = lm.trim().to_lowercase();
-                            let sel_clean = selector_title.trim().to_lowercase();
-                            if lm_clean == sel_clean {
-                                match_count += 1;
-                                println!("  [✓] {}: \"{}\"", slug, selector_title);
-                            } else {
-                                mismatch_count += 1;
-                                println!("  [✗] {}: LM=\"{}\" vs SELECTOR=\"{}\"", slug, lm, selector_title);
+                        match ft {
+                            FieldType::Title => {
+                                let lm_result = detector.detect_title(&html);
+                                let selector_val = detail.judul.as_deref().unwrap_or("(none)");
+                                match lm_result {
+                                    Some(lm) => {
+                                        let lm_clean = lm.trim().to_lowercase();
+                                        let sel_clean = selector_val.trim().to_lowercase();
+                                        if lm_clean == sel_clean {
+                                            stats.0 += 1;
+                                            println!("  [✓ title] {}: \"{}\"", slug, selector_val);
+                                        } else {
+                                            stats.1 += 1;
+                                            println!("  [✗ title] {}: LM=\"{}\" vs SELECTOR=\"{}\"", slug, lm, selector_val);
+                                        }
+                                    }
+                                    None => {
+                                        stats.2 += 1;
+                                        println!("  [? title] {}: no detection, SELECTOR=\"{}\"", slug, selector_val);
+                                    }
+                                }
                             }
-                        }
-                        None => {
-                            miss_count += 1;
-                            println!("  [?] {}: LM=no title detected, SELECTOR=\"{}\"", slug, selector_title);
+                            FieldType::Rating => {
+                                let lm_result = detector.detect_rating(&html);
+                                let selector_val = detail.rating;
+                                match lm_result {
+                                    Some(lm) => {
+                                        let match_ok = match selector_val {
+                                            Some(sel) => (lm - sel).abs() < 0.01,
+                                            None => false,
+                                        };
+                                        if match_ok {
+                                            stats.0 += 1;
+                                            println!("  [✓ rating] {}: {:.2} (selector={:.2})", slug, lm, selector_val.unwrap_or(0.0));
+                                        } else {
+                                            stats.1 += 1;
+                                            println!("  [✗ rating] {}: LM={:.2} vs SELECTOR={}", slug, lm,
+                                                selector_val.map(|v| format!("{:.2}", v)).unwrap_or("(none)".to_string()));
+                                        }
+                                    }
+                                    None => {
+                                        stats.2 += 1;
+                                        println!("  [? rating] {}: no detection, SELECTOR={}", slug,
+                                            selector_val.map(|v| format!("{:.2}", v)).unwrap_or("(none)".to_string()));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
                 Err(e) => {
+                    fetch_fail += 1;
                     println!("  [!] {}: fetch failed: {}", slug, e);
                 }
             }
@@ -716,9 +751,18 @@ async fn run_lm_detect(limit: usize, model_path: Option<String>) -> Result<()> {
     println!("{}", "=".repeat(70));
     println!("  LM DETECT RESULTS");
     println!("  Total tested:    {total}");
-    println!("  Match:           {match_count} ({:.0}%)", match_count as f64 / total as f64 * 100.0);
-    println!("  Mismatch:        {mismatch_count}");
-    println!("  No detection:    {miss_count}");
+    println!("  Fetch failures:  {fetch_fail}");
+    for ft in &fields {
+        let field_name = format!("{:?}", ft).to_lowercase();
+        let (m, mm, ms) = field_stats[&field_name];
+        let tested = m + mm + ms;
+        if tested > 0 {
+            println!("  --- {} ---", field_name);
+            println!("  Match:           {m} ({:.0}%)", m as f64 / tested as f64 * 100.0);
+            println!("  Mismatch:        {mm}");
+            println!("  No detection:    {ms}");
+        }
+    }
     println!("{}", "=".repeat(70));
 
     Ok(())
