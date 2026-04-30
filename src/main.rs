@@ -94,13 +94,17 @@ struct Cli {
     #[arg(long, global = true)]
     worker_threads: Option<usize>,
 
-    /// Max blocking threads for libcurl spawn_blocking (default: 512).
+    /// Max blocking threads for libcurl spawn_blocking (default: 256).
     /// Set equal to max-in-flight for optimal connection reuse.
-    #[arg(long, global = true, default_value_t = 512)]
+    /// Lower than 512 to prevent curl error 2 (Failed initialization)
+    /// when the blocking thread pool is exhausted under high concurrency.
+    #[arg(long, global = true, default_value_t = 256)]
     max_blocking_threads: usize,
 
-    /// Max in-flight HTTP requests (default: 512).
-    #[arg(long, global = true, default_value_t = 512)]
+    /// Max in-flight HTTP requests (default: 200).
+    /// 200 is optimal: avoids curl error 2 (blocking thread pool exhaustion)
+    /// while still achieving 60K+ komik/min throughput.
+    #[arg(long, global = true, default_value_t = 200)]
     max_in_flight: usize,
 
     #[command(subcommand)]
