@@ -303,6 +303,18 @@ enum Commands {
 
     /// Drop all scraper tables (DANGEROUS): removes tables completely
     DbDropAll,
+
+    /// [EXPERIMENTAL] LM-based title detection using ONNX model
+    /// Compare LM-detected title vs hardcoded selector title.
+    LmDetect {
+        /// Limit jumlah komik untuk test (0 = semua di JSONL terbaru)
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+
+        /// Path ke ONNX model (default: models/title_detector.onnx)
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 // ============================================================
@@ -428,6 +440,9 @@ fn main() -> Result<()> {
             }
             Commands::UploadDb { file, batch_size } => {
                 run_upload_db(file, batch_size).await?;
+            }
+            Commands::LmDetect { limit, model } => {
+                run_lm_detect(limit, model.clone()).await?;
             }
         }
         Ok(())
@@ -602,6 +617,110 @@ async fn run_db_drop_all() -> Result<()> {
     sqlx::query("DROP TABLE IF EXISTS komik CASCADE").execute(&pool).await?;
 
     println!("[DB] OK: dropped komik, chapters, komik_genres, scrape_log");
+    Ok(())
+}
+
+// ============================================================
+// LM DETECT (experimental)
+// ============================================================
+
+async fn run_lm_detect(limit: usize, model_path: Option<String>) -> Result<()> {
+    use komikindo_scraper::lm_selector::LmTitleDetector;
+
+    println!("{}", "=".repeat(70));
+    println!("  LM TITLE DETECTION (EXPERIMENTAL)");
+    println!("{}", "=".repeat(70));
+
+    // Load ONNX model
+    let model = model_path.as_deref().unwrap_or("models/title_detector.onnx");
+    let model_path = std::path::Path::new(model);
+    println!("[LM] Loading ONNX model: {}", model_path.display());
+
+    let mut detector = LmTitleDetector::new(model_path)?;
+    println!("[LM] Model loaded successfully");
+
+    // Find latest JSONL
+    let data_dir = std::path::Path::new("data");
+    let jsonl_file = jsonl::find_latest_jsonl(data_dir);
+    
+    if jsonl_file.is_none() {
+        anyhow::bail!("No JSONL files found in data/. Run full-fetch first.");
+    }
+    let jsonl_file = jsonl_file.unwrap();
+    println!("[LM] Using JSONL: {}", jsonl_file.display());
+
+    // Read JSONL and get slugs
+    let fetcher = Fetcher::new(30, None, false, 10)?;
+    
+    let mut match_count = 0usize;
+    let mut mismatch_count = 0usize;
+    let mut miss_count = 0usize;
+    let mut total = 0usize;
+
+    let file = std::fs::File::open(&jsonl_file)?;
+    let reader = std::io::BufReader::new(file);
+
+    for line in std::io::BufRead::lines(reader) {
+        let Ok(line) = line else { continue };
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+
+        // Skip error entries
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if val.get("_status").is_some() { continue; }
+        }
+
+        if let Ok(detail) = serde_json::from_str::<KomikDetail>(trimmed) {
+            if total >= limit { break; }
+            total += 1;
+
+            // Fetch the HTML page
+            let slug = &detail.slug;
+            let url = format!("{BASE_URL}/komik/{slug}/");
+            
+            match fetcher.fetch_page(&url).await {
+                Ok(html) => {
+                    // LM detection
+                    let lm_title = detector.detect_title(&html);
+                    
+                    // Hardcoded selector result
+                    let selector_title = detail.judul.as_deref().unwrap_or("(none)");
+
+                    match lm_title {
+                        Some(lm) => {
+                            // Compare (case-insensitive, trimmed)
+                            let lm_clean = lm.trim().to_lowercase();
+                            let sel_clean = selector_title.trim().to_lowercase();
+                            if lm_clean == sel_clean {
+                                match_count += 1;
+                                println!("  [✓] {}: \"{}\"", slug, selector_title);
+                            } else {
+                                mismatch_count += 1;
+                                println!("  [✗] {}: LM=\"{}\" vs SELECTOR=\"{}\"", slug, lm, selector_title);
+                            }
+                        }
+                        None => {
+                            miss_count += 1;
+                            println!("  [?] {}: LM=no title detected, SELECTOR=\"{}\"", slug, selector_title);
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  [!] {}: fetch failed: {}", slug, e);
+                }
+            }
+        }
+    }
+
+    println!();
+    println!("{}", "=".repeat(70));
+    println!("  LM DETECT RESULTS");
+    println!("  Total tested:    {total}");
+    println!("  Match:           {match_count} ({:.0}%)", match_count as f64 / total as f64 * 100.0);
+    println!("  Mismatch:        {mismatch_count}");
+    println!("  No detection:    {miss_count}");
+    println!("{}", "=".repeat(70));
+
     Ok(())
 }
 

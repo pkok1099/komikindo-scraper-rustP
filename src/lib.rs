@@ -6,5 +6,6 @@ pub mod config;
 pub mod db;
 pub mod fetcher;
 pub mod jsonl;
+pub mod lm_selector;
 pub mod parsers;
 pub mod scraper;

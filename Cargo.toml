@@ -48,6 +48,10 @@ sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "tls-rustls
 # ~30-50ns less overhead per lock/unlock vs std::sync::Mutex
 parking_lot = "0.12"
 
+# ONNX Runtime for LM-based selector engine
+ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
+ndarray = "0.17"
+
 # jemalloc for better allocation performance (5-15% improvement for allocation-heavy workloads)
 # Only available on Linux/macOS, not on Windows or some embedded targets
 [target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
