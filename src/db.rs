@@ -492,6 +492,7 @@ pub async fn sync_genres(pool: &PgPool, komik_id: i32, genre_ids: &[i16]) -> Res
 
 /// Write satu KomikDetail lengkap ke database.
 /// Returns (komik_id, is_new, chapters_inserted, genres_synced).
+#[allow(dead_code)]
 pub async fn write_komik(pool: &PgPool, detail: &KomikDetail) -> Result<WriteResult> {
     // 1. UPSERT komik
     let (komik_id, is_new) = upsert_komik(pool, detail).await?;
@@ -511,6 +512,7 @@ pub async fn write_komik(pool: &PgPool, detail: &KomikDetail) -> Result<WriteRes
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct WriteResult {
     pub komik_id: i32,
     pub is_new: bool,
