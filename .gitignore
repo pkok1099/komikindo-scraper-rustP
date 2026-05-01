@@ -44,3 +44,6 @@ lm/title_detector.json
 # SonarCloud
 .scannerwork/
 clippy-result.json
+
+# PID files
+full_fetch.pid
