@@ -40,3 +40,7 @@ lm/html_cache/
 lm/training_data.npz
 lm/title_detector.onnx
 lm/title_detector.json
+
+# SonarCloud
+.scannerwork/
+clippy-result.json

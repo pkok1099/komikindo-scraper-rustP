@@ -1,0 +1,86 @@
+# SonarCloud Code Analysis
+#
+# Runs on:
+#   - Push to main / experimental
+#   - Pull requests to main / experimental
+#
+# Analyzes Rust code with clippy + tests + coverage (tarpaulin).
+# Python training scripts are analyzed as supplementary.
+
+name: SonarCloud Analysis
+
+on:
+  push:
+    branches: [main, experimental]
+  pull_request:
+    branches: [main, experimental]
+
+permissions:
+  contents: read
+
+jobs:
+  sonarcloud:
+    name: SonarCloud
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Shallow clones must be disabled for Sonar
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry & git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-sonar-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-sonar-
+
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-sonar-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-sonar-
+
+      - name: Install tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+
+      - name: Generate coverage
+        run: |
+          cargo tarpaulin \
+            --skip-clean \
+            --target-dir target/tarpaulin \
+            --out Stdout \
+            --out Json \
+            --output-dir target/tarpaulin \
+            -- --test-threads=1
+        env:
+          # ONNX model required for test — skip ONNX-dependent tests if model absent
+          RUST_LOG: warn
+
+      - name: Run clippy ( SARIF )
+        run: |
+          cargo clippy --all-features --message-format=json &> clippy-result.json || true
+          cargo clippy --all-features --message-format=json
+        continue-on-error: true
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
