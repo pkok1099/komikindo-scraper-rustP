@@ -4,8 +4,9 @@
 #   - Push to main / experimental
 #   - Pull requests to main / experimental
 #
-# Analyzes Rust code with clippy + tests + coverage (tarpaulin).
-# Python training scripts are analyzed as supplementary.
+# Analyzes Rust code with clippy + coverage (tarpaulin).
+# LM/ONNX tests are excluded via --skip — they need the ONNX model
+# file which requires ort dynamic library not available in CI.
 
 name: SonarCloud Analysis
 
@@ -68,12 +69,12 @@ jobs:
             --out Stdout \
             --out Json \
             --output-dir target/tarpaulin \
-            -- --test-threads=1
+            --timeout 300 \
+            -- --test-threads=1 --skip test_lm_detect_all_fields
         env:
-          # ONNX model required for test — skip ONNX-dependent tests if model absent
           RUST_LOG: warn
 
-      - name: Run clippy ( SARIF )
+      - name: Run clippy
         run: |
           cargo clippy --all-features --message-format=json &> clippy-result.json || true
           cargo clippy --all-features --message-format=json

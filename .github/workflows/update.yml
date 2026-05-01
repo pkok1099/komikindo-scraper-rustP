@@ -1,11 +1,14 @@
 # KomikIndo Smart Update — runs every 6 hours
 #
 # Flow:
-#   1. Build Rust binary (release, statically linked curl + rustls)
+#   1. Download pre-built binary from latest GitHub Release
 #   2. Run `komikindo-scraper update --db`
 #   3. Upsert results to Supabase PostgreSQL
 #
-# All TLS: pure Rust (rustls) = ZERO system dependencies needed.
+# Why download instead of build?
+#   - Code rarely changes between cron runs — no point rebuilding every 6h
+#   - Download: ~2s | Build: ~3-5min → saves CI minutes & time
+#   - Release binary is the exact same artifact (musl, static, rustls)
 
 name: Smart Update
 
@@ -15,49 +18,37 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     # Only run on default branch (main) for scheduled runs
     if: github.event_name != 'schedule' || github.ref == 'refs/heads/main'
     env:
       RUST_LOG: warn
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-registry-v6-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-v6-
-
-      - name: Cache cargo target
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-target-v6-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-target-v6-
-
-      # No system dependencies needed (all rustls, static-curl)
-      - name: Build
-        run: cargo build --release --locked 2>&1
+      - name: Download latest release binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BINARY="komikindo-scraper-amd64"
+          echo "=== Downloading latest release binary ==="
+          gh release download --repo pkok1099/komikindo-scraper-rust \
+            --pattern "${BINARY}" \
+            --output komikindo-scraper \
+            --clobber
+          chmod +x komikindo-scraper
+          echo "=== Binary info ==="
+          ls -lh komikindo-scraper
+          file komikindo-scraper
 
       - name: Run smart update
         continue-on-error: true
         run: |
-          ./target/release/komikindo-scraper update \
+          ./komikindo-scraper update \
             --max-pages 3 \
             --max-age-minutes 380 \
             --db
