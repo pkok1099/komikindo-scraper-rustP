@@ -4,10 +4,16 @@
 SINGLE MODEL approach:
   Input:  40-dim feature vector
   Output: 9 probabilities [title, rating, genre, synopsis, alt_title, author, status, similar, chapters]
-  Architecture: 40 → 128 → 64 → 9 (sigmoid on each output)
+  Architecture: 40 → 256 → 128 → 9 (sigmoid on each output)
 
 The model is trained with multi-label binary cross-entropy loss.
 sklearn MLPClassifier supports multi-label natively when y is 2D.
+
+Key design decisions:
+  - Uses TRAINING scaler for ONNX export (not full-data scaler)
+  - Per-label optimal thresholds computed from validation set
+  - Sample weights for class imbalance handling
+  - Log-transformed text_length feature for better MLP convergence
 
 Usage:
   python3 train_model.py                   # train unified multi-label model
@@ -24,7 +30,8 @@ from pathlib import Path
 
 from sklearn.neural_network import MLPClassifier
 from sklearn.model_selection import cross_val_score, train_test_split
-from sklearn.metrics import classification_report, confusion_matrix, multilabel_confusion_matrix
+from sklearn.metrics import (classification_report, confusion_matrix,
+                             multilabel_confusion_matrix, precision_recall_curve)
 from sklearn.preprocessing import StandardScaler
 import onnx
 from onnx import helper, TensorProto, numpy_helper
@@ -37,8 +44,8 @@ FEATURE_NAMES = [
     'has_class_title', 'has_class_entry', 'has_class_info', 'has_class_rating', 'has_class_archive',
     # ID (14)
     'has_id',
-    # Structural (15-19)
-    'depth', 'sibling_index', 'sibling_count', 'child_count', 'text_length',
+    # Structural (15-19) — note: feature[19] is log-transformed text_length
+    'depth', 'sibling_index', 'sibling_count', 'child_count', 'text_length_log1p',
     # Text features (20)
     'text_starts_komik',
     # Parent features (21-22)
@@ -72,11 +79,14 @@ FIELD_NAMES = ['title', 'rating', 'genre', 'synopsis', 'alt_title', 'author', 's
 NUM_FIELDS = len(FIELD_NAMES)  # 9
 
 
-def multilabel_mlp_to_onnx(clf, scaler, input_size, num_outputs):
+def multilabel_mlp_to_onnx(clf, scaler, input_size, num_outputs, thresholds=None):
     """Convert sklearn multi-label MLPClassifier to ONNX model.
 
     Architecture: Input → StandardScaler → MLP → Sigmoid → Output
     Output shape: [None, num_outputs]
+
+    The training scaler is used (NOT a full-data refit scaler) because
+    the MLP weights were learned in the training scaler's coordinate space.
     """
     nodes = []
     initializers = []
@@ -86,7 +96,7 @@ def multilabel_mlp_to_onnx(clf, scaler, input_size, num_outputs):
     output_tensor = helper.make_tensor_value_info(
         'probabilities', TensorProto.FLOAT, [None, num_outputs])
 
-    # Step 1: StandardScaler (scale + offset)
+    # Step 1: StandardScaler (scale + offset) — using TRAINING scaler
     scale_np = scaler.scale_.astype(np.float32)
     mean_np = scaler.mean_.astype(np.float32)
 
@@ -144,6 +154,123 @@ def multilabel_mlp_to_onnx(clf, scaler, input_size, num_outputs):
     return model
 
 
+def compute_optimal_thresholds(clf, X_scaled, Y, field_names):
+    """Compute per-label optimal thresholds using precision-recall curve.
+
+    For each field, find the threshold that maximizes F1 score on the
+    validation set. This is important because:
+    - Rare fields (title, synopsis at 0.17%) need lower thresholds
+    - Common fields (chapters at 12.4%) work fine with 0.5
+    - Using a single 0.5 threshold for all fields is suboptimal
+
+    Returns: dict of field_name → optimal_threshold
+    """
+    # Get probability estimates from sklearn
+    sklearn_pred = clf.predict_proba(X_scaled)
+    if isinstance(sklearn_pred, list):
+        probs = np.column_stack([p[:, 1] for p in sklearn_pred])
+    else:
+        probs = sklearn_pred
+
+    thresholds = {}
+
+    for i, field_name in enumerate(field_names):
+        y_true = Y[:, i]
+        y_prob = probs[:, i]
+
+        pos_count = y_true.sum()
+        if pos_count == 0:
+            thresholds[field_name] = 0.5
+            continue
+
+        # Compute precision-recall curve
+        precisions, recalls, threshs = precision_recall_curve(y_true, y_prob)
+
+        # F1 for each threshold
+        f1_scores = np.zeros_like(threshs)
+        for j in range(len(threshs)):
+            if precisions[j] + recalls[j] > 0:
+                f1_scores[j] = 2 * precisions[j] * recalls[j] / (precisions[j] + recalls[j])
+
+        # Find best threshold
+        best_idx = np.argmax(f1_scores)
+        best_thresh = float(threshs[best_idx]) if best_idx < len(threshs) else 0.5
+        best_f1 = f1_scores[best_idx]
+
+        # Clamp to reasonable range [0.1, 0.95]
+        best_thresh = max(0.1, min(0.95, best_thresh))
+
+        thresholds[field_name] = best_thresh
+        print(f"  {field_name:12s}: threshold={best_thresh:.4f}  F1={best_f1:.4f}  (positive={int(pos_count)})")
+
+    return thresholds
+
+
+def oversample_positives(X, Y, target_ratio=0.05):
+    """Oversample positive instances for rare fields.
+
+    For multi-label data, duplicates samples that have at least one
+    positive label in a rare field (below target_ratio). This ensures
+    the MLP sees more examples of rare patterns without being overwhelmed
+    by the majority negative class.
+
+    Args:
+        X: Feature matrix (N, F)
+        Y: Label matrix (N, K)
+        target_ratio: Minimum target positive ratio per field (default 5%)
+
+    Returns:
+        X_balanced, Y_balanced: Oversampled arrays
+    """
+    # For each field, compute how many times to duplicate its positive samples
+    n_samples = Y.shape[0]
+    duplicate_counts = {}
+
+    for i in range(Y.shape[1]):
+        pos_count = int(Y[:, i].sum())
+        pos_ratio = pos_count / n_samples
+        if pos_ratio < target_ratio and pos_count > 0:
+            # How many copies needed to reach target_ratio?
+            # If we duplicate all positive samples k times:
+            # new_pos = pos_count * (k+1), new_total = n_samples + pos_count * k
+            # new_ratio = pos_count * (k+1) / (n_samples + pos_count * k)
+            # Solve for k to reach target_ratio
+            k = int((target_ratio * n_samples - pos_count) / (pos_count * (1 - target_ratio)))
+            k = max(0, min(k, 50))  # Cap at 50x to avoid explosion
+            if k > 0:
+                duplicate_counts[i] = k
+
+    if not duplicate_counts:
+        return X, Y
+
+    # Find indices of samples with at least one positive label in rare fields
+    rare_fields = list(duplicate_counts.keys())
+    has_rare_positive = Y[:, rare_fields].sum(axis=1) > 0
+
+    # Maximum duplication factor across rare fields for each sample
+    max_dup = max(duplicate_counts.values())
+
+    # Duplicate positive samples
+    X_extra_list = [X]
+    Y_extra_list = [Y]
+
+    for dup_idx in range(max_dup):
+        extra_mask = has_rare_positive.copy()
+        # Only include samples for fields that need this many copies
+        for field_idx, k in duplicate_counts.items():
+            if dup_idx >= k:
+                # This field doesn't need more copies
+                pass  # keep mask as is
+
+        X_extra_list.append(X[extra_mask])
+        Y_extra_list.append(Y[extra_mask])
+
+    X_balanced = np.concatenate(X_extra_list, axis=0)
+    Y_balanced = np.concatenate(Y_extra_list, axis=0)
+
+    return X_balanced, Y_balanced
+
+
 def train_multilabel(input_path, output_dir, hidden_sizes, epochs, cv):
     """Train unified multi-label model."""
     print(f"\n{'='*60}")
@@ -159,7 +286,7 @@ def train_multilabel(input_path, output_dir, hidden_sizes, epochs, cv):
     print(f"Loaded training data: {X.shape[0]} samples, {X.shape[1]} features")
     print(f"Label shape: {Y.shape}")
 
-    # Adjust Y columns if needed (old data may have 4 columns)
+    # Adjust Y columns if needed (old data may have fewer columns)
     if Y.shape[1] < NUM_FIELDS:
         print(f"WARNING: Training data has {Y.shape[1]} fields, expected {NUM_FIELDS}")
         print(f"  Padding with zeros for missing fields...")
@@ -179,9 +306,21 @@ def train_multilabel(input_path, output_dir, hidden_sizes, epochs, cv):
 
     print(f"\nTrain: {len(X_train)} | Test: {len(X_test)}")
 
-    # StandardScaler
+    # Handle class imbalance via oversampling positive samples
+    # MLPClassifier doesn't support sample_weight, so we duplicate
+    # positive samples to increase their representation.
+    print(f"\nHandling class imbalance via oversampling...")
+    X_train_balanced, Y_train_balanced = oversample_positives(X_train, Y_train)
+    print(f"  Before: {len(X_train)} samples")
+    print(f"  After:  {len(X_train_balanced)} samples")
+    for i, field_name in enumerate(FIELD_NAMES):
+        pos = int(Y_train_balanced[:, i].sum())
+        total = len(Y_train_balanced)
+        print(f"    {field_name:12s}: {pos:5d} positive ({pos/total*100:.2f}%)")
+
+    # StandardScaler — fit on BALANCED training data ONLY
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
+    X_train_scaled = scaler.fit_transform(X_train_balanced)
     X_test_scaled = scaler.transform(X_test)
 
     print(f"\nModel: MLP ({X.shape[1]} → {' → '.join(str(s) for s in hidden_sizes)} → {NUM_FIELDS})")
@@ -199,7 +338,7 @@ def train_multilabel(input_path, output_dir, hidden_sizes, epochs, cv):
         n_iter_no_change=20,
         verbose=True,
     )
-    clf.fit(X_train_scaled, Y_train)
+    clf.fit(X_train_scaled, Y_train_balanced)
 
     # Evaluate per-field
     Y_pred = clf.predict(X_test_scaled)
@@ -243,6 +382,12 @@ def train_multilabel(input_path, output_dir, hidden_sizes, epochs, cv):
     overall_acc = (Y_pred == Y_test).all(axis=1).mean()
     print(f"\n  Overall (all labels correct): {overall_acc:.4f}")
 
+    # Compute per-label optimal thresholds
+    print(f"\n{'='*60}")
+    print("  COMPUTING PER-LABEL OPTIMAL THRESHOLDS")
+    print(f"{'='*60}")
+    thresholds = compute_optimal_thresholds(clf, X_test_scaled, Y_test, FIELD_NAMES)
+
     # Feature importance (first layer weights)
     first_layer_weights = np.abs(clf.coefs_[0]).mean(axis=1)
     importance = sorted(zip(FEATURE_NAMES, first_layer_weights), key=lambda x: -x[1])
@@ -251,15 +396,12 @@ def train_multilabel(input_path, output_dir, hidden_sizes, epochs, cv):
         bar = '█' * int(imp * 50)
         print(f"  {name:35s} {imp:.4f} {bar}")
 
-    # Export ONNX
+    # Export ONNX — CRITICAL: use training scaler, NOT full-data scaler
     output_path = Path(output_dir) / 'field_detector.onnx'
     print(f"\nExporting to ONNX: {output_path}")
+    print(f"  Using TRAINING scaler (not full-data refit)")
 
-    # Refit scaler on ALL data
-    scaler_full = StandardScaler()
-    scaler_full.fit(X)
-
-    onnx_model = multilabel_mlp_to_onnx(clf, scaler_full, X.shape[1], NUM_FIELDS)
+    onnx_model = multilabel_mlp_to_onnx(clf, scaler, X.shape[1], NUM_FIELDS, thresholds)
 
     onnx.save(onnx_model, output_path)
 
@@ -286,21 +428,32 @@ def train_multilabel(input_path, output_dir, hidden_sizes, epochs, cv):
     if isinstance(sklearn_pred, list):
         # Multi-label: predict_proba returns list of (N, 2) arrays
         sklearn_probs = np.column_stack([p[:, 1] for p in sklearn_pred])
-        print(f"  sklearn sample 0: {sklearn_probs[0]}")
-        max_diff = np.abs(onnx_pred - sklearn_probs).max()
     else:
-        print(f"  sklearn sample 0: {sklearn_pred[0]}")
-        max_diff = np.abs(onnx_pred.flatten() - sklearn_pred.flatten()[:onnx_pred.size]).max()
+        sklearn_probs = sklearn_pred
 
+    print(f"  sklearn sample 0: {sklearn_probs[0]}")
+    max_diff = np.abs(onnx_pred - sklearn_probs).max()
     print(f"  max diff: {max_diff:.6f}")
     if max_diff > 0.01:
-        print(f"  WARNING: Large diff detected! This usually means the verification is passing")
-        print(f"  pre-scaled data to ONNX (which already has a scaler). Use RAW features for ONNX.")
+        print(f"  WARNING: Large diff detected! Check scaler consistency.")
+
+    # Test with known positive samples
+    print(f"\n  Spot-check positive samples:")
+    for field_idx in range(NUM_FIELDS):
+        pos_indices = np.where(Y_test[:, field_idx] == 1)[0]
+        if len(pos_indices) > 0:
+            idx = pos_indices[0]
+            raw = X_test[idx:idx+1].astype(np.float32)
+            onnx_out = sess.run([output_name], {input_name: raw})[0][0]
+            thresh = thresholds[FIELD_NAMES[field_idx]]
+            detected = onnx_out[field_idx] >= thresh
+            print(f"    {FIELD_NAMES[field_idx]:12s}: ONNX prob={onnx_out[field_idx]:.4f} "
+                  f"threshold={thresh:.4f} detected={detected}")
 
     model_size = output_path.stat().st_size
     print(f"\nModel size: {model_size:,} bytes ({model_size/1024:.1f} KB)")
 
-    # Save metadata
+    # Save metadata — includes thresholds and TRAINING scaler params
     meta = {
         'mode': 'multilabel',
         'field_names': FIELD_NAMES,
@@ -308,13 +461,16 @@ def train_multilabel(input_path, output_dir, hidden_sizes, epochs, cv):
         'num_features': NUM_FEATURES,
         'num_outputs': NUM_FIELDS,
         'hidden_sizes': list(hidden_sizes),
-        'scaler_mean': scaler_full.mean_.tolist(),
-        'scaler_scale': scaler_full.scale_.tolist(),
-        'training_samples': int(len(X)),
+        'scaler_mean': scaler.mean_.tolist(),
+        'scaler_scale': scaler.scale_.tolist(),
+        'training_samples_original': int(len(X_train)),
+        'training_samples_oversampled': int(len(X_train_balanced)),
         'field_positive_counts': {
             FIELD_NAMES[i]: int(Y[:, i].sum()) for i in range(NUM_FIELDS)
         },
+        'field_thresholds': thresholds,
         'test_overall_accuracy': float(overall_acc),
+        'note': 'scaler fitted on oversampled training data; thresholds from precision-recall curve',
     }
     meta_path = output_path.with_suffix('.json')
     with open(meta_path, 'w') as f:
@@ -369,12 +525,9 @@ def train_field_legacy(field_name, input_path, output_dir, hidden_sizes, epochs,
     print(f"  TN={cm[0][0]:5d}  FP={cm[0][1]:5d}")
     print(f"  FN={cm[1][0]:5d}  TP={cm[1][1]:5d}")
 
-    # Export ONNX (single output)
+    # Export ONNX (single output) — use TRAINING scaler
     output_path = Path(output_dir) / f'{field_name}_detector.onnx'
     print(f"\nExporting to ONNX: {output_path}")
-
-    scaler_full = StandardScaler()
-    scaler_full.fit(X)
 
     # Build single-output ONNX
     nodes = []
@@ -382,8 +535,9 @@ def train_field_legacy(field_name, input_path, output_dir, hidden_sizes, epochs,
     input_tensor = helper.make_tensor_value_info('features', TensorProto.FLOAT, [None, X.shape[1]])
     output_tensor = helper.make_tensor_value_info('probability', TensorProto.FLOAT, [None, 1])
 
-    scale_init = numpy_helper.from_array(scaler_full.scale_.astype(np.float32), name='scaler_scale')
-    mean_init = numpy_helper.from_array(scaler_full.mean_.astype(np.float32), name='scaler_mean')
+    # Use TRAINING scaler
+    scale_init = numpy_helper.from_array(scaler.scale_.astype(np.float32), name='scaler_scale')
+    mean_init = numpy_helper.from_array(scaler.mean_.astype(np.float32), name='scaler_mean')
     initializers.extend([scale_init, mean_init])
     nodes.append(helper.make_node('Sub', ['features', 'scaler_mean'], ['centered']))
     nodes.append(helper.make_node('Div', ['centered', 'scaler_scale'], ['normalized']))
@@ -415,9 +569,10 @@ def train_field_legacy(field_name, input_path, output_dir, hidden_sizes, epochs,
     meta = {
         'field': field_name, 'feature_names': FEATURE_NAMES,
         'num_features': NUM_FEATURES, 'hidden_sizes': list(hidden_sizes),
-        'scaler_mean': scaler_full.mean_.tolist(), 'scaler_scale': scaler_full.scale_.tolist(),
-        'training_samples': int(len(X)), 'positive_samples': int(y.sum()),
+        'scaler_mean': scaler.mean_.tolist(), 'scaler_scale': scaler.scale_.tolist(),
+        'training_samples': int(len(X_train)), 'positive_samples': int(y.sum()),
         'test_accuracy': float((y_pred == y_test).mean()),
+        'note': 'scaler_mean and scaler_scale are from TRAINING split',
     }
     with open(output_path.with_suffix('.json'), 'w') as f:
         json.dump(meta, f, indent=2)

@@ -4,7 +4,7 @@ Feature vector (40 dims):
   [0-8]   Tag one-hot: h1, h2, h3, span, div, a, td, i, meta
   [9-13]  Class contains: title, entry, info, rating, archive
   [14]    Has non-empty id
-  [15-19] Structural: depth, sibling_index, sibling_count, child_count, text_length
+  [15-19] Structural: depth, sibling_index, sibling_count, child_count, text_length_log1p
   [20]    Text starts with "Komik"
   [21-22] Parent: is_div, has_info_class
   [23-24] Attribute: has_itemprop, itemprop_is_ratingValue
@@ -33,7 +33,7 @@ FEATURE_NAMES = [
     # ID (14)
     'has_id',
     # Structural (15-19)
-    'depth', 'sibling_index', 'sibling_count', 'child_count', 'text_length',
+    'depth', 'sibling_index', 'sibling_count', 'child_count', 'text_length_log1p',
     # Text features (20)
     'text_starts_komik',
     # Parent features (21-22)
@@ -131,7 +131,12 @@ def extract_features(element, depth=0):
     features[17] = min(len(siblings) / 20.0, 1.0)
     children = [c for c in element.children if hasattr(c, 'name') and c.name is not None]
     features[18] = min(len(children) / 50.0, 1.0)
-    features[19] = min(len(element.get_text(strip=True)) / 200.0, 1.0)
+    # Log-transform text_length for better MLP convergence
+    # Raw text_length has heavy-tail distribution (0 to ~10K+).
+    # MLP is sensitive to feature scale, so log(1+x) compresses the range.
+    # This is capped at 1.0 for very long texts (log1p(200) ≈ 5.3, normalized to ~0.95)
+    text_len = len(element.get_text(strip=True))
+    features[19] = min(np.log1p(text_len) / 6.0, 1.0)
 
     # Text features (20)
     text = element.get_text(strip=True)

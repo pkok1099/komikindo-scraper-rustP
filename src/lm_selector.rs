@@ -12,7 +12,7 @@
 ///   [0-8]   Tag one-hot: h1, h2, h3, span, div, a, td, i, meta
 ///   [9-13]  Class contains: title, entry, info, rating, archive
 ///   [14]    Has non-empty id
-///   [15-19] Structural: depth, sibling_index, sibling_count, child_count, text_length
+///   [15-19] Structural: depth, sibling_index, sibling_count, child_count, text_length_log1p
 ///   [20]    Text starts with "Komik"
 ///   [21-22] Parent: is_div, has_info_class
 ///   [23-24] Attribute: has_itemprop, itemprop_value (ratingValue=1, else 0)
@@ -47,6 +47,11 @@ const SKIP_TAGS: &[&str] = &["script", "style", "noscript", "head"];
 const CANDIDATE_TAGS: &[&str] = &[
     "h1", "h2", "h3", "span", "div", "a", "td", "i", "meta",
     "p", "b", "strong", "label", "section", "article",
+];
+
+/// Field names in output order — must match Python FIELD_NAMES
+const FIELD_NAMES_RUST: &[&str] = &[
+    "title", "rating", "genre", "synopsis", "alt_title", "author", "status", "similar", "chapters",
 ];
 
 /// Which fields we can detect with LM — order must match Python FIELD_NAMES
@@ -160,6 +165,10 @@ pub struct AllFieldsResult {
 /// LM Detector Engine — single unified model for all fields
 pub struct LmDetector {
     session: Session,
+    /// Per-label optimal thresholds (loaded from model metadata JSON).
+    /// Each field has a different optimal threshold computed from
+    /// precision-recall curves on the validation set.
+    thresholds: [f32; NUM_FIELDS],
 }
 
 impl LmDetector {
@@ -191,6 +200,30 @@ impl LmDetector {
         }
     }
 
+    /// Load per-label thresholds from model metadata JSON.
+    /// Falls back to 0.5 for all fields if JSON is missing or invalid.
+    fn load_thresholds(model_path: &std::path::Path) -> [f32; NUM_FIELDS] {
+        let json_path = model_path.with_extension("json");
+        let mut thresholds = [0.5f32; NUM_FIELDS];
+
+        if let Ok(json_str) = std::fs::read_to_string(&json_path) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                if let Some(ts) = meta.get("field_thresholds") {
+                    for (i, field_name) in FIELD_NAMES_RUST.iter().enumerate() {
+                        if let Some(t) = ts.get(field_name) {
+                            if let Some(val) = t.as_f64() {
+                                thresholds[i] = val as f32;
+                            }
+                        }
+                    }
+                    return thresholds;
+                }
+            }
+        }
+
+        thresholds
+    }
+
     /// Create a new detector loading the unified multi-label model
     pub fn new() -> Result<Self> {
         Self::ensure_ort_dylib();
@@ -204,7 +237,8 @@ impl LmDetector {
         }
         let session = Session::builder()?
             .commit_from_file(model_path)?;
-        Ok(Self { session })
+        let thresholds = Self::load_thresholds(model_path);
+        Ok(Self { session, thresholds })
     }
 
     /// Create a detector with a custom model path
@@ -219,7 +253,8 @@ impl LmDetector {
         }
         let session = Session::builder()?
             .commit_from_file(model_path)?;
-        Ok(Self { session })
+        let thresholds = Self::load_thresholds(model_path);
+        Ok(Self { session, thresholds })
     }
 
     /// Detect ALL fields in HTML in a single pass (most efficient).
@@ -335,7 +370,7 @@ impl LmDetector {
             Err(_) => return AllFieldsResult::default(),
         };
 
-        // Step 4: Organize results by field type
+        // Step 4: Organize results by field type using per-label thresholds
         let mut result = AllFieldsResult::default();
 
         // Track best for single-node fields
@@ -356,7 +391,7 @@ impl LmDetector {
 
             // Title (index 0)
             let title_prob = probs[base + 0];
-            if title_prob > 0.5 {
+            if title_prob > self.thresholds[0] {
                 match &best_title {
                     Some((best, _)) if title_prob <= *best => {}
                     _ => best_title = Some((title_prob, info.clone())),
@@ -365,7 +400,7 @@ impl LmDetector {
 
             // Rating (index 1)
             let rating_prob = probs[base + 1];
-            if rating_prob > 0.5 {
+            if rating_prob > self.thresholds[1] {
                 match &best_rating {
                     Some((best, _)) if rating_prob <= *best => {}
                     _ => best_rating = Some((rating_prob, info.clone())),
@@ -374,7 +409,7 @@ impl LmDetector {
 
             // Genre (index 2) — multi-node
             let genre_prob = probs[base + 2];
-            if genre_prob > 0.5 {
+            if genre_prob > self.thresholds[2] {
                 genre_candidates.push(DetectionResult {
                     text: info.text.clone(),
                     confidence: genre_prob,
@@ -385,7 +420,7 @@ impl LmDetector {
 
             // Synopsis (index 3)
             let synopsis_prob = probs[base + 3];
-            if synopsis_prob > 0.4 {
+            if synopsis_prob > self.thresholds[3] {
                 match &best_synopsis {
                     Some((best, _)) if synopsis_prob <= *best => {}
                     _ => best_synopsis = Some((synopsis_prob, info.clone())),
@@ -394,7 +429,7 @@ impl LmDetector {
 
             // AltTitle (index 4)
             let alt_title_prob = probs[base + 4];
-            if alt_title_prob > 0.5 {
+            if alt_title_prob > self.thresholds[4] {
                 match &best_alt_title {
                     Some((best, _)) if alt_title_prob <= *best => {}
                     _ => best_alt_title = Some((alt_title_prob, info.clone())),
@@ -403,7 +438,7 @@ impl LmDetector {
 
             // Author (index 5)
             let author_prob = probs[base + 5];
-            if author_prob > 0.5 {
+            if author_prob > self.thresholds[5] {
                 match &best_author {
                     Some((best, _)) if author_prob <= *best => {}
                     _ => best_author = Some((author_prob, info.clone())),
@@ -412,7 +447,7 @@ impl LmDetector {
 
             // Status (index 6)
             let status_prob = probs[base + 6];
-            if status_prob > 0.5 {
+            if status_prob > self.thresholds[6] {
                 match &best_status {
                     Some((best, _)) if status_prob <= *best => {}
                     _ => best_status = Some((status_prob, info.clone())),
@@ -421,7 +456,7 @@ impl LmDetector {
 
             // Similar (index 7) — multi-node
             let similar_prob = probs[base + 7];
-            if similar_prob > 0.5 {
+            if similar_prob > self.thresholds[7] {
                 similar_candidates.push(DetectionResult {
                     text: info.text.clone(),
                     confidence: similar_prob,
@@ -432,7 +467,7 @@ impl LmDetector {
 
             // Chapters (index 8) — multi-node
             let chapters_prob = probs[base + 8];
-            if chapters_prob > 0.5 {
+            if chapters_prob > self.thresholds[8] {
                 chapter_candidates.push(DetectionResult {
                     text: info.text.clone(),
                     confidence: chapters_prob,
@@ -915,9 +950,11 @@ impl LmDetector {
             feat[37] = 0.0;
         }
 
-        // [19] Text length (normalized: /200.0, capped at 1.0)
+        // [19] Text length — log-transformed for better MLP convergence
+        // Raw text_length has heavy-tail distribution, log(1+x) compresses range
         let text = tag.inner_text(parser).trim().to_string();
-        feat[19] = (text.len() as f32 / 200.0).min(1.0);
+        let text_len = text.len() as f32;
+        feat[19] = (text_len.ln_1p() / 6.0).min(1.0);
 
         // [20] Text starts with "Komik"
         feat[20] = if text.to_lowercase().starts_with("komik") { 1.0 } else { 0.0 };
