@@ -264,17 +264,22 @@ def train_multilabel(input_path, output_dir, hidden_sizes, epochs, cv):
     onnx.save(onnx_model, output_path)
 
     # Verify ONNX model
+    # IMPORTANT: ONNX model includes StandardScaler, so pass RAW (unscaled) features
     import onnxruntime as ort
     sess = ort.InferenceSession(str(output_path))
     input_name = sess.get_inputs()[0].name
     output_name = sess.get_outputs()[0].name
 
-    sample = X_test_scaled[:5].astype(np.float32)
-    onnx_pred = sess.run([output_name], {input_name: sample})[0]
-    sklearn_pred = clf.predict_proba(sample)
+    # Use RAW test features (ONNX has scaler built-in)
+    sample_raw = X_test[:5].astype(np.float32)
+    onnx_pred = sess.run([output_name], {input_name: sample_raw})[0]
+
+    # sklearn expects pre-scaled input
+    sample_scaled = X_test_scaled[:5].astype(np.float32)
+    sklearn_pred = clf.predict_proba(sample_scaled)
 
     # sklearn multi-label predict_proba returns list of arrays
-    print(f"\nONNX verification (5 samples):")
+    print(f"\nONNX verification (5 samples, raw input):")
     print(f"  ONNX output shape: {onnx_pred.shape}")
     print(f"  ONNX sample 0: {onnx_pred[0]}")
 
@@ -288,6 +293,9 @@ def train_multilabel(input_path, output_dir, hidden_sizes, epochs, cv):
         max_diff = np.abs(onnx_pred.flatten() - sklearn_pred.flatten()[:onnx_pred.size]).max()
 
     print(f"  max diff: {max_diff:.6f}")
+    if max_diff > 0.01:
+        print(f"  WARNING: Large diff detected! This usually means the verification is passing")
+        print(f"  pre-scaled data to ONNX (which already has a scaler). Use RAW features for ONNX.")
 
     model_size = output_path.stat().st_size
     print(f"\nModel size: {model_size:,} bytes ({model_size/1024:.1f} KB)")

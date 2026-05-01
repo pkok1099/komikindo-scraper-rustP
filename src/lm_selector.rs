@@ -163,8 +163,38 @@ pub struct LmDetector {
 }
 
 impl LmDetector {
+    /// Ensure the ONNX Runtime shared library can be found.
+    ///
+    /// `ort` with `load-dynamic` needs either:
+    ///   1. `ORT_DYLIB_PATH` env var, or
+    ///   2. The library on `LD_LIBRARY_PATH`
+    ///
+    /// This function checks common locations and sets `ORT_DYLIB_PATH`
+    /// automatically if the library hasn't been located yet.
+    fn ensure_ort_dylib() {
+        if std::env::var("ORT_DYLIB_PATH").is_ok() {
+            return; // Already set by the user
+        }
+
+        // Common locations for the ONNX Runtime shared library
+        let candidates = [
+            "/home/z/.local/lib/python3.13/site-packages/onnxruntime/capi/libonnxruntime.so.1.25.1",
+            "/usr/lib/libonnxruntime.so",
+            "/usr/local/lib/libonnxruntime.so",
+        ];
+
+        for path in &candidates {
+            if std::path::Path::new(path).exists() {
+                std::env::set_var("ORT_DYLIB_PATH", path);
+                return;
+            }
+        }
+    }
+
     /// Create a new detector loading the unified multi-label model
     pub fn new() -> Result<Self> {
+        Self::ensure_ort_dylib();
+
         let model_path = std::path::Path::new("models/field_detector.onnx");
         if !model_path.exists() {
             anyhow::bail!(
@@ -179,6 +209,8 @@ impl LmDetector {
 
     /// Create a detector with a custom model path
     pub fn from_path(model_path: &std::path::Path) -> Result<Self> {
+        Self::ensure_ort_dylib();
+
         if !model_path.exists() {
             anyhow::bail!(
                 "ONNX model not found at {}",
