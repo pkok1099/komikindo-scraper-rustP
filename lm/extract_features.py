@@ -1,6 +1,6 @@
 """Feature extraction for DOM nodes — shared between collect and Rust integration.
 
-Feature vector (32 dims):
+Feature vector (40 dims):
   [0-8]   Tag one-hot: h1, h2, h3, span, div, a, td, i, meta
   [9-13]  Class contains: title, entry, info, rating, archive
   [14]    Has non-empty id
@@ -9,9 +9,14 @@ Feature vector (32 dims):
   [21-22] Parent: is_div, has_info_class
   [23-24] Attribute: has_itemprop, itemprop_is_ratingValue
   [25-27] Inside ancestor: spe, infox, infoanime
-  [28]    Bold text ratio
-  [29-30] Link count, has rel=tag
+  [28-30] Content: bold_text_ratio, link_count, has_rel_tag
   [31]    Font size indicator
+  [32-34] Bold text label patterns: contains_status, contains_author, contains_alternative
+  [35]    Class contains: desc/synopsis/entry-content
+  [36]    Has href containing "-chapter-"
+  [37]    Inside ancestor: mirip/bxcl
+  [38]    Has class: lchx, series
+  [39]    Text contains "Chapter"
 """
 
 import numpy as np
@@ -41,9 +46,21 @@ FEATURE_NAMES = [
     'bold_text_ratio', 'link_count', 'has_rel_tag',
     # Semantic features (31)
     'font_size_indicator',
+    # NEW: Bold text label patterns (32-34)
+    'bold_contains_status', 'bold_contains_author', 'bold_contains_alternative',
+    # NEW: Class/content patterns (35)
+    'has_class_desc_or_synopsis',
+    # NEW: Chapter link pattern (36)
+    'href_contains_chapter',
+    # NEW: Ancestor: mirip/bxcl containers (37)
+    'is_inside_mirip_or_bxcl',
+    # NEW: Class: lchx/series (38)
+    'has_class_lchx_or_series',
+    # NEW: Text contains "Chapter" (39)
+    'text_contains_chapter',
 ]
 
-NUM_FEATURES = len(FEATURE_NAMES)  # 32
+NUM_FEATURES = len(FEATURE_NAMES)  # 40
 
 
 def get_ancestors(element):
@@ -74,8 +91,16 @@ def is_first_significant(element):
     return False
 
 
+def _get_bold_text(element):
+    """Get concatenated text from all <b>/<strong> children."""
+    bold_texts = []
+    for b in element.find_all(['b', 'strong']):
+        bold_texts.append(b.get_text(strip=True).lower())
+    return ' '.join(bold_texts)
+
+
 def extract_features(element, depth=0):
-    """Extract 32-dim feature vector from a DOM element."""
+    """Extract 40-dim feature vector from a DOM element."""
     features = np.zeros(NUM_FEATURES, dtype=np.float32)
 
     tag = element.name.lower() if element.name else ''
@@ -126,8 +151,12 @@ def extract_features(element, depth=0):
     # Ancestor features (25-27)
     ancestors = get_ancestors(element)
     ancestor_classes = set()
+    ancestor_ids = set()
     for anc in ancestors:
         ancestor_classes.update(get_classes(anc))
+        anc_id = anc.get('id', '')
+        if anc_id:
+            ancestor_ids.add(anc_id.lower())
     features[25] = 1.0 if 'spe' in ancestor_classes else 0.0
     features[26] = 1.0 if 'infox' in ancestor_classes else 0.0
     features[27] = 1.0 if 'infoanime' in ancestor_classes else 0.0
@@ -146,6 +175,33 @@ def extract_features(element, depth=0):
     # Font size indicator (31)
     font_map = {'h1': 1.0, 'h2': 0.8, 'h3': 0.6, 'h4': 0.5, 'h5': 0.4, 'h6': 0.3}
     features[31] = font_map.get(tag, 0.0)
+
+    # === NEW FEATURES (32-39) ===
+
+    # Bold text label patterns (32-34) — for alt_title, author, status detection
+    bold_text_joined = _get_bold_text(element)
+    features[32] = 1.0 if 'status' in bold_text_joined else 0.0
+    features[33] = 1.0 if any(kw in bold_text_joined for kw in ('pengarang', 'author')) else 0.0
+    features[34] = 1.0 if any(kw in bold_text_joined for kw in ('alternative', 'alternatif')) else 0.0
+
+    # Class: desc/synopsis/entry-content (35)
+    features[35] = 1.0 if any(c in classes for c in ('desc', 'synopsis', 'entry-content')) else 0.0
+
+    # href contains "-chapter-" (36)
+    href = element.get('href', '')
+    features[36] = 1.0 if '-chapter-' in href.lower() else 0.0
+
+    # Ancestor: mirip/bxcl containers (37)
+    features[37] = 1.0 if ('mirip' in ancestor_ids or
+                           'mirip' in ancestor_classes or
+                           'bxcl' in ancestor_classes or
+                           'chapter_list' in ancestor_ids) else 0.0
+
+    # Class: lchx/series (38)
+    features[38] = 1.0 if any(c in classes for c in ('lchx', 'series')) else 0.0
+
+    # Text contains "Chapter" (39)
+    features[39] = 1.0 if 'chapter' in text.lower() else 0.0
 
     return features
 
@@ -247,3 +303,96 @@ def find_synopsis_node(soup):
                 return div
 
     return None
+
+
+def find_alt_title_node(soup):
+    """Find the alternative title <span> node (single-node field).
+
+    Alt title is in: div.spe > span containing <b>Alternative/Alternatif</b>
+    The span itself is the target node.
+    """
+    spe = soup.select_one('div.spe')
+    if spe:
+        for span in spe.find_all('span'):
+            bold = span.find(['b', 'strong'])
+            if bold:
+                bold_text = bold.get_text(strip=True).lower().rstrip(':')
+                if 'alternative' in bold_text or 'alternatif' in bold_text:
+                    return span
+    return None
+
+
+def find_author_node(soup):
+    """Find the author <span> node (single-node field).
+
+    Author is in: div.spe > span containing <b>Pengarang/Author</b>
+    """
+    spe = soup.select_one('div.spe')
+    if spe:
+        for span in spe.find_all('span'):
+            bold = span.find(['b', 'strong'])
+            if bold:
+                bold_text = bold.get_text(strip=True).lower().rstrip(':')
+                if 'pengarang' in bold_text or 'author' in bold_text:
+                    return span
+    return None
+
+
+def find_status_node(soup):
+    """Find the status <span> node (single-node field).
+
+    Status is in: div.spe > span containing <b>Status</b>
+    """
+    spe = soup.select_one('div.spe')
+    if spe:
+        for span in spe.find_all('span'):
+            bold = span.find(['b', 'strong'])
+            if bold:
+                bold_text = bold.get_text(strip=True).lower().rstrip(':')
+                if 'status' in bold_text:
+                    return span
+    return None
+
+
+def find_similar_nodes(soup):
+    """Find similar/recommended komik <a> nodes (multi-node field).
+
+    Similar links: div#mirip > li > a.series[href*="/komik/"]
+    Returns a list of BeautifulSoup elements.
+    """
+    similar = []
+    mirip = soup.select_one('div#mirip')
+    if mirip:
+        # Find all a.series links with /komik/ href inside mirip
+        for a in mirip.find_all('a', class_='series'):
+            href = a.get('href', '')
+            if '/komik/' in href:
+                similar.append(a)
+    return similar
+
+
+def find_chapter_nodes(soup):
+    """Find chapter <a> nodes (multi-node field).
+
+    Chapter links: div.bxcl a[href*='-chapter-'] or span.lchx a
+    Returns a list of BeautifulSoup elements.
+    """
+    chapters = []
+    container_selectors = ['div.bxcl', 'div#chapter_list']
+
+    for container_sel in container_selectors:
+        container = soup.select_one(container_sel)
+        if container:
+            # Primary: a[href*='-chapter-']
+            for a in container.find_all('a', href=True):
+                if '-chapter-' in a.get('href', '').lower():
+                    chapters.append(a)
+            if chapters:
+                return chapters
+
+    # Fallback: any a[href*='-chapter-']
+    for a in soup.find_all('a', href=True):
+        if '-chapter-' in a.get('href', '').lower():
+            chapters.append(a)
+
+    return chapters

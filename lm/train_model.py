@@ -2,9 +2,9 @@
 """Train unified multi-label field detection LM → export ONNX.
 
 SINGLE MODEL approach:
-  Input:  32-dim feature vector (same as before)
-  Output: 4 probabilities [title, rating, genre, synopsis]
-  Architecture: 32 → 128 → 64 → 4 (sigmoid on each output)
+  Input:  40-dim feature vector
+  Output: 9 probabilities [title, rating, genre, synopsis, alt_title, author, status, similar, chapters]
+  Architecture: 40 → 128 → 64 → 9 (sigmoid on each output)
 
 The model is trained with multi-label binary cross-entropy loss.
 sklearn MLPClassifier supports multi-label natively when y is 2D.
@@ -13,7 +13,7 @@ Usage:
   python3 train_model.py                   # train unified multi-label model
   python3 train_model.py --mode multilabel # same as above
   python3 train_model.py --mode per-field  # legacy per-field models
-  python3 train_model.py --hidden-sizes 128,64
+  python3 train_model.py --hidden-sizes 256,128,64
   python3 train_model.py --epochs 500
 """
 
@@ -51,13 +51,25 @@ FEATURE_NAMES = [
     'bold_text_ratio', 'link_count', 'has_rel_tag',
     # Semantic features (31)
     'font_size_indicator',
+    # Bold text label patterns (32-34)
+    'bold_contains_status', 'bold_contains_author', 'bold_contains_alternative',
+    # Class/content patterns (35)
+    'has_class_desc_or_synopsis',
+    # Chapter link pattern (36)
+    'href_contains_chapter',
+    # Ancestor: mirip/bxcl containers (37)
+    'is_inside_mirip_or_bxcl',
+    # Class: lchx/series (38)
+    'has_class_lchx_or_series',
+    # Text contains "Chapter" (39)
+    'text_contains_chapter',
 ]
 
-NUM_FEATURES = len(FEATURE_NAMES)  # 32
+NUM_FEATURES = len(FEATURE_NAMES)  # 40
 
 # Field order — must match Rust FieldType enum
-FIELD_NAMES = ['title', 'rating', 'genre', 'synopsis']
-NUM_FIELDS = len(FIELD_NAMES)
+FIELD_NAMES = ['title', 'rating', 'genre', 'synopsis', 'alt_title', 'author', 'status', 'similar', 'chapters']
+NUM_FIELDS = len(FIELD_NAMES)  # 9
 
 
 def multilabel_mlp_to_onnx(clf, scaler, input_size, num_outputs):
@@ -135,7 +147,7 @@ def multilabel_mlp_to_onnx(clf, scaler, input_size, num_outputs):
 def train_multilabel(input_path, output_dir, hidden_sizes, epochs, cv):
     """Train unified multi-label model."""
     print(f"\n{'='*60}")
-    print(f"  Training: UNIFIED MULTI-LABEL MODEL")
+    print(f"  Training: UNIFIED MULTI-LABEL MODEL (9 fields)")
     print(f"  Fields: {FIELD_NAMES}")
     print(f"{'='*60}")
 
@@ -147,10 +159,18 @@ def train_multilabel(input_path, output_dir, hidden_sizes, epochs, cv):
     print(f"Loaded training data: {X.shape[0]} samples, {X.shape[1]} features")
     print(f"Label shape: {Y.shape}")
 
+    # Adjust Y columns if needed (old data may have 4 columns)
+    if Y.shape[1] < NUM_FIELDS:
+        print(f"WARNING: Training data has {Y.shape[1]} fields, expected {NUM_FIELDS}")
+        print(f"  Padding with zeros for missing fields...")
+        padded = np.zeros((Y.shape[0], NUM_FIELDS), dtype=np.int32)
+        padded[:, :Y.shape[1]] = Y
+        Y = padded
+
     for i, field_name in enumerate(FIELD_NAMES):
         pos = int(Y[:, i].sum())
         total = Y.shape[0]
-        print(f"  {field_name:10s}: {pos:5d} positive ({pos/total*100:.2f}%)")
+        print(f"  {field_name:12s}: {pos:5d} positive ({pos/total*100:.2f}%)")
 
     # Split train/test — stratify by any-positive indicator
     has_any_positive = Y.sum(axis=1) > 0
@@ -191,7 +211,19 @@ def train_multilabel(input_path, output_dir, hidden_sizes, epochs, cv):
     for i, field_name in enumerate(FIELD_NAMES):
         y_true = Y_test[:, i]
         y_pred = Y_pred[:, i]
+
+        # Handle case where a field may have no positive samples in test
+        if y_true.sum() == 0 and y_pred.sum() == 0:
+            print(f"\n  --- {field_name} --- (no positive samples in test)")
+            continue
+
         cm = confusion_matrix(y_true, y_pred)
+        if cm.size == 1:
+            # Only one class in test
+            print(f"\n  --- {field_name} --- (single class in test)")
+            print(f"  TN={cm[0][0]:5d}")
+            continue
+
         tn, fp, fn, tp = cm.ravel()
 
         accuracy = (tn + tp) / (tn + fp + fn + tp)
@@ -214,10 +246,10 @@ def train_multilabel(input_path, output_dir, hidden_sizes, epochs, cv):
     # Feature importance (first layer weights)
     first_layer_weights = np.abs(clf.coefs_[0]).mean(axis=1)
     importance = sorted(zip(FEATURE_NAMES, first_layer_weights), key=lambda x: -x[1])
-    print(f"\nFeature Importance (top 15):")
-    for name, imp in importance[:15]:
+    print(f"\nFeature Importance (top 20):")
+    for name, imp in importance[:20]:
         bar = '█' * int(imp * 50)
-        print(f"  {name:30s} {imp:.4f} {bar}")
+        print(f"  {name:35s} {imp:.4f} {bar}")
 
     # Export ONNX
     output_path = Path(output_dir) / 'field_detector.onnx'
@@ -396,9 +428,9 @@ def main():
                         help='Which field (per-field mode only)')
     parser.add_argument('--output-dir', type=str, default='../models',
                         help='Output directory for ONNX files')
-    parser.add_argument('--hidden-sizes', type=str, default='128,64',
+    parser.add_argument('--hidden-sizes', type=str, default='256,128',
                         help='Hidden layer sizes (comma-separated)')
-    parser.add_argument('--epochs', type=int, default=300,
+    parser.add_argument('--epochs', type=int, default=500,
                         help='Max iterations')
     parser.add_argument('--cv', type=int, default=0,
                         help='Cross-validation folds (0=none)')

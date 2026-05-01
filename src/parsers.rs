@@ -1525,8 +1525,46 @@ pub fn parse_komik_detail_lm(
     extract_thumbnail(&dom, parser, &mut detail);
 
     // === INFO (status, author, alt title) ===
-    // Keep hardcoded — these require bold-label matching, not node detection
-    extract_spe_info(&dom, parser, &mut detail);
+    // LM first, hardcoded fallback
+    match &lm_results.alt_title {
+        Some(result) => { detail.alternative_title = Some(result.text.clone()); }
+        None => {} // Will be filled by extract_spe_info fallback below
+    }
+    match &lm_results.author {
+        Some(result) => { detail.author = Some(result.text.clone()); }
+        None => {}
+    }
+    match &lm_results.status {
+        Some(result) => {
+            if let Some(id) = status_to_id(&result.text) {
+                detail.status_id = Some(id);
+            }
+        }
+        None => {}
+    }
+
+    // Fallback: hardcoded spe info for any missing fields
+    if detail.alternative_title.is_none() || detail.author.is_none() || detail.status_id.is_none() {
+        extract_spe_info(&dom, parser, &mut detail);
+    }
+
+    // === TYPE from span.typeflag (hardcoded — not LM detected) ===
+    if detail.tipe.is_none() {
+        if let Some(mut iter) = dom.query_selector("span.typeflag") {
+            if let Some(handle) = iter.next() {
+                if let Some(node) = handle.get(parser) {
+                    if let Some(tag) = node.as_tag() {
+                        for cls in get_classes(tag) {
+                            if cls != "typeflag" {
+                                detail.tipe = Some(cls.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // === GENRE: LM first, hardcoded fallback ===
     let lm_genres: Vec<String> = lm_results.genres.iter().map(|r| r.text.clone()).collect();
@@ -1661,14 +1699,60 @@ pub fn parse_komik_detail_lm(
         }
     }
 
-    // === CHAPTERS === (hardcoded — container-level, not LM-detected)
-    detail.chapters = extract_chapters(&dom, parser);
+    // === CHAPTERS: LM first, hardcoded fallback ===
+    if !lm_results.chapters.is_empty() {
+        for ch in &lm_results.chapters {
+            if let Some(ref href) = ch.href {
+                let full_url = if href.starts_with('/') {
+                    format!("{BASE_URL}{href}")
+                } else {
+                    href.clone()
+                };
+                if let Some(number) = extract_chapter_number(&ch.text, &full_url) {
+                    detail.chapters.push(ChapterInfo {
+                        number,
+                        url: full_url,
+                        cdn_domain_id: None,
+                        cdn_path_prefix: None,
+                        image_filenames: None,
+                        image_ext_ids: None,
+                        total_images: None,
+                    });
+                }
+            }
+        }
+        // Sort descending by chapter number
+        if detail.chapters.len() > 1 {
+            detail.chapters.sort_by(|a, b| b.number.total_cmp(&a.number));
+        }
+    }
+    if detail.chapters.is_empty() {
+        // Fallback: hardcoded selector
+        detail.chapters = extract_chapters(&dom, parser);
+    }
     if let Some(first) = detail.chapters.first() {
         detail.latest_chapter_number = Some(first.number);
     }
 
-    // === SIMILAR/MIRIP === (hardcoded — container-level, not LM-detected)
-    detail.similar = extract_similar(&dom, parser);
+    // === SIMILAR/MIRIP: LM first, hardcoded fallback ===
+    if !lm_results.similar.is_empty() {
+        let mut seen_slugs = HashSet::new();
+        for sim in &lm_results.similar {
+            if let Some(ref href) = sim.href {
+                if let Some(caps) = RE_SLUG_FROM_KOMIK_URL.captures(href) {
+                    let slug = caps[1].to_string();
+                    if !slug.is_empty() && seen_slugs.insert(slug.clone()) {
+                        let judul = if sim.text.is_empty() { None } else { Some(sim.text.clone()) };
+                        detail.similar.push(SimilarKomik { slug, judul });
+                    }
+                }
+            }
+        }
+    }
+    if detail.similar.is_empty() {
+        // Fallback: hardcoded selector
+        detail.similar = extract_similar(&dom, parser);
+    }
 
     Some(detail)
 }

@@ -2,10 +2,10 @@
 """Collect multi-label training data — 1 pass per page, all fields labeled.
 
 Single unified model approach: every DOM node gets a multi-label vector:
-  [is_title, is_rating, is_genre, is_synopsis]
+  [is_title, is_rating, is_genre, is_synopsis, is_alt_title, is_author, is_status, is_similar, is_chapters]
 
 This replaces the old per-field collection. The resulting training data
-is used to train ONE model that outputs 4 probabilities simultaneously.
+is used to train ONE model that outputs 9 probabilities simultaneously.
 
 Usage:
   python3 collect_training_data.py                     # multi-label (default)
@@ -24,11 +24,13 @@ from bs4 import BeautifulSoup
 from extract_features import (
     extract_features, find_title_node, find_rating_node,
     find_genre_nodes, find_synopsis_node,
+    find_alt_title_node, find_author_node, find_status_node,
+    find_similar_nodes, find_chapter_nodes,
     FEATURE_NAMES, NUM_FEATURES
 )
 
 # Field definitions — order matters, must match Rust FieldType enum
-FIELD_NAMES = ['title', 'rating', 'genre', 'synopsis']
+FIELD_NAMES = ['title', 'rating', 'genre', 'synopsis', 'alt_title', 'author', 'status', 'similar', 'chapters']
 NUM_FIELDS = len(FIELD_NAMES)
 
 # Map field name → ground truth finder
@@ -37,10 +39,15 @@ FIELD_FINDERS = {
     'rating': find_rating_node,
     'genre': find_genre_nodes,
     'synopsis': find_synopsis_node,
+    'alt_title': find_alt_title_node,
+    'author': find_author_node,
+    'status': find_status_node,
+    'similar': find_similar_nodes,
+    'chapters': find_chapter_nodes,
 }
 
 # Which fields return multiple nodes
-MULTI_NODE_FIELDS = {'genre'}
+MULTI_NODE_FIELDS = {'genre', 'similar', 'chapters'}
 
 
 def _node_identity(element):
@@ -56,8 +63,8 @@ def _node_identity(element):
 def collect_multilabel(html_sources, limit=0):
     """Collect multi-label training data: 1 pass per page, all fields at once.
 
-    Returns X (N, 32) and Y (N, 4) where Y columns are:
-      [is_title, is_rating, is_genre, is_synopsis]
+    Returns X (N, 40) and Y (N, 9) where Y columns are:
+      [is_title, is_rating, is_genre, is_synopsis, is_alt_title, is_author, is_status, is_similar, is_chapters]
     """
     if limit > 0:
         html_sources = html_sources[:limit]
@@ -337,7 +344,7 @@ def main():
             col_idx = FIELD_NAMES.index(field_name)
             pos = int(Y[:, col_idx].sum())
             total = Y.shape[0]
-            print(f"    {field_name:10s}: {pos:5d} positive ({pos/total*100:.2f}%)")
+            print(f"    {field_name:12s}: {pos:5d} positive ({pos/total*100:.2f}%)")
 
         for field_name in FIELD_NAMES:
             if result['examples'][field_name]:

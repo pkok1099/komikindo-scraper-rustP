@@ -641,13 +641,18 @@ async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
         "rating" => vec![FieldType::Rating],
         "genre" => vec![FieldType::Genre],
         "synopsis" => vec![FieldType::Synopsis],
-        "all" => vec![FieldType::Title, FieldType::Rating, FieldType::Genre, FieldType::Synopsis],
-        other => anyhow::bail!("Unknown field: '{}'. Use: title, rating, genre, synopsis, or all", other),
+        "alt_title" => vec![FieldType::AltTitle],
+        "author" => vec![FieldType::Author],
+        "status" => vec![FieldType::Status],
+        "similar" => vec![FieldType::Similar],
+        "chapters" => vec![FieldType::Chapters],
+        "all" => FieldType::all().to_vec(),
+        other => anyhow::bail!("Unknown field: '{}'. Use: title, rating, genre, synopsis, alt_title, author, status, similar, chapters, or all", other),
     };
 
     println!("{}", "=".repeat(70));
-    println!("  LM FIELD DETECTION — UNIFIED MODEL (1 AI)");
-    println!("  Fields: {}", fields.iter().map(|f| format!("{:?}", f).to_lowercase()).collect::<Vec<_>>().join(", "));
+    println!("  LM FIELD DETECTION — UNIFIED MODEL (1 AI, 9 FIELDS)");
+    println!("  Fields: {}", fields.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", "));
     println!("{}", "=".repeat(70));
 
     // Load unified ONNX model
@@ -669,7 +674,7 @@ async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
     
     let mut field_stats: HashMap<String, (usize, usize, usize)> = HashMap::new();
     for ft in &fields {
-        field_stats.insert(format!("{:?}", ft).to_lowercase(), (0, 0, 0)); // (match, mismatch, miss)
+        field_stats.insert(ft.to_string(), (0, 0, 0)); // (match, mismatch, miss)
     }
     let mut total = 0usize;
     let mut fetch_fail = 0usize;
@@ -699,7 +704,7 @@ async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
                     let results: AllFieldsResult = detector.detect_all_fields(&html);
 
                     for ft in &fields {
-                        let field_name = format!("{:?}", ft).to_lowercase();
+                        let field_name = ft.to_string();
                         let stats = field_stats.get_mut(&field_name).unwrap();
 
                         match ft {
@@ -801,6 +806,95 @@ async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
                                     }
                                 }
                             }
+                            FieldType::AltTitle => {
+                                let lm_result = results.alt_title.as_ref().map(|r| r.text.clone());
+                                let selector_val = detail.alternative_title.as_deref().unwrap_or("");
+                                if lm_result.is_none() && selector_val.is_empty() {
+                                    // Both empty — skip
+                                } else if let Some(lm) = lm_result {
+                                    let lm_clean = lm.trim().to_lowercase();
+                                    let sel_clean = selector_val.trim().to_lowercase();
+                                    if lm_clean == sel_clean || sel_clean.contains(&lm_clean) || lm_clean.contains(&sel_clean) {
+                                        stats.0 += 1;
+                                        println!("  [OK alt_title] {}: \"{}\"", slug, lm);
+                                    } else {
+                                        stats.1 += 1;
+                                        println!("  [XX alt_title] {}: LM=\"{}\" vs SELECTOR=\"{}\"", slug, lm, selector_val);
+                                    }
+                                } else {
+                                    stats.2 += 1;
+                                    println!("  [?? alt_title] {}: no detection, SELECTOR=\"{}\"", slug, selector_val);
+                                }
+                            }
+                            FieldType::Author => {
+                                let lm_result = results.author.as_ref().map(|r| r.text.clone());
+                                let selector_val = detail.author.as_deref().unwrap_or("");
+                                if lm_result.is_none() && selector_val.is_empty() {
+                                    // Both empty — skip
+                                } else if let Some(lm) = lm_result {
+                                    let lm_clean = lm.trim().to_lowercase();
+                                    let sel_clean = selector_val.trim().to_lowercase();
+                                    if lm_clean == sel_clean {
+                                        stats.0 += 1;
+                                        println!("  [OK author] {}: \"{}\"", slug, lm);
+                                    } else {
+                                        stats.1 += 1;
+                                        println!("  [XX author] {}: LM=\"{}\" vs SELECTOR=\"{}\"", slug, lm, selector_val);
+                                    }
+                                } else {
+                                    stats.2 += 1;
+                                    println!("  [?? author] {}: no detection, SELECTOR=\"{}\"", slug, selector_val);
+                                }
+                            }
+                            FieldType::Status => {
+                                let lm_result = results.status.as_ref().map(|r| r.text.clone());
+                                let selector_val = detail.status_id.map(|id| crate::config::status_id_to_name(id)).unwrap_or("");
+                                if lm_result.is_none() && selector_val.is_empty() {
+                                    // Both empty — skip
+                                } else if let Some(lm) = lm_result {
+                                    let lm_clean = lm.trim().to_lowercase();
+                                    let sel_clean = selector_val.trim().to_lowercase();
+                                    if lm_clean == sel_clean {
+                                        stats.0 += 1;
+                                        println!("  [OK status] {}: \"{}\"", slug, lm);
+                                    } else {
+                                        stats.1 += 1;
+                                        println!("  [XX status] {}: LM=\"{}\" vs SELECTOR=\"{}\"", slug, lm, selector_val);
+                                    }
+                                } else {
+                                    stats.2 += 1;
+                                    println!("  [?? status] {}: no detection, SELECTOR=\"{}\"", slug, selector_val);
+                                }
+                            }
+                            FieldType::Similar => {
+                                let lm_similar_count = results.similar.len();
+                                let selector_similar_count = detail.similar.len();
+                                if lm_similar_count == 0 && selector_similar_count == 0 {
+                                    // Both empty — skip
+                                } else if lm_similar_count == 0 {
+                                    stats.2 += 1;
+                                    println!("  [?? similar] {}: no LM detection, SELECTOR={} items", slug, selector_similar_count);
+                                } else {
+                                    stats.0 += 1;
+                                    println!("  [OK similar] {}: {} items (selector={})", slug, lm_similar_count, selector_similar_count);
+                                }
+                            }
+                            FieldType::Chapters => {
+                                let lm_chapter_count = results.chapters.len();
+                                let selector_chapter_count = detail.chapters.len();
+                                if lm_chapter_count == 0 && selector_chapter_count == 0 {
+                                    // Both empty — skip
+                                } else if lm_chapter_count == 0 {
+                                    stats.2 += 1;
+                                    println!("  [?? chapters] {}: no LM detection, SELECTOR={} chapters", slug, selector_chapter_count);
+                                } else if lm_chapter_count >= selector_chapter_count {
+                                    stats.0 += 1;
+                                    println!("  [OK chapters] {}: {} chapters (selector={})", slug, lm_chapter_count, selector_chapter_count);
+                                } else {
+                                    stats.1 += 1;
+                                    println!("  [~~ chapters] {}: LM={} vs SELECTOR={} chapters", slug, lm_chapter_count, selector_chapter_count);
+                                }
+                            }
                         }
                     }
                 }
@@ -818,7 +912,7 @@ async fn run_lm_detect(limit: usize, field: String) -> Result<()> {
     println!("  Total tested:    {total}");
     println!("  Fetch failures:  {fetch_fail}");
     for ft in &fields {
-        let field_name = format!("{:?}", ft).to_lowercase();
+        let field_name = ft.to_string();
         let (m, mm, ms) = field_stats[&field_name];
         let tested = m + mm + ms;
         if tested > 0 {
@@ -1482,7 +1576,7 @@ async fn run_full_fetch(opts: FullFetchOpts) -> Result<()> {
         let lm_detector: Option<Arc<tokio::sync::Mutex<komikindo_scraper::lm_selector::LmDetector>>> = if opts_lm {
             match komikindo_scraper::lm_selector::LmDetector::new() {
                 Ok(detector) => {
-                    println!("[LM] Loaded unified ONNX model (title, rating, genre, synopsis)");
+                    println!("[LM] Loaded unified ONNX model (9 fields: title, rating, genre, synopsis, alt_title, author, status, similar, chapters)");
                     Some(Arc::new(tokio::sync::Mutex::new(detector)))
                 }
                 Err(e) => {

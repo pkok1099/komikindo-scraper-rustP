@@ -304,6 +304,14 @@ pub fn status_to_id(status: &str) -> Option<i16> {
     }
 }
 
+pub fn status_id_to_name(id: i16) -> &'static str {
+    match id {
+        1 => "Berjalan",
+        2 => "Tamat",
+        _ => "",
+    }
+}
+
 // ============================================================
 // IMAGE EXTENSIONS
 // ============================================================

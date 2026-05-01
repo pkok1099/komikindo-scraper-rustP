@@ -1,13 +1,14 @@
 /// LM-based Selector Engine — Unified Multi-Field Detection (1 AI)
 ///
 /// Uses a single ONNX model to detect ALL fields simultaneously.
-/// Instead of 4 separate models, one model outputs 4 probabilities:
-///   [title_prob, rating_prob, genre_prob, synopsis_prob]
+/// Instead of 9 separate models, one model outputs 9 probabilities:
+///   [title_prob, rating_prob, genre_prob, synopsis_prob,
+///    alt_title_prob, author_prob, status_prob, similar_prob, chapters_prob]
 ///
 /// Architecture:
 ///   HTML → DOM Walk (1 pass) → Feature Vectors → ONNX (1 inference per node) → All Fields
 ///
-/// Feature vector (32 dims):
+/// Feature vector (40 dims):
 ///   [0-8]   Tag one-hot: h1, h2, h3, span, div, a, td, i, meta
 ///   [9-13]  Class contains: title, entry, info, rating, archive
 ///   [14]    Has non-empty id
@@ -19,16 +20,22 @@
 ///   [28]    Bold text ratio
 ///   [29-30] Link count, has rel=tag
 ///   [31]    Font size indicator
+///   [32-34] Bold text label patterns: contains_status, contains_author, contains_alternative
+///   [35]    Class contains: desc/synopsis/entry-content
+///   [36]    Has href containing "-chapter-"
+///   [37]    Inside ancestor: mirip/bxcl
+///   [38]    Has class: lchx/series
+///   [39]    Text contains "Chapter"
 
 use anyhow::Result;
 use ort::session::Session;
 use std::collections::HashSet;
 
 /// Number of features per DOM node
-pub const NUM_FEATURES: usize = 32;
+pub const NUM_FEATURES: usize = 40;
 
 /// Number of output fields
-pub const NUM_FIELDS: usize = 4;
+pub const NUM_FIELDS: usize = 9;
 
 /// Tag vocabulary for one-hot encoding
 const TAG_VOCAB: &[&str] = &["h1", "h2", "h3", "span", "div", "a", "td", "i", "meta"];
@@ -49,6 +56,11 @@ pub enum FieldType {
     Rating,
     Genre,
     Synopsis,
+    AltTitle,
+    Author,
+    Status,
+    Similar,
+    Chapters,
 }
 
 impl FieldType {
@@ -59,17 +71,43 @@ impl FieldType {
             FieldType::Rating => 1,
             FieldType::Genre => 2,
             FieldType::Synopsis => 3,
+            FieldType::AltTitle => 4,
+            FieldType::Author => 5,
+            FieldType::Status => 6,
+            FieldType::Similar => 7,
+            FieldType::Chapters => 8,
         }
     }
 
     /// Whether this field has multiple nodes per page
     pub fn is_multi(&self) -> bool {
-        matches!(self, FieldType::Genre)
+        matches!(self, FieldType::Genre | FieldType::Similar | FieldType::Chapters)
     }
 
     /// All field types in output order
     pub fn all() -> &'static [FieldType] {
-        &[FieldType::Title, FieldType::Rating, FieldType::Genre, FieldType::Synopsis]
+        &[
+            FieldType::Title, FieldType::Rating, FieldType::Genre, FieldType::Synopsis,
+            FieldType::AltTitle, FieldType::Author, FieldType::Status,
+            FieldType::Similar, FieldType::Chapters,
+        ]
+    }
+}
+
+impl std::fmt::Display for FieldType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            FieldType::Title => "title",
+            FieldType::Rating => "rating",
+            FieldType::Genre => "genre",
+            FieldType::Synopsis => "synopsis",
+            FieldType::AltTitle => "alt_title",
+            FieldType::Author => "author",
+            FieldType::Status => "status",
+            FieldType::Similar => "similar",
+            FieldType::Chapters => "chapters",
+        };
+        write!(f, "{name}")
     }
 }
 
@@ -83,11 +121,13 @@ struct NodeContext {
     parent_tag: Option<String>,
     parent_classes: HashSet<String>,
     ancestor_classes: HashSet<String>,
+    ancestor_ids: HashSet<String>,
     is_first_significant: bool,
     has_img_child: bool,
     bold_text_len: usize,
     total_text_len: usize,
     link_count: usize,
+    bold_text_content: String,
 }
 
 /// Result of detecting a field in HTML
@@ -99,6 +139,8 @@ pub struct DetectionResult {
     pub confidence: f32,
     /// Tag name of the detected node
     pub tag_name: String,
+    /// For <a> tags: the href value if present
+    pub href: Option<String>,
 }
 
 /// Results for ALL fields from a single detection pass
@@ -108,6 +150,11 @@ pub struct AllFieldsResult {
     pub rating: Option<DetectionResult>,
     pub genres: Vec<DetectionResult>,
     pub synopsis: Option<DetectionResult>,
+    pub alt_title: Option<DetectionResult>,
+    pub author: Option<DetectionResult>,
+    pub status: Option<DetectionResult>,
+    pub similar: Vec<DetectionResult>,
+    pub chapters: Vec<DetectionResult>,
 }
 
 /// LM Detector Engine — single unified model for all fields
@@ -199,9 +246,18 @@ impl LmDetector {
                     // Extract features
                     let features = Self::extract_features(tag, parser, &name, ctx);
 
+                    // Get href for <a> tags
+                    let href = if name.as_ref() == "a" {
+                        tag.attributes().get(tl::Bytes::from("href")).flatten()
+                            .map(|v| v.as_utf8_str().to_string())
+                    } else {
+                        None
+                    };
+
                     let info = CandidateInfo {
                         text,
                         tag_name: name.as_ref().to_string(),
+                        href,
                     };
 
                     candidates.push((info, features));
@@ -239,7 +295,7 @@ impl LmDetector {
             Err(_) => return AllFieldsResult::default(),
         };
 
-        // Extract probabilities: shape [batch_size, 4]
+        // Extract probabilities: shape [batch_size, 9]
         let probs: Vec<f32> = match output["probabilities"]
             .try_extract_tensor::<f32>()
         {
@@ -251,12 +307,17 @@ impl LmDetector {
         let mut result = AllFieldsResult::default();
 
         // Track best for single-node fields
-        let mut best_title: Option<(f32, String, String)> = None;
-        let mut best_rating: Option<(f32, String, String)> = None;
-        let mut best_synopsis: Option<(f32, String, String)> = None;
+        let mut best_title: Option<(f32, CandidateInfo)> = None;
+        let mut best_rating: Option<(f32, CandidateInfo)> = None;
+        let mut best_synopsis: Option<(f32, CandidateInfo)> = None;
+        let mut best_alt_title: Option<(f32, CandidateInfo)> = None;
+        let mut best_author: Option<(f32, CandidateInfo)> = None;
+        let mut best_status: Option<(f32, CandidateInfo)> = None;
 
         // Track all above-threshold for multi-node fields
         let mut genre_candidates: Vec<DetectionResult> = Vec::new();
+        let mut similar_candidates: Vec<DetectionResult> = Vec::new();
+        let mut chapter_candidates: Vec<DetectionResult> = Vec::new();
 
         for (i, (info, _)) in candidates.iter().enumerate() {
             let base = i * NUM_FIELDS;
@@ -265,10 +326,8 @@ impl LmDetector {
             let title_prob = probs[base + 0];
             if title_prob > 0.5 {
                 match &best_title {
-                    Some((best, _, _)) if title_prob <= *best => {}
-                    _ => {
-                        best_title = Some((title_prob, info.text.clone(), info.tag_name.clone()));
-                    }
+                    Some((best, _)) if title_prob <= *best => {}
+                    _ => best_title = Some((title_prob, info.clone())),
                 }
             }
 
@@ -276,10 +335,8 @@ impl LmDetector {
             let rating_prob = probs[base + 1];
             if rating_prob > 0.5 {
                 match &best_rating {
-                    Some((best, _, _)) if rating_prob <= *best => {}
-                    _ => {
-                        best_rating = Some((rating_prob, info.text.clone(), info.tag_name.clone()));
-                    }
+                    Some((best, _)) if rating_prob <= *best => {}
+                    _ => best_rating = Some((rating_prob, info.clone())),
                 }
             }
 
@@ -290,6 +347,7 @@ impl LmDetector {
                     text: info.text.clone(),
                     confidence: genre_prob,
                     tag_name: info.tag_name.clone(),
+                    href: info.href.clone(),
                 });
             }
 
@@ -297,52 +355,149 @@ impl LmDetector {
             let synopsis_prob = probs[base + 3];
             if synopsis_prob > 0.4 {
                 match &best_synopsis {
-                    Some((best, _, _)) if synopsis_prob <= *best => {}
-                    _ => {
-                        best_synopsis = Some((synopsis_prob, info.text.clone(), info.tag_name.clone()));
-                    }
+                    Some((best, _)) if synopsis_prob <= *best => {}
+                    _ => best_synopsis = Some((synopsis_prob, info.clone())),
                 }
+            }
+
+            // AltTitle (index 4)
+            let alt_title_prob = probs[base + 4];
+            if alt_title_prob > 0.5 {
+                match &best_alt_title {
+                    Some((best, _)) if alt_title_prob <= *best => {}
+                    _ => best_alt_title = Some((alt_title_prob, info.clone())),
+                }
+            }
+
+            // Author (index 5)
+            let author_prob = probs[base + 5];
+            if author_prob > 0.5 {
+                match &best_author {
+                    Some((best, _)) if author_prob <= *best => {}
+                    _ => best_author = Some((author_prob, info.clone())),
+                }
+            }
+
+            // Status (index 6)
+            let status_prob = probs[base + 6];
+            if status_prob > 0.5 {
+                match &best_status {
+                    Some((best, _)) if status_prob <= *best => {}
+                    _ => best_status = Some((status_prob, info.clone())),
+                }
+            }
+
+            // Similar (index 7) — multi-node
+            let similar_prob = probs[base + 7];
+            if similar_prob > 0.5 {
+                similar_candidates.push(DetectionResult {
+                    text: info.text.clone(),
+                    confidence: similar_prob,
+                    tag_name: info.tag_name.clone(),
+                    href: info.href.clone(),
+                });
+            }
+
+            // Chapters (index 8) — multi-node
+            let chapters_prob = probs[base + 8];
+            if chapters_prob > 0.5 {
+                chapter_candidates.push(DetectionResult {
+                    text: info.text.clone(),
+                    confidence: chapters_prob,
+                    tag_name: info.tag_name.clone(),
+                    href: info.href.clone(),
+                });
             }
         }
 
         // Build final results
-        if let Some((prob, text, tag)) = best_title {
+        if let Some((prob, info)) = best_title {
             // Clean title: strip "Komik" prefix if present
-            let cleaned = if text.to_lowercase().starts_with("komik") {
+            let cleaned = if info.text.to_lowercase().starts_with("komik") {
                 let re = regex::Regex::new(r"(?i)^komik\s*").ok();
-                re.map(|r| r.replace(&text, "").trim().to_string())
-                    .unwrap_or_else(|| text.clone())
+                re.map(|r| r.replace(&info.text, "").trim().to_string())
+                    .unwrap_or_else(|| info.text.clone())
             } else {
-                text.clone()
+                info.text.clone()
             };
             result.title = Some(DetectionResult {
                 text: cleaned,
                 confidence: prob,
-                tag_name: tag,
+                tag_name: info.tag_name,
+                href: None,
             });
         }
 
-        if let Some((prob, text, tag)) = best_rating {
+        if let Some((prob, info)) = best_rating {
             result.rating = Some(DetectionResult {
-                text: text.trim().to_string(),
+                text: info.text.trim().to_string(),
                 confidence: prob,
-                tag_name: tag,
+                tag_name: info.tag_name,
+                href: None,
             });
         }
 
-        if let Some((prob, text, tag)) = best_synopsis {
+        if let Some((prob, info)) = best_synopsis {
             result.synopsis = Some(DetectionResult {
-                text: text.trim().to_string(),
+                text: info.text.trim().to_string(),
                 confidence: prob,
-                tag_name: tag,
+                tag_name: info.tag_name,
+                href: None,
             });
         }
 
-        // Sort genre candidates by confidence (highest first)
+        if let Some((prob, info)) = best_alt_title {
+            // Extract value after the bold label (e.g., "Alternative:Nano Machine" → "Nano Machine")
+            let cleaned = Self::extract_value_after_label(&info.text);
+            result.alt_title = Some(DetectionResult {
+                text: cleaned,
+                confidence: prob,
+                tag_name: info.tag_name,
+                href: None,
+            });
+        }
+
+        if let Some((prob, info)) = best_author {
+            let cleaned = Self::extract_value_after_label(&info.text);
+            result.author = Some(DetectionResult {
+                text: cleaned,
+                confidence: prob,
+                tag_name: info.tag_name,
+                href: None,
+            });
+        }
+
+        if let Some((prob, info)) = best_status {
+            let cleaned = Self::extract_value_after_label(&info.text);
+            result.status = Some(DetectionResult {
+                text: cleaned,
+                confidence: prob,
+                tag_name: info.tag_name,
+                href: None,
+            });
+        }
+
+        // Sort multi-node candidates by confidence (highest first)
         genre_candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
         result.genres = genre_candidates;
 
+        similar_candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        result.similar = similar_candidates;
+
+        chapter_candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        result.chapters = chapter_candidates;
+
         result
+    }
+
+    /// Extract value after a colon from text like "Status:Berjalan" → "Berjalan"
+    /// or "Alternative:Nano Machine - Nanogiga" → "Nano Machine - Nanogiga"
+    fn extract_value_after_label(text: &str) -> String {
+        // Try colon separator
+        if let Some(pos) = text.find(':') {
+            return text[pos + 1..].trim().to_string();
+        }
+        text.trim().to_string()
     }
 
     // ================================================================
@@ -373,6 +528,31 @@ impl LmDetector {
         self.detect_all_fields(html).synopsis.map(|r| r.text)
     }
 
+    /// Detect alt title in HTML
+    pub fn detect_alt_title(&mut self, html: &str) -> Option<String> {
+        self.detect_all_fields(html).alt_title.map(|r| r.text)
+    }
+
+    /// Detect author in HTML
+    pub fn detect_author(&mut self, html: &str) -> Option<String> {
+        self.detect_all_fields(html).author.map(|r| r.text)
+    }
+
+    /// Detect status in HTML
+    pub fn detect_status(&mut self, html: &str) -> Option<String> {
+        self.detect_all_fields(html).status.map(|r| r.text)
+    }
+
+    /// Detect similar komik links in HTML
+    pub fn detect_similar(&mut self, html: &str) -> Vec<DetectionResult> {
+        self.detect_all_fields(html).similar
+    }
+
+    /// Detect chapter links in HTML
+    pub fn detect_chapters(&mut self, html: &str) -> Vec<DetectionResult> {
+        self.detect_all_fields(html).chapters
+    }
+
     /// Detect a specific field (for compatibility with per-field testing)
     pub fn detect(&mut self, field: FieldType, html: &str) -> Option<DetectionResult> {
         let results = self.detect_all_fields(html);
@@ -381,25 +561,31 @@ impl LmDetector {
             FieldType::Rating => results.rating,
             FieldType::Genre => results.genres.into_iter().next(),
             FieldType::Synopsis => results.synopsis,
+            FieldType::AltTitle => results.alt_title,
+            FieldType::Author => results.author,
+            FieldType::Status => results.status,
+            FieldType::Similar => results.similar.into_iter().next(),
+            FieldType::Chapters => results.chapters.into_iter().next(),
         }
     }
 
-    /// Detect all instances of a multi-node field (for genre)
+    /// Detect all instances of a multi-node field
     pub fn detect_all(&mut self, field: FieldType, html: &str, threshold: f32) -> Vec<DetectionResult> {
         let results = self.detect_all_fields(html);
+        let filtered = |v: Vec<DetectionResult>| v.into_iter()
+            .filter(|r| r.confidence >= threshold)
+            .collect();
+
         match field {
-            FieldType::Genre => results.genres.into_iter()
-                .filter(|r| r.confidence >= threshold)
-                .collect(),
-            FieldType::Title => results.title.into_iter()
-                .filter(|r| r.confidence >= threshold)
-                .collect(),
-            FieldType::Rating => results.rating.into_iter()
-                .filter(|r| r.confidence >= threshold)
-                .collect(),
-            FieldType::Synopsis => results.synopsis.into_iter()
-                .filter(|r| r.confidence >= threshold)
-                .collect(),
+            FieldType::Genre => filtered(results.genres),
+            FieldType::Similar => filtered(results.similar),
+            FieldType::Chapters => filtered(results.chapters),
+            FieldType::Title => results.title.into_iter().filter(|r| r.confidence >= threshold).collect(),
+            FieldType::Rating => results.rating.into_iter().filter(|r| r.confidence >= threshold).collect(),
+            FieldType::Synopsis => results.synopsis.into_iter().filter(|r| r.confidence >= threshold).collect(),
+            FieldType::AltTitle => results.alt_title.into_iter().filter(|r| r.confidence >= threshold).collect(),
+            FieldType::Author => results.author.into_iter().filter(|r| r.confidence >= threshold).collect(),
+            FieldType::Status => results.status.into_iter().filter(|r| r.confidence >= threshold).collect(),
         }
     }
 
@@ -429,6 +615,7 @@ impl LmDetector {
                     sibling_count,
                     None,
                     &HashSet::new(),
+                    &HashSet::new(),
                     &mut contexts,
                 );
             }
@@ -448,6 +635,7 @@ impl LmDetector {
         sibling_count: usize,
         parent_info: Option<(&str, &HashSet<String>)>,
         ancestor_classes: &HashSet<String>,
+        ancestor_ids: &HashSet<String>,
         contexts: &mut std::collections::HashMap<usize, NodeContext>,
     ) {
         let tag = match node.as_tag() {
@@ -463,6 +651,11 @@ impl LmDetector {
 
         let node_classes = Self::get_classes_set(tag);
 
+        // Get node ID attribute
+        let node_id_attr = tag.attributes().get(tl::Bytes::from("id")).flatten()
+            .map(|v| v.as_utf8_str().to_lowercase())
+            .unwrap_or_default();
+
         let children_wrapper = tag.children();
         let children = children_wrapper.top();
         let child_count = children.len();
@@ -471,6 +664,7 @@ impl LmDetector {
         let mut bold_text_len = 0usize;
         let mut total_text_len = 0usize;
         let mut link_count = 0usize;
+        let mut bold_text_parts: Vec<String> = Vec::new();
 
         for &child_handle in children.iter() {
             if let Some(child_node) = child_handle.get(parser) {
@@ -484,6 +678,7 @@ impl LmDetector {
                             let t = inner.trim();
                             bold_text_len += t.len();
                             total_text_len += t.len();
+                            bold_text_parts.push(t.to_lowercase());
                         }
                         _ => {
                             let inner = child_tag.inner_text(parser);
@@ -519,7 +714,14 @@ impl LmDetector {
             my_ancestor_classes.extend(p_classes.iter().cloned());
         }
 
+        let mut my_ancestor_ids = ancestor_ids.clone();
+        if !node_id_attr.is_empty() {
+            my_ancestor_ids.insert(node_id_attr);
+        }
+
         let is_first_significant = false;
+
+        let bold_text_content = bold_text_parts.join(" ");
 
         contexts.insert(
             node_id,
@@ -531,11 +733,13 @@ impl LmDetector {
                 parent_tag,
                 parent_classes,
                 ancestor_classes: my_ancestor_classes.clone(),
+                ancestor_ids: my_ancestor_ids.clone(),
                 is_first_significant,
                 has_img_child,
                 bold_text_len,
                 total_text_len,
                 link_count,
+                bold_text_content,
             },
         );
 
@@ -551,6 +755,7 @@ impl LmDetector {
                     child_count_val,
                     Some((&tag_name, &node_classes)),
                     &my_ancestor_classes,
+                    &my_ancestor_ids,
                     contexts,
                 );
             }
@@ -583,10 +788,10 @@ impl LmDetector {
     }
 
     // ================================================================
-    // Feature Extraction — 32 dims, shared across all fields
+    // Feature Extraction — 40 dims, shared across all fields
     // ================================================================
 
-    /// Extract 32-dim feature vector from a DOM tag with full structural context.
+    /// Extract 40-dim feature vector from a DOM tag with full structural context.
     pub fn extract_features(
         tag: &tl::HTMLTag,
         parser: &tl::Parser,
@@ -649,6 +854,17 @@ impl LmDetector {
 
             // [29] Link count
             feat[29] = (ctx.link_count as f32 / 10.0).min(1.0);
+
+            // [32-34] Bold text label patterns
+            feat[32] = if ctx.bold_text_content.contains("status") { 1.0 } else { 0.0 };
+            feat[33] = if ctx.bold_text_content.contains("pengarang") || ctx.bold_text_content.contains("author") { 1.0 } else { 0.0 };
+            feat[34] = if ctx.bold_text_content.contains("alternative") || ctx.bold_text_content.contains("alternatif") { 1.0 } else { 0.0 };
+
+            // [37] Ancestor: mirip/bxcl containers
+            feat[37] = if ctx.ancestor_ids.contains("mirip") ||
+                          ctx.ancestor_classes.contains("mirip") ||
+                          ctx.ancestor_classes.contains("bxcl") ||
+                          ctx.ancestor_ids.contains("chapter_list") { 1.0 } else { 0.0 };
         } else {
             feat[15] = 0.0;
             feat[16] = 0.0;
@@ -661,6 +877,10 @@ impl LmDetector {
             feat[27] = 0.0;
             feat[28] = 0.0;
             feat[29] = 0.0;
+            feat[32] = 0.0;
+            feat[33] = 0.0;
+            feat[34] = 0.0;
+            feat[37] = 0.0;
         }
 
         // [19] Text length (normalized: /200.0, capped at 1.0)
@@ -695,12 +915,29 @@ impl LmDetector {
             .map(|(_, v)| *v)
             .unwrap_or(0.0);
 
+        // [35] Class: desc/synopsis/entry-content
+        feat[35] = if classes_lower.iter().any(|c| c == "desc" || c == "synopsis" || c == "entry-content") { 1.0 } else { 0.0 };
+
+        // [36] href contains "-chapter-"
+        let href = tag.attributes().get(tl::Bytes::from("href")).flatten()
+            .map(|v| v.as_utf8_str().to_lowercase())
+            .unwrap_or_default();
+        feat[36] = if href.contains("-chapter-") { 1.0 } else { 0.0 };
+
+        // [38] Class: lchx/series
+        feat[38] = if classes_lower.iter().any(|c| c == "lchx" || c == "series") { 1.0 } else { 0.0 };
+
+        // [39] Text contains "Chapter"
+        feat[39] = if text.to_lowercase().contains("chapter") { 1.0 } else { 0.0 };
+
         feat
     }
 }
 
 /// Internal struct for candidate node info during detection
+#[derive(Debug, Clone)]
 struct CandidateInfo {
     text: String,
     tag_name: String,
+    href: Option<String>,
 }
