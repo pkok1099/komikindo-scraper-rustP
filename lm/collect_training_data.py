@@ -116,20 +116,27 @@ def collect_multilabel(html_sources, limit=0):
                 continue
 
             # Walk all elements ONCE, extract features + multi-label
+            # First collect all candidate elements to compute document position
+            all_elements = [
+                e for e in soup.find_all(True)
+                if e.name not in ['script', 'style', 'noscript', 'meta', 'link', 'head']
+            ]
+            total_elements = len(all_elements)
+
             features_list = []
             labels_list = []
 
-            for element in soup.find_all(True):
-                if element.name in ['script', 'style', 'noscript', 'meta', 'link', 'head']:
-                    continue
-
+            for doc_idx, element in enumerate(all_elements):
                 depth = 0
                 parent = element.parent
                 while parent and parent.name:
                     depth += 1
                     parent = parent.parent
 
-                feat = extract_features(element, depth)
+                # Normalized document position: 0.0 = top, 1.0 = bottom
+                doc_position = doc_idx / max(total_elements - 1, 1)
+
+                feat = extract_features(element, depth, doc_position)
                 features_list.append(feat)
 
                 elem_id = _node_identity(element)
@@ -214,20 +221,25 @@ def collect_for_field_legacy(html_sources, field_name, finder_fn, limit=0):
                 if gt_result is not None:
                     gt_identities.add(_node_identity(gt_result))
 
+            # Collect all candidate elements for document position
+            all_elements = [
+                e for e in soup.find_all(True)
+                if e.name not in ['script', 'style', 'noscript', 'meta', 'link', 'head']
+            ]
+            total_elements = len(all_elements)
+
             features_list = []
             labels_list = []
 
-            for element in soup.find_all(True):
-                if element.name in ['script', 'style', 'noscript', 'meta', 'link', 'head']:
-                    continue
-
+            for doc_idx, element in enumerate(all_elements):
                 depth = 0
                 parent = element.parent
                 while parent and parent.name:
                     depth += 1
                     parent = parent.parent
 
-                feat = extract_features(element, depth)
+                doc_position = doc_idx / max(total_elements - 1, 1)
+                feat = extract_features(element, depth, doc_position)
                 features_list.append(feat)
 
                 is_positive = 0

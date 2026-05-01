@@ -457,4 +457,43 @@ mod parser_tests {
         assert!(per_iter_ms < 50.0,
             "Large detail page should parse in < 50ms, got {:.2} ms", per_iter_ms);
     }
+
+    // ============================================================
+    // LM-based field detection (ONNX model inference)
+    // ============================================================
+
+    #[test]
+    fn test_lm_detect_all_fields() {
+        let html = load_fixture("detail_page.html");
+        let mut detector = komikindo_scraper::lm_selector::LmDetector::new()
+            .expect("Should create LmDetector (ONNX model must exist in models/)");
+
+        let result = detector.detect_all_fields(&html);
+
+        // Print all results for debugging
+        println!("\n[LM] Title: {:?}", result.title);
+        println!("[LM] Rating: {:?}", result.rating);
+        println!("[LM] Genres: {:?} ({} found)", result.genres.iter().map(|g| &g.text).collect::<Vec<_>>(), result.genres.len());
+        println!("[LM] Synopsis: {:?}", result.synopsis.as_ref().map(|r| &r.text[..50.min(r.text.len())]));
+        println!("[LM] Alt title: {:?}", result.alt_title);
+        println!("[LM] Author: {:?}", result.author);
+        println!("[LM] Status: {:?}", result.status);
+        println!("[LM] Similar: {} found", result.similar.len());
+        println!("[LM] Chapters: {} found", result.chapters.len());
+
+        // Title should be detected
+        assert!(result.title.is_some(), "Title should be detected");
+        let title_text = result.title.as_ref().unwrap().text.clone();
+        assert!(!title_text.is_empty(), "Title text should not be empty");
+        assert!(result.title.as_ref().unwrap().confidence > 0.1, "Title confidence should be > 0.1");
+
+        // Rating should be detected (may be None on some pages)
+        // Not all fixture pages may have rating in the expected format
+
+        // Genres should be detected (at least 1)
+        assert!(result.genres.len() >= 1, "Should detect at least 1 genre, got {}", result.genres.len());
+
+        // Chapters should be detected
+        assert!(result.chapters.len() >= 1, "Should detect at least 1 chapter, got {}", result.chapters.len());
+    }
 }

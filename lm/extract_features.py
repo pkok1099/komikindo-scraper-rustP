@@ -1,6 +1,6 @@
 """Feature extraction for DOM nodes — shared between collect and Rust integration.
 
-Feature vector (40 dims):
+Feature vector (44 dims):
   [0-8]   Tag one-hot: h1, h2, h3, span, div, a, td, i, meta
   [9-13]  Class contains: title, entry, info, rating, archive
   [14]    Has non-empty id
@@ -17,8 +17,13 @@ Feature vector (40 dims):
   [37]    Inside ancestor: mirip/bxcl
   [38]    Has class: lchx, series
   [39]    Text contains "Chapter"
+  [40]    Text matches rating float pattern (e.g. "7.5", "8.0")
+  [41]    Text matches chapter number pattern (e.g. "Chapter 1", "Bab 45")
+  [42]    Text contains a 4-digit year (1900-2099)
+  [43]    Normalized document position (0=top, 1=bottom)
 """
 
+import re
 import numpy as np
 from bs4 import BeautifulSoup
 
@@ -46,21 +51,32 @@ FEATURE_NAMES = [
     'bold_text_ratio', 'link_count', 'has_rel_tag',
     # Semantic features (31)
     'font_size_indicator',
-    # NEW: Bold text label patterns (32-34)
+    # Bold text label patterns (32-34)
     'bold_contains_status', 'bold_contains_author', 'bold_contains_alternative',
-    # NEW: Class/content patterns (35)
+    # Class/content patterns (35)
     'has_class_desc_or_synopsis',
-    # NEW: Chapter link pattern (36)
+    # Chapter link pattern (36)
     'href_contains_chapter',
-    # NEW: Ancestor: mirip/bxcl containers (37)
+    # Ancestor: mirip/bxcl containers (37)
     'is_inside_mirip_or_bxcl',
-    # NEW: Class: lchx/series (38)
+    # Class: lchx/series (38)
     'has_class_lchx_or_series',
-    # NEW: Text contains "Chapter" (39)
+    # Text contains "Chapter" (39)
     'text_contains_chapter',
+    # Regex numeric features (40-42)
+    'contains_rating_float',
+    'contains_chapter_number',
+    'contains_year',
+    # DOM positional prior (43)
+    'normalized_document_position',
 ]
 
-NUM_FEATURES = len(FEATURE_NAMES)  # 40
+NUM_FEATURES = len(FEATURE_NAMES)  # 44
+
+# Precompiled regex patterns for numeric features
+_RATING_FLOAT_RE = re.compile(r'\b\d\.\d\b')
+_CHAPTER_NUMBER_RE = re.compile(r'(?i)(chapter|bab)\s*\d+')
+_YEAR_RE = re.compile(r'\b(19|20)\d{2}\b')
 
 
 def get_ancestors(element):
@@ -99,8 +115,14 @@ def _get_bold_text(element):
     return ' '.join(bold_texts)
 
 
-def extract_features(element, depth=0):
-    """Extract 40-dim feature vector from a DOM element."""
+def extract_features(element, depth=0, doc_position=0.0):
+    """Extract 44-dim feature vector from a DOM element.
+
+    Args:
+        element: BeautifulSoup element
+        depth: Nesting depth in the DOM tree
+        doc_position: Normalized position in document order (0=top, 1=bottom)
+    """
     features = np.zeros(NUM_FEATURES, dtype=np.float32)
 
     tag = element.name.lower() if element.name else ''
@@ -207,6 +229,31 @@ def extract_features(element, depth=0):
 
     # Text contains "Chapter" (39)
     features[39] = 1.0 if 'chapter' in text.lower() else 0.0
+
+    # === REGEX NUMERIC FEATURES (40-42) ===
+
+    # Contains rating float (40) — e.g. "7.5", "8.0", "9.5"
+    # This is more specific than itemprop: it detects the numeric rating value pattern
+    # itself, which works even without semantic markup.
+    features[40] = 1.0 if _RATING_FLOAT_RE.search(text) else 0.0
+
+    # Contains chapter number (41) — e.g. "Chapter 1", "Bab 45"
+    # More specific than text_contains_chapter (39): requires a NUMBER after
+    # the keyword, distinguishing actual chapter links from the word "chapter"
+    # appearing in synopsis text.
+    features[41] = 1.0 if _CHAPTER_NUMBER_RE.search(text) else 0.0
+
+    # Contains 4-digit year (42) — e.g. "2024", "2019"
+    # Useful for distinguishing metadata (author, status) from other content.
+    features[42] = 1.0 if _YEAR_RE.search(text) else 0.0
+
+    # === DOM POSITIONAL PRIOR (43) ===
+
+    # Normalized document position (0=top, 1=bottom)
+    # Title is typically near the top (~0.0-0.2), synopsis in the middle (~0.3-0.6),
+    # chapters near the bottom (~0.7-1.0). This positional prior helps the MLP
+    # learn field location patterns.
+    features[43] = doc_position
 
     return features
 

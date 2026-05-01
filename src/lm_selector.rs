@@ -8,7 +8,7 @@
 /// Architecture:
 ///   HTML → DOM Walk (1 pass) → Feature Vectors → ONNX (1 inference per node) → All Fields
 ///
-/// Feature vector (40 dims):
+/// Feature vector (44 dims):
 ///   [0-8]   Tag one-hot: h1, h2, h3, span, div, a, td, i, meta
 ///   [9-13]  Class contains: title, entry, info, rating, archive
 ///   [14]    Has non-empty id
@@ -26,13 +26,35 @@
 ///   [37]    Inside ancestor: mirip/bxcl
 ///   [38]    Has class: lchx/series
 ///   [39]    Text contains "Chapter"
+///   [40]    Text matches rating float pattern (e.g. "7.5", "8.0")
+///   [41]    Text matches chapter number pattern (e.g. "Chapter 1", "Bab 45")
+///   [42]    Text contains a 4-digit year (1900-2099)
+///   [43]    Normalized document position (0=top, 1=bottom)
 
 use anyhow::Result;
 use ort::session::Session;
 use std::collections::HashSet;
+use std::sync::OnceLock;
+
+// Precompiled regex patterns for numeric features (compiled once, reused)
+static RATING_FLOAT_RE: OnceLock<regex::Regex> = OnceLock::new();
+static CHAPTER_NUMBER_RE: OnceLock<regex::Regex> = OnceLock::new();
+static YEAR_RE: OnceLock<regex::Regex> = OnceLock::new();
+
+fn rating_float_re() -> &'static regex::Regex {
+    RATING_FLOAT_RE.get_or_init(|| regex::Regex::new(r"\b\d\.\d\b").unwrap())
+}
+
+fn chapter_number_re() -> &'static regex::Regex {
+    CHAPTER_NUMBER_RE.get_or_init(|| regex::Regex::new(r"(?i)(chapter|bab)\s*\d+").unwrap())
+}
+
+fn year_re() -> &'static regex::Regex {
+    YEAR_RE.get_or_init(|| regex::Regex::new(r"\b(19|20)\d{2}\b").unwrap())
+}
 
 /// Number of features per DOM node
-pub const NUM_FEATURES: usize = 40;
+pub const NUM_FEATURES: usize = 44;
 
 /// Number of output fields
 pub const NUM_FIELDS: usize = 9;
@@ -133,6 +155,10 @@ struct NodeContext {
     total_text_len: usize,
     link_count: usize,
     bold_text_content: String,
+    /// Document order index (set during walk, normalized after)
+    doc_order: usize,
+    /// Normalized document position (0=top, 1=bottom, set after walk)
+    doc_position: f32,
 }
 
 /// Result of detecting a field in HTML
@@ -666,6 +692,7 @@ impl LmDetector {
         parser: &tl::Parser,
     ) -> std::collections::HashMap<usize, NodeContext> {
         let mut contexts: std::collections::HashMap<usize, NodeContext> = std::collections::HashMap::new();
+        let mut doc_order_counter: usize = 0;
 
         let top_children = dom.children();
         let sibling_count = top_children.len();
@@ -684,8 +711,15 @@ impl LmDetector {
                     &HashSet::new(),
                     &HashSet::new(),
                     &mut contexts,
+                    &mut doc_order_counter,
                 );
             }
+        }
+
+        // Normalize doc_order to [0, 1] range for all nodes
+        let max_order = doc_order_counter.max(1) as f32;
+        for ctx in contexts.values_mut() {
+            ctx.doc_position = ctx.doc_order as f32 / max_order;
         }
 
         contexts
@@ -704,6 +738,7 @@ impl LmDetector {
         ancestor_classes: &HashSet<String>,
         ancestor_ids: &HashSet<String>,
         contexts: &mut std::collections::HashMap<usize, NodeContext>,
+        doc_order_counter: &mut usize,
     ) {
         let tag = match node.as_tag() {
             Some(t) => t,
@@ -790,6 +825,9 @@ impl LmDetector {
 
         let bold_text_content = bold_text_parts.join(" ");
 
+        let current_doc_order = *doc_order_counter;
+        *doc_order_counter += 1;
+
         contexts.insert(
             node_id,
             NodeContext {
@@ -807,6 +845,8 @@ impl LmDetector {
                 total_text_len,
                 link_count,
                 bold_text_content,
+                doc_order: current_doc_order,
+                doc_position: 0.0, // Will be normalized after the walk
             },
         );
 
@@ -824,6 +864,7 @@ impl LmDetector {
                     &my_ancestor_classes,
                     &my_ancestor_ids,
                     contexts,
+                    doc_order_counter,
                 );
             }
         }
@@ -998,6 +1039,31 @@ impl LmDetector {
 
         // [39] Text contains "Chapter"
         feat[39] = if text.to_lowercase().contains("chapter") { 1.0 } else { 0.0 };
+
+        // === REGEX NUMERIC FEATURES (40-42) ===
+
+        // [40] Contains rating float — e.g. "7.5", "8.0", "9.5"
+        // More specific than itemprop: detects the numeric rating value pattern itself,
+        // which works even without semantic markup.
+        feat[40] = if rating_float_re().is_match(&text) { 1.0 } else { 0.0 };
+
+        // [41] Contains chapter number — e.g. "Chapter 1", "Bab 45"
+        // More specific than text_contains_chapter (39): requires a NUMBER after
+        // the keyword, distinguishing actual chapter links from the word "chapter"
+        // appearing in synopsis text.
+        feat[41] = if chapter_number_re().is_match(&text) { 1.0 } else { 0.0 };
+
+        // [42] Contains 4-digit year — e.g. "2024", "2019"
+        // Useful for distinguishing metadata (author, status) from other content.
+        feat[42] = if year_re().is_match(&text) { 1.0 } else { 0.0 };
+
+        // === DOM POSITIONAL PRIOR (43) ===
+
+        // [43] Normalized document position (0=top, 1=bottom)
+        // Title is typically near the top (~0.0-0.2), synopsis in the middle (~0.3-0.6),
+        // chapters near the bottom (~0.7-1.0). This positional prior helps the MLP
+        // learn field location patterns.
+        feat[43] = ctx.map(|c| c.doc_position).unwrap_or(0.0);
 
         feat
     }
